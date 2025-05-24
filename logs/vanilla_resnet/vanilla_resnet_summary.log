@@ -1,0 +1,48 @@
+=====================================================================================================================================================================
+Layer (type:depth-idx)                   Input Shape               Output Shape              Param #                   Param %                   Mult-Adds
+=====================================================================================================================================================================
+ResGRUNet                                [256, 625, 2]             [256, 2]                  --                             --                   --
+├─TemporalBlock: 1-1                     [256, 625, 1]             [256, 9, 128]             --                             --                   --
+│    └─ModuleList: 2-1                   --                        --                        --                             --                   --
+│    │    └─TemporalResBlock: 3-1        [256, 1, 625]             [256, 32, 312]            1,322                       0.20%                   11,840,000
+│    │    └─TemporalResBlock: 3-2        [256, 32, 312]            [256, 32, 156]            3,616                       0.54%                   105,381,888
+│    │    └─TemporalResBlock: 3-3        [256, 32, 156]            [256, 64, 78]             8,960                       1.34%                   96,256,000
+│    │    └─TemporalResBlock: 3-4        [256, 64, 78]             [256, 64, 39]             13,376                      1.99%                   95,518,720
+│    │    └─TemporalResBlock: 3-5        [256, 64, 39]             [256, 128, 19]            34,304                      5.12%                   94,699,520
+│    │    └─TemporalResBlock: 3-6        [256, 128, 19]            [256, 128, 9]             51,328                      7.66%                   93,945,856
+├─TemporalBlock: 1-2                     [256, 625]                [256, 9, 128]             --                             --                   --
+│    └─ModuleList: 2-2                   --                        --                        --                             --                   --
+│    │    └─TemporalResBlock: 3-7        [256, 1, 625]             [256, 32, 312]            1,322                       0.20%                   11,840,000
+│    │    └─TemporalResBlock: 3-8        [256, 32, 312]            [256, 32, 156]            3,616                       0.54%                   105,381,888
+│    │    └─TemporalResBlock: 3-9        [256, 32, 156]            [256, 64, 78]             8,960                       1.34%                   96,256,000
+│    │    └─TemporalResBlock: 3-10       [256, 64, 78]             [256, 64, 39]             13,376                      1.99%                   95,518,720
+│    │    └─TemporalResBlock: 3-11       [256, 64, 39]             [256, 128, 19]            34,304                      5.12%                   94,699,520
+│    │    └─TemporalResBlock: 3-12       [256, 128, 19]            [256, 128, 9]             51,328                      7.66%                   93,945,856
+├─GRU: 1-3                               [256, 9, 256]             [256, 9, 128]             148,224                    22.11%                   341,508,096
+├─BatchNorm1d: 1-4                       [256, 128, 9]             [256, 128, 9]             256                         0.04%                   65,536
+├─Flatten: 1-5                           [256, 9, 128]             [256, 1152]               --                             --                   --
+├─Linear: 1-6                            [256, 1152]               [256, 256]                295,168                    44.02%                   75,563,008
+├─BatchNorm1d: 1-7                       [256, 256]                [256, 256]                512                         0.08%                   131,072
+├─ReLU: 1-8                              [256, 256]                [256, 256]                --                             --                   --
+├─Dropout: 1-9                           [256, 256]                [256, 256]                --                             --                   --
+├─Linear: 1-10                           [256, 256]                [256, 2]                  514                         0.08%                   131,584
+=====================================================================================================================================================================
+Total params: 670,486
+Trainable params: 670,486
+Non-trainable params: 0
+Total mult-adds (G): 1.41
+=====================================================================================================================================================================
+Input size (MB): 1.28
+Forward/backward pass size (MB): 1287.66
+Params size (MB): 2.68
+Estimated Total Size (MB): 1291.63
+=====================================================================================================================================================================
+[INFO] Register count_convNd() for <class 'torch.nn.modules.conv.Conv1d'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.batchnorm.BatchNorm1d'>.
+[INFO] Register count_relu() for <class 'torch.nn.modules.activation.LeakyReLU'>.
+[INFO] Register count_linear() for <class 'torch.nn.modules.linear.Linear'>.
+[INFO] Register count_avgpool() for <class 'torch.nn.modules.pooling.AvgPool1d'>.
+[INFO] Register count_gru() for <class 'torch.nn.modules.rnn.GRU'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.activation.ReLU'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.dropout.Dropout'>.
+ResNet has 670.4860000K params and 3.9086792G macs.

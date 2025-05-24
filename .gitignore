@@ -13,15 +13,15 @@ data/lmdb/*
 data/raw_mimic_iii/*
 
 # Checkpoints
-checkpoints/
+#checkpoints/
 
 # Logs
-logs/
+#logs/
 
 # TensorBoard logs
-tensorboard/
+#tensorboard/
 
 # Figures
-figs/
+#figs/
 
 
