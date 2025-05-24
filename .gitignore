@@ -1,0 +1,27 @@
+# Python packages
+__pycache__/
+data/__pycache__
+
+# VSCode settings
+.vscode/
+
+# Attempts records
+attempts/
+
+# Datasets
+data/lmdb/*
+data/raw_mimic_iii/*
+
+# Checkpoints
+checkpoints/
+
+# Logs
+logs/
+
+# TensorBoard logs
+tensorboard/
+
+# Figures
+figs/
+
+

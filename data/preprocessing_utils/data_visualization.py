@@ -1,0 +1,288 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+    
+    
+def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs/dataset'):
+    """Calculates SBP and DBP distributions and plots them with mean and quartiles."""
+
+    for dataloader, dataloader_name in zip(dataloaders, dataloaders_names):
+        sbp_values = []
+        dbp_values = []
+
+        for batch in dataloader:
+            _, annotation = batch 
+            sbp_values.extend(annotation[0].flatten().tolist())
+            dbp_values.extend(annotation[1].flatten().tolist())
+
+        sbp_values = np.array(sbp_values)
+        dbp_values = np.array(dbp_values)
+
+        # Calculate statistics
+        sbp_mean = np.mean(sbp_values)
+        sbp_std = np.std(sbp_values)
+        sbp_q1 = np.quantile(sbp_values, 0.25)
+        sbp_q3 = np.quantile(sbp_values, 0.75)
+
+        dbp_mean = np.mean(dbp_values)
+        dbp_std = np.std(dbp_values)
+        dbp_q1 = np.quantile(dbp_values, 0.25)
+        dbp_q3 = np.quantile(dbp_values, 0.75)
+        
+        # Create the figure
+        plt.figure(figsize=(10, 6))
+        sns.set_palette("pastel")
+
+        # Plot SBP histogram
+        plt.hist(sbp_values, bins=50, alpha=0.7, label='SBP', color='skyblue')
+
+        # Plot DBP histogram
+        plt.hist(dbp_values, bins=50, alpha=0.7, label='DBP', color='lightcoral')
+
+        # Add vertical lines for SBP
+        plt.axvline(sbp_mean, color='blue', linestyle='dashed', linewidth=1, 
+                    label=r'SBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(sbp_mean, sbp_std))  
+        plt.axvline(sbp_q1, color='blue', linestyle='dotted', linewidth=1, label=f'SBP Q1: {sbp_q1:.2f}')
+        plt.axvline(sbp_q3, color='blue', linestyle='dotted', linewidth=1, label=f'SBP Q3: {sbp_q3:.2f}')
+
+        # Add vertical lines for DBP
+        plt.axvline(dbp_mean, color='red', linestyle='dashed', linewidth=1,
+                    label=r'DBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(dbp_mean, dbp_std))
+        plt.axvline(dbp_q1, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q1: {dbp_q1:.2f}')
+        plt.axvline(dbp_q3, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q3: {dbp_q3:.2f}')
+
+
+        plt.title(f'{dataloader_name} SBP and DBP Distributions')
+        plt.xlabel('mmHg')
+        plt.ylabel('Density')
+        plt.legend()  # Update legend to include lines
+        plt.tight_layout()
+
+        plt.savefig(os.path.join(savepath, f'{dataloader_name}_sbp_dbp_distribution.jpg'))
+        plt.close()
+
+
+def plot_subject_sample_distribution(subject_sample_dict, ids, savepath="subject_sample_distribution.png"):
+    r"""
+    Plots the distribution of sample counts per subject in a dataset.
+    
+    Args:
+        subject_sample_dict: A dictionary where the keys are subject IDs and the values are lists of sample IDs.
+        savepath: Path to save the plot.    
+    """
+    
+    subject_sample_counts = [len(subject_sample_dict[id]) for id in ids]
+            
+    plt.figure(figsize=(10, 6))
+    sns.histplot(subject_sample_counts, kde=False)  # kde=False removes the kernel density estimate line
+    plt.title("Distribution of Sample Counts per Subject")
+    plt.xlabel("Number of Samples")
+    plt.ylabel("Number of Subjects")
+
+    # Calculate and display mean, standard deviation, min, and max
+    mean_samples = np.mean(subject_sample_counts)
+    std_samples = np.std(subject_sample_counts)
+    min_samples = np.min(subject_sample_counts)
+    max_samples = np.max(subject_sample_counts)
+    
+    plt.text(0.95, 0.95, f'Mean: {mean_samples:.2f}\nStd: {std_samples:.2f}\nMin: {min_samples}\nMax: {max_samples}',
+             verticalalignment='top', horizontalalignment='right',
+             transform=plt.gca().transAxes,
+             bbox=dict(facecolor='white', alpha=0.7))
+
+    plt.tight_layout()
+    plt.savefig(savepath)
+    plt.close()
+
+
+def plot_train_val_test_samples_distribution(train_samples_list, val_samples_list, test_samples_list, title='', savepath='./figs'):
+    r"""
+    Plots the distribution of samples across train, validation, and test sets.
+
+    Parameters
+    ------------
+    train_samples_list : list
+        List of sample IDs for the training set.
+    val_samples_list : list
+        List of sample IDs for the validation set.
+    test_samples_list : list
+        List of sample IDs for the test set.
+    savepath : str, optional
+        File path to save the generated plot. Defaults to './figs/dataset_overview.jpg'.
+
+    Returns
+    ------------
+    None (saves the plot to the specified savepath)
+    """
+    x_values = ['train', 'val', 'test']
+    y_values = [len(train_samples_list), len(val_samples_list), len(test_samples_list)]
+    
+    # Create a Pandas DataFrame for Seaborn
+    df = pd.DataFrame({
+        'Split': x_values,
+        'Samples': y_values
+    })
+
+    # Pastel color palette
+    pastel_palette = sns.color_palette("pastel")
+
+    # Plotting with Seaborn
+    fig, axes = plt.subplots(1, 1, figsize=(10, 5))
+
+    sns.barplot(x='Split', y='Samples', hue='Split', data=df, ax=axes, palette=pastel_palette, legend=False)  # Added hue and legend=False
+    axes.set_ylabel('# Samples')
+
+    fig.suptitle(f'{title}', fontsize=14)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap with suptitle
+
+    plt.savefig(savepath)
+    plt.close()
+
+
+def plot_pretraining_personalization_subjects_distribution(pretraining_subjects, personalization_subjects, title='', savepath='./figs/two_series_distribution.jpg'):
+    r"""
+    Plots the distribution of counts for two series of values.
+
+    Parameters
+    ------------
+    pretraining_subjects : list
+        List of items representing the first series.
+    personalization_subjects : list
+        List of items representing the second series.
+    title : str, optional
+        Title of the plot. Defaults to ''.
+    savepath : str, optional
+        File path to save the generated plot. Defaults to './figs/two_series_distribution.jpg'.
+
+    Returns
+    ------------
+    None (saves the plot to the specified savepath)
+    """
+    series_names = ['Pretraining', 'Personalization']
+    series_counts = [len(pretraining_subjects), len(personalization_subjects)]
+
+    # Create a Pandas DataFrame for Seaborn
+    df = pd.DataFrame({
+        'Split': series_names,
+        'Count': series_counts
+    })
+
+    # Pastel color palette
+    pastel_palette = sns.color_palette("pastel")
+
+    # Plotting with Seaborn
+    fig, axes = plt.subplots(1, 1, figsize=(8, 5))
+
+    sns.barplot(x='Split', y='Count', hue='Split', data=df, ax=axes, palette=pastel_palette, legend=False)  # Added hue and legend=False
+    axes.set_ylabel('# subjects')
+
+    fig.suptitle(f'{title}', fontsize=14)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap with suptitle
+
+    plt.savefig(savepath)
+    plt.close()
+
+
+
+def plot_signals(signals, labels=None, title="Signals Plot", fs=125, savepath='./figs', ylabels=None):
+    r"""
+    Plots multiple 1D signals on the same figure.
+
+    Parameters
+    ------------
+    
+    signals (list or numpy.ndarray): 
+        A list of 1D NumPy arrays, or a 2D NumPy array where each row is a signal.
+    labels (list, optional): 
+        A list of strings, one for each signal, to use as labels in the legend. Defaults to None.
+    title (str, optional): 
+        The title of the plot. Defaults to "Signals Plot".
+    fs (int, optional): 
+        The sampling frequency of the signals. Defaults to 125.
+    """
+
+    num_signals = len(signals) if isinstance(signals, list) else signals.shape[0] # Handle list or 2D array input
+    time = np.arange(signals[0].size if isinstance(signals, list) else signals.shape[1]) / fs  # Time vector in seconds
+
+    plt.figure(figsize=(12, 2 * num_signals))  # Adjust figure size as needed
+    plt.suptitle(title, fontsize=14)  # Overall plot title
+
+    for i in range(num_signals):
+        plt.subplot(num_signals, 1, i + 1)  # Create subplots
+
+        signal = signals[i] if isinstance(signals, list) else signals[i, :] # Get the signal
+
+        plt.plot(time, signal)  # Plot the signal
+        if labels:
+            plt.title(labels[i])  # Use provided labels
+        else:
+            plt.title(f"Signal {i+1}")  # Default title
+
+        plt.xlabel("Time (seconds)")
+        if ylabels is None:
+            plt.ylabel("Amplitude")
+        else:
+            plt.ylabel(ylabels[i])
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust subplot params for title
+    plt.savefig(os.path.join(savepath, f'{title}.jpg'))
+    plt.close()
+
+
+def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks : np.array = None, valleys: np.array = None, title : str = 'ABP', save_path : str = './figs') -> None:
+    r"""
+    Handy function to plot a signal, with its peaks, valleys, flat parts, outliers, and lower/upper envelops (when provided).
+
+    Parameters
+    ------------
+
+    signal: np.array,
+        the signal to analyze
+    fs: int,
+        the sampling rate of the signal
+    flat_locs_sig: np.array, default None,
+        the locations of the flat lines
+    peaks: np.array, default None,
+        the locations of the peaks
+    valleys: np.array, default None,
+        the locations of the valleys
+    title: str, default '',
+        the title of the plot
+    save_path: str, default './',
+        where to save the image
+
+    Returns
+    ------------
+    None
+    """
+
+    # Seconds on the x-axis, amplitude on the y-axis
+    t = np.arange(0, (len(signal) / fs), 1.0 / fs)
+    plt.title(f'{title}')
+    plt.xlabel('s')
+    plt.ylabel('mmHg')
+    plt.plot(t, signal, label='abp')
+
+    if peaks is not None:
+        # If peaks are provided, then also the upper envelope of the signal is plotted
+        x_vals = np.arange(len(signal))
+        up_env = np.interp(x_vals, peaks, signal[peaks])
+        plt.plot(t, up_env, color='red', label='up envelope', marker='o', linestyle='dashed', linewidth=1, markersize=1)
+        plt.scatter(t[peaks], signal[peaks], color='red', label='peaks')
+
+    if valleys is not None:
+        # If valleys are provided, then also the lower envelope of the signal is plotted
+        x_vals = np.arange(len(signal))
+        down_env = np.interp(x_vals, valleys, signal[valleys])
+        plt.plot(t, down_env, color='blue', label='down envelope', marker='o', linestyle='dashed', linewidth=1, markersize=1)
+        plt.scatter(t[valleys], signal[valleys], color='blue', label='valleys')
+
+    if flat_locs_sig is not None:
+        plt.scatter(t[flat_locs_sig], signal[flat_locs_sig], color='green', label='flat lines')
+
+    plt.legend(loc='upper right')
+    plt.savefig(os.path.join(save_path, f'{title}.jpg'))
+    plt.close()
