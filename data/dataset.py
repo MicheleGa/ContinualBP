@@ -17,7 +17,24 @@ from preprocessing_utils.split import split_train_val_test
 
 
 class PhysioDataset(Dataset):
-    def __init__(self, seed, lmdb_folder, pretraining_ratio=0.8, pretraining_split_ratio=[0.7, 0.1, 0.2], personalization_sample_number=50, mix_pretraining_subject_samples=False, fs=125, input_seq_len_s=5, ecg=False, resp=False, ppg_derivatives=False, ppg_emd=False, ppg_freqs=False, min_subject_sample_number=0, plot=False, savepath='./figs'):
+    def __init__(self,
+                 seed, 
+                 lmdb_folder, 
+                 pretraining_ratio=0.8, 
+                 pretraining_split_ratio=[0.7, 0.1, 0.2], 
+                 personalization_sample_number=50, 
+                 mix_pretraining_subject_samples=False, 
+                 fs=125, 
+                 input_seq_len_s=5, 
+                 ecg=False, 
+                 resp=False, 
+                 sig2sig=False,
+                 ppg_derivatives=False, 
+                 ppg_emd=False, 
+                 ppg_freqs=False, 
+                 min_subject_sample_number=0, 
+                 plot=False, 
+                 savepath='./figs'):
         super(PhysioDataset, self).__init__()
 
         # Generic arguments
@@ -38,6 +55,7 @@ class PhysioDataset(Dataset):
         # Which input data to load (PPG + VPG + APG, PPG + ECG, etc.), PPG is always loaded
         self.ecg = ecg
         self.resp = resp
+        self.sig2sig = sig2sig # Predict annotation over the whole analysis window or not
         self.ppg_derivatives = ppg_derivatives
         self.ppg_emd = ppg_emd
         self.ppg_freqs = ppg_freqs
@@ -264,20 +282,32 @@ class PhysioDataset(Dataset):
             sample['sig'] = sample['ppg']
         
         # Annotation
-        sample['sbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-sbp".format(index).encode()), dtype="float32"))
-        sample['dbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-dbp".format(index).encode()), dtype="float32"))
+        if self.sig2sig:
+            sample['abp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-abp".format(index).encode()), dtype="float32"))
+            
+            for k in sample:
+                sample[k] = np.require(sample[k], requirements=['O', 'W'])
+                sample[k].setflags(write=1)
+            
+            # Cast to torch tensor
+            signals = torch.tensor(sample['sig'])
+            abp = torch.tensor(sample['abp'])
+            
+            return signals, abp
+        else:
+            sample['sbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-sbp".format(index).encode()), dtype="float32"))
+            sample['dbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-dbp".format(index).encode()), dtype="float32"))
         
-        for k in sample:
-            sample[k] = np.require(sample[k], requirements=['O', 'W'])
-            sample[k].setflags(write=1)
-        
-        # Cast to torch tensor
-        signals = torch.tensor(sample['sig'])
-        
-        sbp_val = torch.tensor(sample['sbp']).unsqueeze(-1)
-        dbp_val = torch.tensor(sample['dbp']).unsqueeze(-1)
-        
-        return signals, [sbp_val, dbp_val]
+            for k in sample:
+                sample[k] = np.require(sample[k], requirements=['O', 'W'])
+                sample[k].setflags(write=1)
+            
+            # Cast to torch tensor
+            signals = torch.tensor(sample['sig'])
+            sbp_val = torch.tensor(sample['sbp']).unsqueeze(-1)
+            dbp_val = torch.tensor(sample['dbp']).unsqueeze(-1)
+            
+            return signals, [sbp_val, dbp_val]
     
 
 def parseargs():
@@ -296,6 +326,7 @@ def parseargs():
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
+    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
     parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
     parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
@@ -333,6 +364,7 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         resp=args.resp,
+        sig2sig=args.sig2sig,
         ppg_derivatives=args.ppg_derivatives,
         ppg_emd=args.ppg_emd,
         ppg_freqs=args.ppg_freqs,
@@ -355,18 +387,34 @@ if __name__ == "__main__":
     annotation = input_batch[1]
     
     idx = np.random.randint(0, sig.shape[0])
-    sbp_val = annotation[0][idx].squeeze().numpy()
-    dbp_val = annotation[1][idx].squeeze().numpy()
+    if args.sig2sig:
+        sig = sig[idx, :, :].squeeze().numpy()
+        abp = annotation[idx, :].squeeze().numpy()
+    else:
+        sbp_val = annotation[0][idx].squeeze().numpy()
+        dbp_val = annotation[1][idx].squeeze().numpy()
     
     # Note that the train_dataloader will already return the required signals specified by the conditions
     if args.ecg and not args.resp and not args.ppg_derivatives and not args.ppg_emd and not args.ppg_freqs:
-        plot_signals(
-            sig[idx, :, :].T, fs=args.fs, 
-            labels=['PPG', 'ECG'], 
-            title=f'PPG + ECG subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-            savepath=root_figs_folder, 
-            ylabels=['a.u.', 'mV']
+        
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ECG', 'ABP'], 
+                title=f'Input: PPG + ECG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV', 'mmHg']
             )
+        else:
+            plot_signals(
+                sig[idx, :, :].T, fs=args.fs, 
+                labels=['PPG', 'ECG'], 
+                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV']
+                )
         
         if args.plot_aug:
             augments = RandomAugmentor(
@@ -388,19 +436,32 @@ if __name__ == "__main__":
                 inp_sigs_augs[idx, :, :].T, 
                 fs=args.fs, 
                 labels=['PPG', 'ECG'], 
-                title=f'Augmented PPG + ECG subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                title=f'Augmented PPG + ECG', 
                 savepath=root_figs_folder, 
                 ylabels=['a.u.', 'mmV']
             )
+            
     elif args.ecg and args.resp and not args.ppg_derivatives and not args.ppg_emd and not args.ppg_freqs:
-        plot_signals(
-            sig[idx, :, :].T, 
-            fs=args.fs, 
-            labels=['PPG', 'ECG', 'RESP'], 
-            title=f'PPG + ECG + RESP subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-            savepath=root_figs_folder, 
-            ylabels=['a.u.', 'mV', 'pm']
+        
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ECG', 'RESP', 'ABP'], 
+                title=f'Input: PPG + ECG + RESP, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV', 'pm', 'mmHg']
             )
+        else:    
+            plot_signals(
+                sig[idx, :, :].T, 
+                fs=args.fs, 
+                labels=['PPG', 'ECG', 'RESP'], 
+                title=f'Input: PPG + ECG + RESP, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV', 'pm']
+                )
         
         if args.plot_aug:
             augments = RandomAugmentor(
@@ -422,41 +483,79 @@ if __name__ == "__main__":
                 inp_sigs_augs[idx, :, :].T, 
                 fs=args.fs, 
                 labels=['PPG', 'ECG', 'RESP'], 
-                title=f'Augmented PPG + ECG subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                title=f'Augmented PPG + ECG + RESP', 
                 savepath=root_figs_folder, 
                 ylabels=['a.u.', 'mV', 'pm']
             )
+            
     elif not args.ecg and not args.resp and args.ppg_derivatives and not args.ppg_emd and not args.ppg_freqs:
-        plot_signals(
-            sig[idx, :, :].T,
-            fs=args.fs, 
-            labels=['PPG', 'VPG', 'APG'], 
-            title=f'PPG + VPG + APG subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-            savepath=root_figs_folder, 
-            ylabels=['a.u.', 'a.u.', 'a.u.']
+        
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'VPG', 'APG', 'ABP'], 
+                title=f'Input: PPG + VPG + APG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'a.u.', 'a.u.', 'mmHg']
             )
+        else:    
+            plot_signals(
+                sig[idx, :, :].T,
+                fs=args.fs, 
+                labels=['PPG', 'VPG', 'APG'], 
+                title=f'Input: PPG + VPG + APG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'a.u.', 'a.u.']
+                )
         
     elif not args.ecg and not args.resp and not args.ppg_derivatives and args.ppg_emd and not args.ppg_freqs:
-        plot_signals(
-            sig[idx, :, :].T,
-            fs=args.fs, 
-            labels=['IMF0', 'IMF1', 'IMF2', 'IMF3'], 
-            title=f'PPG EMD (4 channels) subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-            savepath=root_figs_folder, 
-            ylabels=['a.u.', 'a.u.', 'a.u.', 'a.u.']
+        
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['IMF0', 'IMF1', 'IMF2', 'IMF3', 'ABP'], 
+                title=f'Input: PPG EMD (4 channels), Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'a.u.', 'a.u.', 'a.u.', 'mmHg']
             )
+        else:
+            plot_signals(
+                sig[idx, :, :].T,
+                fs=args.fs, 
+                labels=['IMF0', 'IMF1', 'IMF2', 'IMF3'], 
+                title=f'Input: PPG EMD (4 channels), Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'a.u.', 'a.u.', 'a.u.']
+                )
+            
     elif not args.ecg and not args.resp and not args.ppg_derivatives and not args.ppg_emd and args.ppg_freqs:
         #plot_signals(sig[idx, :, :].T, labels=['IMF0', 'IMF1', 'IMF2', 'IMF3'], title=f'PPG EMD (4 channels) [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', savepath=root_figs_folder)
         print('Plot scalogram to be done soon ...')
     else:
-        plot_signals(
-            sig[idx, :, :].T, 
-            fs=args.fs,
-            labels=['PPG'], 
-            title=f'PPG subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-            savepath=root_figs_folder, 
-            ylabels=['a.u.']
+        
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ABP'], 
+                title=f'Input: PPG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mmHg']
             )
+        else:
+            plot_signals(
+                sig[idx, :, :].T, 
+                fs=args.fs,
+                labels=['PPG'], 
+                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.']
+                )
         
         if args.plot_aug:
             augments = RandomAugmentor(
@@ -478,7 +577,7 @@ if __name__ == "__main__":
                 inp_sigs_augs[idx, :, :].T, 
                 fs=args.fs, 
                 labels=['PPG'], 
-                title=f'Augmented PPG subj. [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
+                title=f'Augmented PPG', 
                 savepath=root_figs_folder, 
                 ylabels=['a.u.']
             )

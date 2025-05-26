@@ -77,6 +77,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
             ppg_freqs = scalogram(window_ppg, fs=fs, high_freq=12.5, low_freq=0.5, num_scales=16, plot=args.plot, savepath=savepath)
             
         # Ensure everything is in np.float32
+        window_abp = window_abp.astype(np.float32)
         sbp = sbp.astype(np.float32)
         dbp = dbp.astype(np.float32)
         
@@ -88,7 +89,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
         if args.resp:
             window_resp = window_resp.astype(np.float32)
         
-        # Notice: we calculate EMD and Scalogram only after the z-score 
+        # N.B.: we calculate EMD and Scalogram only after the z-score 
         if args.ppg_emd:
             imfs = imfs.astype(np.float32)
             
@@ -98,38 +99,74 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
         # Save into subject data
         if args.ppg_emd and not args.scalogram:
             if args.resp:
-                subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, sbp, dbp))
+                if args.sig2sig:
+                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, window_abp))
+                else:
+                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, sbp, dbp))
             else:
-                subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, sbp, dbp))
+                if args.sig2sig:
+                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, window_abp))
+                else:
+                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, sbp, dbp))
         elif not args.ppg_emd and args.scalogram:
             if args.resp:
-                subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, sbp, dbp))
+                if args.sig2sig:
+                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, window_abp))
+                else:
+                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, sbp, dbp))
             else:
-                subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, sbp, dbp))
+                if args.sig2sig:
+                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, window_abp))
+                else:
+                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, sbp, dbp))
         else:
             if args.resp:
-                subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, sbp, dbp))
+                if args.sig2sig:
+                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp))
+                else:
+                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, sbp, dbp))
             else:
-                subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, sbp, dbp))
+                if args.sig2sig:
+                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, window_abp))
+                else:
+                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, sbp, dbp))
                 
         if args.plot:
             plot_abp(window_abp, fs=fs, peaks=peaks, valleys=valleys, title=f'ABP [SBP {sbp:.2f} - DBP {dbp:.2f}]', save_path=savepath)
             if args.resp:
-                plot_signals(
-                    [window_ppg, window_vpg, window_apg, window_ecg, window_resp], 
-                    labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP'], 
-                    title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
-                    savepath=savepath, 
-                    ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm']
-                    )
+                if args.sig2sig:
+                    plot_signals(
+                        [window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp], 
+                        labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP', 'ABP'], 
+                        title=f'Sample Input Signals', 
+                        savepath=savepath, 
+                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm', 'mmHg']
+                        )
+                else:
+                    plot_signals(
+                        [window_ppg, window_vpg, window_apg, window_ecg, window_resp], 
+                        labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP'], 
+                        title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
+                        savepath=savepath, 
+                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm']
+                        )
             else:
-                plot_signals(
-                    [window_ppg, window_vpg, window_apg, window_ecg], 
-                    labels=['PPG', 'VPG', 'APG', 'ECG'], 
-                    title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
-                    savepath=savepath, 
-                    ylabels=['a.u.', 'a.u.', 'a.u.', 'mV']
-                    )
+                if args.sig2sig:
+                    plot_signals(
+                        [window_ppg, window_vpg, window_apg, window_ecg, window_abp], 
+                        labels=['PPG', 'VPG', 'APG', 'ECG', 'ABP'], 
+                        title=f'Sample Input Signals', 
+                        savepath=savepath, 
+                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'mmHg']
+                        )
+                else:
+                    plot_signals(
+                        [window_ppg, window_vpg, window_apg, window_ecg], 
+                        labels=['PPG', 'VPG', 'APG', 'ECG'], 
+                        title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
+                        savepath=savepath, 
+                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV']
+                        )
             # No need to do the preprocessing of all subjects when plot true
             exit()
 
@@ -253,55 +290,106 @@ def preprocess_dataset(args):
             
             subject_id_list.append(subject_id)
             index_by_subject_id[subject_id] = []
-
             subject_n_recording = 0
+            
             if args.ppg_emd and not args.scalogram:
-                for window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, sbp, dbp in subject_data:
-                    txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
-                    txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
-                    txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
-                    txn.put(key="{}-imfs".format(sample_id).encode(), value=imfs.tobytes())
-                    txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
-                    if window_resp is not None:
-                        txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes())
-                    txn.put(key="{}-sbp".format(sample_id).encode(), value=np.array([sbp]).tobytes())
-                    txn.put(key="{}-dbp".format(sample_id).encode(), value=np.array([dbp]).tobytes())
+                
+                if args.sig2sig:
+                    for window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, window_abp in subject_data:
+                        txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
+                        txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
+                        txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
+                        txn.put(key="{}-imfs".format(sample_id).encode(), value=imfs.tobytes())
+                        txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
+                        if window_resp is not None:
+                            txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes())
+                        txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
+                        
+                        index_by_sample_id.append((subject_id, subject_n_recording))
+                        index_by_subject_id[subject_id].append(sample_id)
+                        sample_id += 1
+                        subject_n_recording += 1
+                else:
+                    for window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, sbp, dbp in subject_data:
+                        txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
+                        txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
+                        txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
+                        txn.put(key="{}-imfs".format(sample_id).encode(), value=imfs.tobytes())
+                        txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
+                        if window_resp is not None:
+                            txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes())
+                        txn.put(key="{}-sbp".format(sample_id).encode(), value=np.array([sbp]).tobytes())
+                        txn.put(key="{}-dbp".format(sample_id).encode(), value=np.array([dbp]).tobytes())
 
-                    index_by_sample_id.append((subject_id, subject_n_recording))
-                    index_by_subject_id[subject_id].append(sample_id)
-                    sample_id += 1
-                    subject_n_recording += 1
+                        index_by_sample_id.append((subject_id, subject_n_recording))
+                        index_by_subject_id[subject_id].append(sample_id)
+                        sample_id += 1
+                        subject_n_recording += 1
+                        
             elif not args.ppg_emd and args.scalogram:
-                for window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, sbp, dbp in subject_data:
-                    txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
-                    txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
-                    txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
-                    txn.put(key="{}-ppg_freqs".format(sample_id).encode(), value=ppg_freqs.tobytes())
-                    txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
-                    if window_resp is not None:
-                        txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes())         
-                    txn.put(key="{}-sbp".format(sample_id).encode(), value=np.array([sbp]).tobytes())
-                    txn.put(key="{}-dbp".format(sample_id).encode(), value=np.array([dbp]).tobytes())
+                
+                if args.sisg2sig:
+                    for window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, window_abp in subject_data:
+                        txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
+                        txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
+                        txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
+                        txn.put(key="{}-ppg_freqs".format(sample_id).encode(), value=ppg_freqs.tobytes())
+                        txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
+                        if window_resp is not None:
+                            txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes())         
+                        txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
 
-                    index_by_sample_id.append((subject_id, subject_n_recording))
-                    index_by_subject_id[subject_id].append(sample_id)
-                    sample_id += 1
-                    subject_n_recording += 1
+                        index_by_sample_id.append((subject_id, subject_n_recording))
+                        index_by_subject_id[subject_id].append(sample_id)
+                        sample_id += 1
+                        subject_n_recording += 1
+                else:
+                    for window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, sbp, dbp in subject_data:
+                        txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
+                        txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
+                        txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
+                        txn.put(key="{}-ppg_freqs".format(sample_id).encode(), value=ppg_freqs.tobytes())
+                        txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
+                        if window_resp is not None:
+                            txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes())         
+                        txn.put(key="{}-sbp".format(sample_id).encode(), value=np.array([sbp]).tobytes())
+                        txn.put(key="{}-dbp".format(sample_id).encode(), value=np.array([dbp]).tobytes())
+
+                        index_by_sample_id.append((subject_id, subject_n_recording))
+                        index_by_subject_id[subject_id].append(sample_id)
+                        sample_id += 1
+                        subject_n_recording += 1
+                        
             else:
-                for window_ppg, window_vpg, window_apg, window_ecg, window_resp, sbp, dbp in subject_data:
-                    txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
-                    txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
-                    txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
-                    txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
-                    if window_resp is not None:
-                        txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes()) 
-                    txn.put(key="{}-sbp".format(sample_id).encode(), value=np.array([sbp]).tobytes())
-                    txn.put(key="{}-dbp".format(sample_id).encode(), value=np.array([dbp]).tobytes())
+                if args.sig2sig:
+                    for window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp in subject_data:
+                        txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
+                        txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
+                        txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
+                        txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
+                        if window_resp is not None:
+                            txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes()) 
+                        txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
+                        
+                        index_by_sample_id.append((subject_id, subject_n_recording))
+                        index_by_subject_id[subject_id].append(sample_id)
+                        sample_id += 1
+                        subject_n_recording += 1
+                else:
+                    for window_ppg, window_vpg, window_apg, window_ecg, window_resp, sbp, dbp in subject_data:
+                        txn.put(key="{}-ppg".format(sample_id).encode(), value=window_ppg.tobytes())
+                        txn.put(key="{}-vpg".format(sample_id).encode(), value=window_vpg.tobytes())
+                        txn.put(key="{}-apg".format(sample_id).encode(), value=window_apg.tobytes())
+                        txn.put(key="{}-ecg".format(sample_id).encode(), value=window_ecg.tobytes())
+                        if window_resp is not None:
+                            txn.put(key="{}-resp".format(sample_id).encode(), value=window_resp.tobytes()) 
+                        txn.put(key="{}-sbp".format(sample_id).encode(), value=np.array([sbp]).tobytes())
+                        txn.put(key="{}-dbp".format(sample_id).encode(), value=np.array([dbp]).tobytes())
 
-                    index_by_sample_id.append((subject_id, subject_n_recording))
-                    index_by_subject_id[subject_id].append(sample_id)
-                    sample_id += 1
-                    subject_n_recording += 1
+                        index_by_sample_id.append((subject_id, subject_n_recording))
+                        index_by_subject_id[subject_id].append(sample_id)
+                        sample_id += 1
+                        subject_n_recording += 1
 
         txn.put(key="index_by_sample_id".encode(), value=pickle.dumps(index_by_sample_id))
         txn.put(key="index_by_subject_id".encode(), value=pickle.dumps(index_by_subject_id))
@@ -326,6 +414,7 @@ def parseargs():
     parser.add_argument('--butterworth_filter', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth PPG with the Butterworth Filter or not')
     parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to calcualte empirical mode decompoistion for PPG (4 channels) or not')
     parser.add_argument('--scalogram', default='False', type=lambda x: bool(strtobool(x)), help='whether to calcualte the scalogram for PPG or not')
+    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot intermediate preprocessing steps or not')
     
     args = parser.parse_args()

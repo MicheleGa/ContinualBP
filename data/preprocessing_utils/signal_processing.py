@@ -132,36 +132,6 @@ def create_windows(win_len, fs, n_samp, overlap):
     return idx_start, idx_stop
     
 
-def resample_signal(signal, original_fs, target_fs):
-    """
-    Resamples a signal from original_fs to target_fs using scipy.signal.resample_poly.
-
-    Parameters
-    ----------
-    signal (numpy.ndarray): 
-        The input signal.
-    original_fs (float): 
-        The original sampling frequency.
-    target_fs (float): 
-        The target sampling frequency.
-
-    Returns
-    -------
-    numpy.ndarray: The resampled signal.
-    """
-
-    up = target_fs
-    down = original_fs
-
-    # Find the greatest common divisor to simplify the fraction
-    gcd = np.gcd(int(up), int(down))
-    up = int(up / gcd)
-    down = int(down / gcd)
-
-    resampled_signal = resample_poly(signal, up=up, down=down)
-    return resampled_signal
-    
-
 def align_pair(abp, raw_ppg, windowing_time, fs):
     """
     Align ABP and PPG signal passed as parameters using the maximum cross-correlation.

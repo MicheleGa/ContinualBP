@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+from pyampd.ampd import find_peaks
+import warnings
     
     
 def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs/dataset'):
@@ -15,9 +16,23 @@ def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs
 
         for batch in dataloader:
             _, annotation = batch 
-            sbp_values.extend(annotation[0].flatten().tolist())
-            dbp_values.extend(annotation[1].flatten().tolist())
-
+            if isinstance(annotation, tuple):
+                sbp_values.extend(annotation[0].flatten().tolist())
+                dbp_values.extend(annotation[1].flatten().tolist())
+            else:
+                window_abp = annotation.numpy()
+                
+                for el in range(window_abp.shape[0]):
+                
+                    peaks = find_peaks(window_abp[el])[1:-1]
+                    valleys = find_peaks(-window_abp[el])[1:-1]
+                    if len(peaks) == 0 or len(valleys) == 0:
+                        continue
+                    sbp = np.mean(window_abp[el, peaks]).astype(np.float32)
+                    dbp = np.mean(window_abp[el, valleys]).astype(np.float32)
+                    sbp_values.extend([sbp])
+                    dbp_values.extend([dbp])
+                    
         sbp_values = np.array(sbp_values)
         dbp_values = np.array(dbp_values)
 
@@ -261,6 +276,8 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
 
     # Seconds on the x-axis, amplitude on the y-axis
     t = np.arange(0, (len(signal) / fs), 1.0 / fs)
+    
+    plt.figure(figsize=(10, 6))  # Adjust figure size as needed
     plt.title(f'{title}')
     plt.xlabel('s')
     plt.ylabel('mmHg')
