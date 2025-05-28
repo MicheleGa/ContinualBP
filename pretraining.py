@@ -39,9 +39,9 @@ def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_pat
     # Get train/val/test samplers and build the dataloaders
     (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
     
-    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=config['batchsize'], num_workers=config['loader_worker'], pin_memory=True)    
-    valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=config['batchsize'], num_workers=config['loader_worker'], pin_memory=True)
-    test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config['batchsize'], num_workers=config['loader_worker'], pin_memory=True)
+    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
+    valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+    test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     
     all_targets, all_outputs = pretraining_training_validation_testing(
         save_name=save_name,
@@ -113,11 +113,12 @@ def parseargs():
     parser.add_argument('--loader_worker', default=4, type=int, help='number of data loader workers')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
+    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
     parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
     parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--aug', default='False', type=lambda x: bool(strtobool(x)), help='whether to use data augmentations during pretraining or not')
-    parser.add_argument('--batchsize', default=256, type=int, help='batch size')
+    parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     
@@ -127,19 +128,36 @@ def parseargs():
     parser.add_argument('--proj_head_dim', default=256, type=int, help='dimension of the projection head after the feture extractor') 
     
     # ResGRUNet setup
-    parser.add_argument('--gru', default='True', type=lambda x: bool(strtobool(x)), help='whether to use a GRU after CNN or not')
-    parser.add_argument('--channels', default='1, 32, 64, 128', type=str, help='channels produced by the convolutional blocks')
-    parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
-    parser.add_argument('--kernel_size', default=7, type=int, help='convolutional layer kernel size')
-    parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
-    parser.add_argument('--supervised', default='False', type=lambda x: bool(strtobool(x)), help='whether to use the model with pretrianing or not')
+    #parser.add_argument('--gru', default='True', type=lambda x: bool(strtobool(x)), help='whether to use a GRU after CNN or not')
+    #parser.add_argument('--channels', default='1, 32, 64, 128', type=str, help='channels produced by the convolutional blocks')
+    #parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
+    #parser.add_argument('--kernel_size', default=7, type=int, help='convolutional layer kernel size')
+    #parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
+    #parser.add_argument('--supervised', default='False', type=lambda x: bool(strtobool(x)), help='whether to use the model with pretrianing or not')
         
-    # PhysioFormer setup
-    parser.add_argument('--embed_dim', default=64, type=int, help='input embedding size')
-    parser.add_argument('--hidden_dim', default=256, type=int, help='transformer hidden dimension')
-    parser.add_argument('--num_layers', default=3, type=int, help='number of transformer layers')
-    parser.add_argument('--n_head', default=4, type=int, help='number of self-attention heads')
-    parser.add_argument('--head_dim', default=16, type=int, help='self-attention headd dimension')
+    ## PhysioFormer setup
+    #parser.add_argument('--embed_dim', default=64, type=int, help='input embedding size')
+    #parser.add_argument('--hidden_dim', default=256, type=int, help='transformer hidden dimension')
+    #parser.add_argument('--num_layers', default=3, type=int, help='number of transformer layers')
+    #parser.add_argument('--n_head', default=4, type=int, help='number of self-attention heads')
+    #parser.add_argument('--head_dim', default=16, type=int, help='self-attention headd dimension')
+    
+    # UNet setup
+    parser.add_argument('--channels', default='32, 64, 128, 256, 512', type=str, help='channels produced by the convolutional blocks')
+    parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
+    parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
+    parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
+    
+    # GRU setup
+    parser.add_argument('--hidden_dim', default=128, type=int, help='GRU hidden dimension size')
+    parser.add_argument('--num_layers', default=2, type=int, help='number of GRU layers')
+    parser.add_argument('--bidirectional', default=True, type=lambda x: bool(strtobool(x)), help='whether to use bidirectional GRU or not')
+        
+    # Transformer setup
+    parser.add_argument('--embed_dim', default=32, type=int, help='transformer embedding dimension size')
+    parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
+    parser.add_argument('--num_encoder_layers', default=2, type=int, help='number of trasnformer layers')
+    parser.add_argument('--dim_feedforward', default=128, type=int, help='feedforward dimension size in the transformer encoder') 
         
     args = parser.parse_args()
     return args
@@ -212,6 +230,7 @@ if __name__ == "__main__":
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
         resp=config['resp'],
+        sig2sig=config['sig2sig'],
         ppg_derivatives=config['ppg_derivatives'],
         ppg_emd=config['ppg_emd'],
         ppg_freqs=config['ppg_freqs']

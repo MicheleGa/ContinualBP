@@ -4,10 +4,23 @@ import yaml
 import numpy as np
 import random
 import torch
-from models import ResGRUNet, PhysioFormer
+from models import ResGRUNet, PhysioFormer, UNet, GRU, Transformer, EUNet
 
 
 def fixseed(SEED):
+    r"""
+    Fixes the random seed for reproducibility across runs.
+    
+    Parameters
+    ------------    
+        SEED (int): 
+            The seed value to be set for random number generation.  
+    
+    Returns
+    ------------
+        None: 
+            The function sets the random seed for various libraries to ensure reproducibility.
+    """
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
@@ -18,6 +31,21 @@ def fixseed(SEED):
 
 
 def generate_runname(model_name, exp_name):
+    r"""
+    Composes a unique run name based on the model name, experiment name, and current timestamp.
+    
+    Parameters
+    ------------
+        model_name (str): 
+            Name of the model.
+        exp_name (str): 
+            Name of the experiment.
+    Returns
+    ------------
+        str: 
+            A unique run name formatted as "exp_name-model_name-YYYY_MM_DD-HH_MM_SS".    
+    """
+    
     exec_timestamp = time.localtime()
     exec_timestr = "{:4d}_{:02d}_{:02d}-{:02d}_{:02d}_{:02d}".format(
         exec_timestamp.tm_year, 
@@ -31,7 +59,21 @@ def generate_runname(model_name, exp_name):
 
 
 def numpy_mse_loss(outputs, targets):
-    """Calculates MSE loss using NumPy."""
+    r"""
+    Calculates MSE loss using NumPy.
+    
+    Parameters
+    ------------
+        outputs (np.ndarray): 
+            Predicted values.
+        targets (np.ndarray): 
+            Ground truth values.
+    
+    Returns
+    ------------
+        float: 
+            The mean squared error loss.
+    """
     return np.mean((outputs - targets)**2)
 
 
@@ -44,7 +86,37 @@ def numpy_smooth_l1_loss(outputs, targets, beta=1.0):
 
     
 def save_status(subject_id, epoch, model_name, save_name, model, optimizer, scheduler, meter, checkpoint_path, config):
-    """Save model checkpoint, hyperparameters, and training configurations."""
+    r"""
+    Save model checkpoint, hyperparameters, and training configurations.
+    
+    Parameters
+    ------------
+        subject_id (int or None): 
+            Subject ID for which the checkpoint is saved. If None, saves the global checkpoint.
+        epoch (int): 
+            Current epoch number.
+        model_name (str): 
+            Name of the model checkpoint file.
+        save_name (str): 
+            Name of the experiment or save directory.
+        model (torch.nn.Module): 
+            Model to save the state dictionary from.
+        optimizer (torch.optim.Optimizer): 
+            Optimizer to save the state dictionary from.
+        scheduler (torch.optim.lr_scheduler or None): 
+            Learning rate scheduler to save the state dictionary from.
+        meter (dict): 
+            Dictionary containing validation metrics.
+        checkpoint_path (str): 
+            Path where checkpoints are saved.
+        config (dict): 
+            Configuration dictionary containing model parameters and settings.
+            
+    Returns
+    ------------
+        None: 
+            The function saves the model, optimizer, scheduler state dictionaries, and validation metrics to a file.
+    """
     to_save = dict()
     to_save['epoch'] = epoch
     to_save['model'] = model.state_dict()
@@ -81,7 +153,33 @@ def save_status(subject_id, epoch, model_name, save_name, model, optimizer, sche
         
     
 def load_status(subject_id, model_name, save_name, model, optimizer, scheduler, checkpoint_path, config):
-    """Load model checkpoint."""
+    r"""
+    Load model checkpoint.
+    
+    Parameters
+    ------------
+        subject_id (int or None): 
+            Subject ID for which the checkpoint is loaded. If None, loads the global checkpoint.
+        model_name (str): 
+            Name of the model checkpoint file.
+        save_name (str): 
+            Name of the experiment or save directory.
+        model (torch.nn.Module): 
+            Model to load the state dictionary into.
+        optimizer (torch.optim.Optimizer or None): 
+            Optimizer to load the state dictionary into.
+        scheduler (torch.optim.lr_scheduler or None): 
+            Learning rate scheduler to load the state dictionary into.
+        checkpoint_path (str): 
+            Path where checkpoints are saved.
+        config (dict): 
+            Configuration dictionary containing model parameters and settings.
+            
+    Returns
+    ------------
+        None: 
+            The function modifies the model, optimizer, and scheduler in place.    
+    """
     assert model is not None, "Model is required for loading status"
     
     if subject_id is not None:
@@ -118,15 +216,20 @@ def load_status(subject_id, model_name, save_name, model, optimizer, scheduler, 
     
 
 def configure_optimizer_and_scheduler(model, config):
-    """
+    r"""
     Configure the optimizer and learning rate scheduler.
 
-    Args:
-        parameters (iterable): Model parameters to optimize.
-        config (dict): Configuration dictionary containing optimizer and scheduler settings.
+    Parameters
+    ------------
+        parameters (iterable): 
+            Model parameters to optimize.
+        config (dict): 
+            Configuration dictionary containing optimizer and scheduler settings.
 
-    Returns:
-        dict: A dictionary containing the optimizer and optionally the scheduler.
+    Returns
+    ------------
+        dict: 
+            A dictionary containing the optimizer and optionally the scheduler.
     """
     
     # Configure optimizer
@@ -142,12 +245,23 @@ def configure_optimizer_and_scheduler(model, config):
         raise ValueError("Invalid optimizer type specified in config.")
 
     # Configure learning rate scheduler
+    # TODO: decide where to put the MultistepLR in the training loop (after optimizer.step() or after the loop over batches just before validation?)
     if config['lr_scheduler_enable']:
         if config['lr_scheduler_type'] == 'MultiStepLR':
             scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 optimizer=optimizer,
                 milestones=tuple([int(s) for s in config['lrsched_step'].split(sep=",")]),
                 gamma=config['lrsched_gamma']
+            )
+            return {"optimizer": optimizer, 'lr_scheduler': scheduler}
+        
+        elif config['lr_scheduler_type'] == 'ExponentialLR':
+            lr_start = config['lr']
+            lr_end = config['lr_scheduler_min_lr'] 
+            gamma = (lr_end / lr_start)**(1 / config['max_training_epochs'])
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer=optimizer,
+                gamma=gamma
             )
             return {"optimizer": optimizer, 'lr_scheduler': scheduler}
         
@@ -180,11 +294,22 @@ def configure_optimizer_and_scheduler(model, config):
 
 
 def set_trainable_parameters(model, tune, config):
-    """ Set the parameters of the model to be trainable or not based on the tuning strategy.
-    Args:
-        model (torch.nn.Module): The model to be tuned.
-        tune (str): The tuning strategy. Options are 'all', 'gru' or 'trasnformer', 'projection_head', 'last_linear', or 'none'.
-        config (dict): Configuration dictionary containing model settings.
+    r""" 
+    Set the parameters of the model to be trainable or not based on the tuning strategy.
+    
+    Parameters
+    ------------
+        model (torch.nn.Module): 
+            The model to be tuned.
+        tune (str): 
+            The tuning strategy. Options are 'all', 'gru' or 'trasnformer', 'projection_head', 'last_linear', or 'none'.
+        config (dict): 
+            Configuration dictionary containing model settings.
+    
+    Returns
+    ------------
+        None: 
+            The function modifies the model parameters in place.
     """
     
     for p in model.parameters():
@@ -296,10 +421,13 @@ def set_trainable_parameters(model, tune, config):
 
 
 class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
+    r"""
+    Early stops the training if validation loss doesn't improve after a given patience.
+    """
     def __init__(self, patience=7, verbose=False, delta=0, trace_func=print, mode='min'):
-        """
-        Args:
+        r"""
+        Parameters
+        ------------
             patience (int): How long to wait after last time validation loss improved.
                             Default: 7
             verbose (bool): If True, prints a message for each validation loss improvement.
@@ -348,6 +476,21 @@ class EarlyStopping:
                 
                 
 def get_model_architecture(config):
+    r"""
+    Function to get the model architecture based on the configuration.
+    
+    Parameters
+    ------------
+        config (dict): 
+            Configuration dictionary containing model parameters.
+    
+    Returns
+    ------------
+        model (torch.nn.Module): 
+            The model architecture initialized with the given configuration.   
+    """
+    
+    
     if config['model_name'] == 'ResGRUNet':   
         model = ResGRUNet.ResGRUNet(
             ecg=config['ecg'],
@@ -376,6 +519,73 @@ def get_model_architecture(config):
             hidden_dim=config['hidden_dim'],
             num_layers=config['num_layers'], 
             input_seq_len=int(config['input_seq_len_s'] * config['fs']),
+            return_embedding=config['return_embedding']
+            )
+    elif config['model_name'] == 'UNet':
+        model = UNet.UNet(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            channels=config['channels'],
+            kernel_size=config['kernel_size'],
+            num_heads_attention=config['num_heads_attention'],
+            dim_feedforward_attention=config['dim_feedforward_attention'],
+            set_tunable_params=config['set_tunable_params'],
+            return_embedding=config['return_embedding']
+            )
+    elif config['model_name'] == 'GRU':
+        model = GRU.GRU(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            hidden_dim=config['hidden_dim'],
+            num_layers=config['num_layers'],
+            bidirectional=config['bidirectional'],
+            set_tunable_params=config['set_tunable_params'],
+            return_embedding=config['return_embedding']
+        )
+    elif config['model_name'] == 'Transformer':
+        model = Transformer.Transformer(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            embed_dim=config['embed_dim'],
+            num_heads=config['num_heads'],
+            dim_feedforward=config['dim_feedforward'],
+            num_encoder_layers=config['num_encoder_layers'],
+            set_tunable_params=config['set_tunable_params'],
+            return_embedding=config['return_embedding']
+        )   
+    elif config['model_name'] == 'EUNet':
+        model = EUNet.EUNet(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            channels=config['channels'],
+            kernel_size=config['kernel_size'],
+            num_heads_attention=config['num_heads_attention'],
+            dim_feedforward_attention=config['dim_feedforward_attention'],
+            set_tunable_params=config['set_tunable_params'],
             return_embedding=config['return_embedding']
             )
     else:

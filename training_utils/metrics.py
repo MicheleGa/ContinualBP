@@ -1,13 +1,40 @@
 import os
+import sys
+folders_to_add = ['data']
+for folder in folders_to_add:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import numpy as np
 import matplotlib.pyplot as plt
 import pyCompare
 from sklearn.metrics import r2_score
 import torch
+from pyampd.ampd import find_peaks
 from helpers import numpy_mse_loss, numpy_smooth_l1_loss
+from data.preprocessing_utils.signal_processing import compute_sp_dp
 
 
 def plot_r_squared(gt, pd, name='', save_path='./figs/', figsize=(10, 8)):
+    r"""
+    Plots the R-squared coefficient for the given ground truth and predicted values.
+    
+    Parameters
+    ------------
+        gt:
+            Ground truth values (list or numpy array).
+        pd:
+            Predicted values (list or numpy array).
+        name:
+            Name of the model or dataset for the plot title.
+        save_path:
+            Path to save the plot.
+        figsize:
+            Size of the figure (tuple, default: (10, 8)).
+    
+    Returns
+    ------------
+        None: The function saves the plot to the specified path.    
+    """
+    
     # Sample data (replace with your actual data)
     y_true = np.array(gt)
     y_pred = np.array(pd)
@@ -32,16 +59,20 @@ def plot_r_squared(gt, pd, name='', save_path='./figs/', figsize=(10, 8)):
 
 
 def bhs_grade(differences, thresholds=[5, 10, 15], title=''):
-    """
+    r"""
     Calculates the BHS grade for a list of blood pressure differences.
 
-    Args:
-        differences: A list of differences between blood pressure readings 
-                    (device under evaluation - reference standard).
-        thresholds: A list of thresholds for grading (default: [5, 10, 15] mmHg)
-        title: The name of the model being tested.
+    Parameters
+    ------------
+        differences: 
+            A list of differences between blood pressure readings (device under evaluation - reference standard).
+        thresholds: 
+            A list of thresholds for grading (default: [5, 10, 15] mmHg)
+        title: 
+            The name of the model being tested.
 
-    Returns:
+    Returns
+    ------------
         A character representing the BHS grade (A, B, C, or D).
     """
 
@@ -63,16 +94,20 @@ def bhs_grade(differences, thresholds=[5, 10, 15], title=''):
     
 
 def aami_grade(differences, mean_threshold=5, std_dev_threshold=8):
-    """
+    r"""
     Calculates the AAMI grade for a list of blood pressure differences.
 
-    Args:
-        differences: A list of differences between blood pressure readings 
-                    (device under evaluation - reference standard).
-        mean_threshold: Threshold for the mean difference (default: 5 mmHg).
-        std_dev_threshold: Threshold for the standard deviation (default: 8 mmHg).
+    Parameters
+    ------------
+        differences: 
+            A list of differences between blood pressure readings (device under evaluation - reference standard).
+        mean_threshold: 
+            Threshold for the mean difference (default: 5 mmHg).
+        std_dev_threshold: 
+            Threshold for the standard deviation (default: 8 mmHg).
 
-    Returns:
+    Returns
+    ------------
         A string representing the AAMI grade ("Acceptable", "Potentially Acceptable", or "Unacceptable").
     """
 
@@ -114,8 +149,33 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
     if not os.path.exists(figure_savepath) and plot:
         os.makedirs(figure_savepath)
 
-    sbp_errors = targets[:, 0] - outputs[:, 0]
-    dbp_errors = targets[:, 1] - outputs[:, 1]
+    if config['sig2sig']:
+        # TODO: add MAP, bad reconstructions may not have peaks and valleys, se we replace SBP/DBP with -1 in this case
+        outputs_sbp_values = []
+        outputs_dbp_values = []
+        for el in range(outputs.shape[0]):
+            try:
+                sbp, dbp, _, _, = compute_sp_dp(outputs[el], fs=config['fs'])
+            except:
+                sbp, dbp = -1, -1
+            outputs_sbp_values.extend([sbp])
+            outputs_dbp_values.extend([dbp])
+
+        targets_sbp_values = []
+        targets_dbp_values = []
+        for el in range(targets.shape[0]):
+            try:
+                sbp, dbp, _, _, = compute_sp_dp(targets[el], fs=config['fs'])
+            except:
+                sbp,dbp = -1, -1
+            targets_sbp_values.extend([sbp])
+            targets_dbp_values.extend([dbp])
+        
+        sbp_errors = np.array(targets_sbp_values) - np.array(outputs_sbp_values)
+        dbp_errors = np.array(targets_dbp_values) - np.array(outputs_dbp_values)
+    else:
+        sbp_errors = targets[:, 0] - outputs[:, 0]
+        dbp_errors = targets[:, 1] - outputs[:, 1]
 
     if config['criterion'] == 'MSELoss':
         loss = numpy_mse_loss(outputs, targets)
@@ -161,8 +221,16 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
 
 
 class AverageMeter(object):
-    """Computes and stores the average and current value"""
+    r"""
+    Computes and stores the average and current value.    
+    """
     def __init__(self, name, fmt=':f'):
+        r"""
+        Parameters
+        ------------
+            name (str): Name of the metric.
+            fmt (str): Format for displaying the value (default: ':f').
+        """
         self.name = name
         self.fmt = fmt
         self.reset()
@@ -185,15 +253,20 @@ class AverageMeter(object):
     
 
 def setup_meter(name, metrics):
-    """
+    r"""
     Function to set up a meter with specified metrics.
 
-    Args:
-        name (str): Prefix for the metric names (e.g., 'train', 'val').
-        metrics (list): List of metric names to initialize.
+    Parameters
+    ------------
+        name (str): 
+            Prefix for the metric names (e.g., 'train', 'val').
+        metrics (list): 
+            List of metric names to initialize.
 
-    Returns:
-        dict: A dictionary of AverageMeter objects for the specified metrics.
+    Returns
+    ------------
+        dict: 
+            A dictionary of AverageMeter objects for the specified metrics.
     """
     meter = {}
     for metric in metrics:
@@ -201,18 +274,77 @@ def setup_meter(name, metrics):
     return meter
 
 
-def get_metric_values(loss, outputs, targets):
-    metric_values = {
-        'loss': loss.item(),
-        'sbp_mae': torch.mean(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
-        'dbp_mae': torch.mean(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
-        'sbp_me': torch.mean(outputs[:, 0] - targets[:, 0]).item(),
-        'dbp_me': torch.mean(outputs[:, 1] - targets[:, 1]).item(),
-        'sbp_mae_std': torch.std(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
-        'dbp_mae_std': torch.std(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
-        'sbp_me_std': torch.std(outputs[:, 0] - targets[:, 0]).item(),
-        'dbp_me_std': torch.std(outputs[:, 1] - targets[:, 1]).item(),
-    }
+def get_metric_values(loss, outputs, targets, config):
+    r"""
+    Function to compute metric values for regression tasks.
+    
+    Parameters
+    ------------
+        loss (torch.Tensor): 
+            Loss value computed by the criterion.
+        outputs (torch.Tensor): 
+            Model predictions.
+        targets (torch.Tensor): 
+            Ground truth values.
+        config (dict): 
+            Configuration dictionary containing model parameters.
+    Returns
+    ------------
+        dict: 
+            A dictionary containing computed metric values.
+    """
+    if config['sig2sig']:
+        # Compute SBP/DBP on the reconstructed ABP waveform as in https://github.com/inventec-ai-center/bp-benchmark
+        # TODO: add MAP, bad reconstructions may not have peaks and valleys, se we replace SBP/DBP with -1 in this case        
+        targets_sbp_values = []
+        targets_dbp_values = []
+        for el in range(targets.shape[0]):
+            try:
+                sbp, dbp, _, _ = compute_sp_dp(targets[el].cpu().numpy(), fs=config['fs'])
+            except:
+                sbp, dbp = -1, -1
+            targets_sbp_values.extend([sbp])
+            targets_dbp_values.extend([dbp])
+        
+        outputs_sbp_values = []
+        outputs_dbp_values = []
+        for el in range(outputs.shape[0]):
+            # May raise error for bad shaped signals
+            try:
+                sbp, dbp, _, _ = compute_sp_dp(outputs[el].cpu().numpy(), fs=config['fs'])
+            except ValueError as e:
+                sbp, dbp = -1, -1
+            outputs_sbp_values.extend([sbp])
+            outputs_dbp_values.extend([dbp])
+
+        targets_sbp_values = torch.tensor(targets_sbp_values, device=targets.device)
+        targets_dbp_values = torch.tensor(targets_dbp_values, device=targets.device)        
+        outputs_sbp_values = torch.tensor(outputs_sbp_values, device=outputs.device)
+        outputs_dbp_values = torch.tensor(outputs_dbp_values, device=outputs.device)
+        
+        metric_values = {
+            'loss': loss.item(),
+            'sbp_mae': torch.mean(torch.abs(outputs_sbp_values - targets_sbp_values)).item(),
+            'dbp_mae': torch.mean(torch.abs(outputs_dbp_values - targets_dbp_values)).item(),
+            'sbp_me': torch.mean(outputs_sbp_values - targets_sbp_values).item(),
+            'dbp_me': torch.mean(outputs_dbp_values - targets_dbp_values).item(),
+            'sbp_mae_std': torch.std(torch.abs(outputs_sbp_values - targets_sbp_values)).item(),
+            'dbp_mae_std': torch.std(torch.abs(outputs_sbp_values - targets_dbp_values)).item(),
+            'sbp_me_std': torch.std(outputs_sbp_values - targets_sbp_values).item(),
+            'dbp_me_std': torch.std(outputs_dbp_values - targets_dbp_values).item(),
+        }
+    else:
+        metric_values = {
+            'loss': loss.item(),
+            'sbp_mae': torch.mean(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
+            'dbp_mae': torch.mean(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
+            'sbp_me': torch.mean(outputs[:, 0] - targets[:, 0]).item(),
+            'dbp_me': torch.mean(outputs[:, 1] - targets[:, 1]).item(),
+            'sbp_mae_std': torch.std(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
+            'dbp_mae_std': torch.std(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
+            'sbp_me_std': torch.std(outputs[:, 0] - targets[:, 0]).item(),
+            'dbp_me_std': torch.std(outputs[:, 1] - targets[:, 1]).item(),
+        }
     return metric_values
 
 

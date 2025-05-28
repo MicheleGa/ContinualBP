@@ -17,349 +17,6 @@ from data.preprocessing_utils.augmentations import RandomAugmentor, Identity, Ji
 from training_utils.helpers import save_status, load_status, EarlyStopping, set_trainable_parameters, configure_optimizer_and_scheduler, get_model_architecture
 from training_utils.metrics import AverageMeter, log_meter_to_tensorboard, setup_meter, update_meter, get_metric_values, get_simclr_metric_values
 
-class SupervisedModel(pl.LightningModule):
-    def __init__(self, model_kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-        print(model_kwargs)
-        if model_kwargs['model_name'] == 'ResGRUNet':   
-            self.model = ResGRUNet(
-                ecg=model_kwargs['ecg'],
-                resp=model_kwargs['resp'], 
-                ppg_derivatives=model_kwargs['ppg_derivatives'], 
-                ppg_emd=model_kwargs['ppg_emd'], 
-                ppg_freqs=model_kwargs['ppg_freqs'],
-                channels=model_kwargs['channels'], 
-                kernel_size=model_kwargs['kernel_size'], 
-                act=model_kwargs['act'], 
-                pooling=model_kwargs['pooling'], 
-                proj_head_dim=model_kwargs['proj_head_dim'], 
-                input_seq_len=int(model_kwargs['input_seq_len_s'] * model_kwargs['fs']),
-                return_embedding=model_kwargs['return_embedding'],
-                set_tunable_params=model_kwargs['set_tunable_params']
-                )
-        elif model_kwargs['model_name'] == 'PhysioFormer':
-            self.model = PhysioFormer(
-                ecg=model_kwargs['ecg'],
-                resp=model_kwargs['resp'], 
-                ppg_derivatives=model_kwargs['ppg_derivatives'], 
-                ppg_emd=model_kwargs['ppg_emd'], 
-                ppg_freqs=model_kwargs['ppg_freqs'],
-                embed_dim=model_kwargs['embed_dim'], 
-                n_head=model_kwargs['n_head'], 
-                head_dim=model_kwargs['head_dim'], 
-                hidden_dim=model_kwargs['hidden_dim'],
-                num_layers=model_kwargs['num_layers'], 
-                input_seq_len=int(model_kwargs['input_seq_len_s'] * model_kwargs['fs']),
-                return_embedding=model_kwargs['return_embedding'],
-                set_tunable_params=model_kwargs['set_tunable_params']
-                )
-        else:
-            raise ValueError("Invalid model name ...")
-        
-        in_channels = self.model.get_input_channels()
-        self.example_input_array = torch.rand((model_kwargs['batchsize'], int(model_kwargs['input_seq_len_s'] * model_kwargs['fs']), (in_channels[0] + in_channels[1] + in_channels[2])))
-               
-        # Train Loss per epoch
-        self.train_loss_epoch = [] # Initialize an empty list to store batch losses
- 
-        # Test Metrics
-        self.test_outputs = np.empty((0, 2), dtype=float)
-        self.test_targets = np.empty((0, 2), dtype=float)
-        
-        # Data Augmentation
-        if model_kwargs['aug']:
-            self.augments = RandomAugmentor(
-                [
-                    Identity(prob=0.2),
-                    Jitter(prob=0.2),
-                    Scaling(prob=0.2),
-                    MagnitudeWarp(prob=0.2),
-                    Flip(prob=0.2)
-                ]
-            )
-        
-    def forward(self, x):
-        return self.model(x)
-    
-    def configure_optimizers(self):
-        
-        if self.hparams.model_kwargs['optimizer_type'] == 'RMSprop':
-            optimizer = torch.optim.RMSprop(self.parameters(), lr=self.hparams.model_kwargs['lr'], weight_decay=self.hparams.model_kwargs['l2norm'])
-        elif self.hparams.model_kwargs['optimizer_type'] == 'Adam':
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.model_kwargs['lr'], weight_decay=self.hparams.model_kwargs['l2norm'])
-        elif self.hparams.model_kwargs['optimizer_type'] == 'SGD':
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.hparams.model_kwargs['lr'], weight_decay=self.hparams.model_kwargs['l2norm'], momentum=self.hparams.model_kwargs['sgd_momentum'])
-        elif self.hparams.model_kwargs['optimizer_type'] == 'AdamW':
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.model_kwargs['lr'], weight_decay=self.hparams.model_kwargs['l2norm'])
-        else:
-            raise ValueError("Invalid optimizer ...")
-
-        if self.hparams.model_kwargs['lr_scheduler_enable']:
-            if self.hparams.model_kwargs['lr_scheduler_type'] == 'MultiStepLR':
-                scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                    optimizer=optimizer,
-                    milestones=tuple([int(s) for s in self.hparams.model_kwargs['lrsched_step'].split(sep=",")]),
-                    gamma=self.hparams.model_kwargs['lrsched_gamma']
-                )
-                
-                return {"optimizer": optimizer, "lr_scheduler": {
-                    'scheduler': scheduler,
-                    'interval': 'step',
-                    'frequency': 1
-                }}
-                
-            elif self.hparams.model_kwargs['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
-                warmup_steps = self.hparams.model_kwargs['lr_scheduler_warmup'] * self.hparams.model_kwargs['steps_per_epoch']
-                annealing_steps = (self.hparams.model_kwargs['max_training_epochs'] - self.hparams.model_kwargs['lr_scheduler_warmup']) * self.hparams.model_kwargs['steps_per_epoch']
-
-                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, 
-                                                                     start_factor=self.hparams.model_kwargs['lr_scheduler_min_lr'] / self.hparams.model_kwargs['lr'], 
-                                                                     total_iters=warmup_steps)
-                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, 
-                    T_max=annealing_steps, 
-                    eta_min=self.hparams.model_kwargs['lr_scheduler_min_lr'])
-
-                lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-                    optimizer,
-                    schedulers=[warmup_scheduler, cosine_scheduler],
-                    milestones=[warmup_steps]
-                )
-
-                return {"optimizer": optimizer, "lr_scheduler": {"scheduler": lr_scheduler, "interval": "step"}}
-            else:
-                raise ValueError("Invalid lr scheduler ...")
-            
-        else:
-            return optimizer
-        
-    def supcon_loss(self, features, labels=None, mask=None):
-        r"""
-        Supervised Contrastive Loss 
-        from https://github.com/pulp-platform/fscil/blob/main/code/lib/torch_blocks.py#L114
-        and from https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/tutorial17/SimCLR.html#SimCLR-implementation
-        """
-        device = features.device
-
-        if len(features.shape) < 3:
-            raise ValueError('`features` needs to be [bsz, n_views, ...],'
-                            'at least 3 dimensions are required')
-        if len(features.shape) > 3:
-            features = features.view(features.shape[0], features.shape[1], -1)
-
-        batch_size = features.shape[0]
-        contrast_count = features.shape[1]
-        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # Shape: [batch_size * n_views, embedding_dim]
-
-        # Normalize embeddings
-        contrast_feature = F.normalize(contrast_feature, dim=1)
-
-        # Compute cosine similarity
-        cos_sim = torch.matmul(contrast_feature, contrast_feature.T)  # Shape: [batch_size * n_views, batch_size * n_views]
-
-        # Mask out self-contrast cases
-        self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=device)
-        cos_sim.masked_fill_(self_mask, -9e15)
-
-        # Create positive pair mask
-        if labels is not None:
-            # Supervised case: Use labels to create positive pairs
-            labels = labels.contiguous().view(-1, 1)
-            if labels.shape[0] != batch_size:
-                raise ValueError('Num of labels does not match num of features')
-            labels = torch.cat([labels] * contrast_count, dim=0)  # Repeat labels for all views
-            pos_mask = torch.eq(labels, labels.T).float().to(device)
-        else:
-            # Unsupervised case: Assume positive pairs are `batch_size // 2` apart
-            pos_mask = self_mask.roll(shifts=cos_sim.shape[0] // 2, dims=0).float()
-
-        # Scale cosine similarity by temperature
-        cos_sim = cos_sim / self.hparams.model_kwargs['temperature']
-
-        # Compute InfoNCE loss
-        log_prob = cos_sim - torch.logsumexp(cos_sim, dim=-1, keepdim=True)
-        mean_log_prob_pos = (pos_mask * log_prob).sum(1) / pos_mask.sum(1)
-
-        # Handle cases where pos_mask.sum(1) == 0
-        mean_log_prob_pos[pos_mask.sum(1) == 0] = 0
-
-        # Final loss
-        loss = -mean_log_prob_pos.mean()
-
-        return loss
-    
-    def training_step(self, batch, batch_idx):
-        
-        # Prepare input data
-        signals = batch[0]
-        _, _, num_modalities = signals.shape
-        
-        # Prepare labels
-        sbp = batch[1][0]
-        dbp = batch[1][1] 
-        target = torch.cat((sbp, dbp), dim=-1)
-        
-        # Create two augmented views of the signals
-        if self.hparams.model_kwargs['return_embedding'] and self.hparams.model_kwargs['aug']:
-            augmented_signals_1 = torch.empty_like(signals, device=target.device)
-            augmented_signals_2 = torch.empty_like(signals, device=target.device)
-            for mod in range(num_modalities):
-                # Apply augmentations to the entire batch for the current modality
-                augmented_mod_1 = self.augments(signals[:, :, mod].clone().cpu())
-                augmented_signals_1[:, :, mod] = augmented_mod_1.to(target.device)
-
-                augmented_mod_2 = self.augments(signals[:, :, mod].clone().cpu())
-                augmented_signals_2[:, :, mod] = augmented_mod_2.to(target.device)
-    
-        # Forward propagation
-        if self.hparams.model_kwargs['return_embedding'] and self.hparams.model_kwargs['aug']:
-            output, embedding = self.model(signals)
-            embedding_1 = self.model(augmented_signals_1)[1]
-            embedding_2 = self.model(augmented_signals_2)[1]
-        else:
-            output = self.model(signals)
-        
-        # Supervised loss 
-        if self.hparams.model_kwargs['criterion'] == 'MSELoss':
-            loss = F.mse_loss(output, target)
-        elif self.hparams.model_kwargs['criterion'] == 'SmoothL1Loss':
-            loss = F.smooth_l1_loss(output, target)
-        else:
-            raise ValueError("Invalid criterion ...")
-
-        if self.hparams.model_kwargs['lambda_contrastive'] != 0.:
-            loss = self.hparams.model_kwargs['lambda_contrastive'] * loss
-            
-        # Contrastive loss (SimCLR)
-        if self.hparams.model_kwargs['lambda_contrastive'] != 0. and self.hparams.model_kwargs['temperature'] != 0. and self.hparams.model_kwargs['return_embedding'] and self.hparams.model_kwargs['aug']:
-            embeddings = torch.stack([embedding_1, embedding_2], dim=1)  # Shape: [batch_size, n_views, embedding_dim]
-            contrastive_loss = self.supcon_loss(embeddings)
-            loss = loss + self.hparams.model_kwargs['lambda_contrastive'] * contrastive_loss
-
-        # Add orthogonal loss
-        if self.hparams.model_kwargs['lambda_ortho'] != 0. and self.hparams.model_kwargs['return_embedding']:
-            proto = F.normalize(embedding, dim=0, p=2)
-            loss_reg = proto.t() @ proto - torch.eye(proto.shape[1], device=proto.device)
-            loss_reg = torch.mean(loss_reg * loss_reg)
-            loss = loss + self.hparams.model_kwargs['lambda_ortho'] * loss_reg
-
-        self.log('train/loss', loss)
-        
-        self.train_loss_epoch.append(loss.detach().cpu())
-
-        return loss  
-    
-    def on_train_epoch_end(self):
-        
-        avg_loss = torch.stack(self.train_loss_epoch).mean()
-        
-        self.log('train/loss_epoch', avg_loss)
-        
-        self.train_loss_epoch.clear() # Clear the list for the next epoch
-
-    def validation_step(self, batch, batch_idx):
-        
-        # Prepare input data
-        signals = batch[0]
-        
-        # Prepare labels
-        sbp = batch[1][0]
-        dbp = batch[1][1] 
-        target = torch.cat((sbp, dbp), dim=-1)
-        
-        # Forward propagation
-        if self.hparams.model_kwargs['return_embedding']:
-            output, _ = self.model(signals)
-        else:
-            output = self.model(signals)
-        
-        # Loss 
-        if self.hparams.model_kwargs['criterion'] == 'MSELoss':
-            loss = F.mse_loss(output, target)
-        elif self.hparams.model_kwargs['criterion'] == 'SmoothL1Loss':
-            loss = F.smooth_l1_loss(output, target)
-        else:
-            raise ValueError("Invalid criterion ...")
-        
-        # Metrics
-        sbp_error = output[:, 0] - target[:, 0]
-        dbp_error = output[:, 1] - target[:, 1]
-
-        sbp_mae = torch.mean(torch.abs(sbp_error), dim=-1)
-        dbp_mae = torch.mean(torch.abs(dbp_error), dim=-1)
-        sbp_mae_std = torch.std(torch.abs(sbp_error), dim=-1)
-        dbp_mae_std = torch.std(torch.abs(dbp_error), dim=-1)
-        
-        sbp_me = torch.mean(sbp_error, dim=-1)
-        dbp_me = torch.mean(dbp_error, dim=-1)
-        sbp_std = torch.std(sbp_error, dim=-1)
-        dbp_std = torch.std(dbp_error, dim=-1)
-        
-        self.log('val/sbp_mae', sbp_mae, on_step=False, on_epoch=True)
-        self.log('val/dbp_mae', dbp_mae, on_step=False, on_epoch=True)
-        self.log('val/sbp_mae_std', sbp_mae_std, on_step=False, on_epoch=True)
-        self.log('val/dbp_mae_std', dbp_mae_std, on_step=False, on_epoch=True)
-        
-        self.log('val/sbp_me', sbp_me, on_step=False, on_epoch=True)
-        self.log('val/dbp_me', dbp_me, on_step=False, on_epoch=True)
-        self.log('val/sbp_me_std', sbp_std, on_step=False, on_epoch=True)
-        self.log('val/dbp_me_std', dbp_std, on_step=False, on_epoch=True)
-        
-        self.log('val/loss', loss)
-
-    def test_step(self, batch, batch_idx):
-        
-        # Prepare input data
-        signals = batch[0]
-        
-        # Prepare labels
-        sbp = batch[1][0]
-        dbp = batch[1][1] 
-        target = torch.cat((sbp, dbp), dim=-1)
-
-        # Forward propagation
-        if self.hparams.model_kwargs['return_embedding']:
-            output, _ = self.model(signals)
-        else:
-            output = self.model(signals)
-        # Loss 
-        if self.hparams.model_kwargs['criterion'] == 'MSELoss':
-            loss = F.mse_loss(output, target)
-        elif self.hparams.model_kwargs['criterion'] == 'SmoothL1Loss':
-            loss = F.smooth_l1_loss(output, target)
-        else:
-            raise ValueError("Invalid criterion ...")
-        
-        # Metrics
-        sbp_error = output[:, 0] - target[:, 0]
-        dbp_error = output[:, 1] - target[:, 1]
-
-        sbp_mae = torch.mean(torch.abs(sbp_error), dim=-1)
-        dbp_mae = torch.mean(torch.abs(dbp_error), dim=-1)
-        sbp_mae_std = torch.std(torch.abs(sbp_error), dim=-1)
-        dbp_mae_std = torch.std(torch.abs(dbp_error), dim=-1)
-        
-        sbp_me = torch.mean(sbp_error, dim=-1)
-        dbp_me = torch.mean(dbp_error, dim=-1)
-        sbp_std = torch.std(sbp_error, dim=-1)
-        dbp_std = torch.std(dbp_error, dim=-1)
-        
-        self.log('test/sbp_mae', sbp_mae, on_step=False, on_epoch=True)
-        self.log('test/dbp_mae', dbp_mae, on_step=False, on_epoch=True)
-        self.log('test/sbp_mae_std', sbp_mae_std, on_step=False, on_epoch=True)
-        self.log('test/dbp_mae_std', dbp_mae_std, on_step=False, on_epoch=True)
-        
-        self.log('test/sbp_me', sbp_me, on_step=False, on_epoch=True)
-        self.log('test/dbp_me', dbp_me, on_step=False, on_epoch=True)
-        self.log('test/sbp_me_std', sbp_std, on_step=False, on_epoch=True)
-        self.log('test/dbp_me_std', dbp_std, on_step=False, on_epoch=True)
-        
-        self.log('test/loss', loss)
-        
-        self.test_outputs = np.concatenate((self.test_outputs, output.detach().cpu().numpy()), axis=0)
-        self.test_targets = np.concatenate((self.test_targets, target.detach().cpu().numpy()), axis=0)
-
 
 def supcon_loss(features, config, labels=None, mask=None):
     r"""
@@ -439,7 +96,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
     val_dataloader = dataloaders['val']
     test_dataloader = dataloaders['test']
     
-    # Optimizater and scheduler
+    # Optimizer and Scheduler
     if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
         config['steps_per_epoch'] = len(train_dataloader)
         
@@ -455,10 +112,10 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
     writer = SummaryWriter(log_dir=tensorboard_path)
     
     in_channels = model.get_input_channels()
-    example_input_array = torch.rand((config['batchsize'], int(config['input_seq_len_s'] * config['fs']), (in_channels[0] + in_channels[1] + in_channels[2])))
+    example_input_array = torch.rand((config['batch_size'], int(config['input_seq_len_s'] * config['fs']), (in_channels[0] + in_channels[1] + in_channels[2])))
     writer.add_graph(model, example_input_array.to(device))
 
-    # Best lowest val loss in case of supervised pretraining, otherwise highest accuracy of SimCLR
+    # Best lowest val loss in case of supervised pretraining
     best_val = float("+inf")
     
     # Early stopping
@@ -494,13 +151,19 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
             
         for batch_idx, batch in enumerate(train_dataloader):
             signals, targets = batch
-
+            
             # Move data and labels to the same device as the model
             signals = signals.to(device)
             
             # Prepare input data
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
             _, _, num_modalities = signals.shape
-            targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+            
+            if config['sig2sig']:
+                targets = targets.to(device)
+            else:
+                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
             
             # Create two augmented views of the signals
             if config['return_embedding'] and config['aug']:
@@ -561,15 +224,15 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
             optimizer.step()
             optimizer.zero_grad()
             
-            # N.B. schedulers are usually called at the end of the epoch, but here we apply it at the end of each batch
-            if config['lr_scheduler_enable']:
+            # N.B. schedulers are usually called at the end of the epoch, but here we apply it at the end of each batch only for cosine-warmup scheduler
+            if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
                 scheduler.step()
             
             train_losses.update(loss.item(), signals.size(0))
             
             # Log training loss to TensorBoard
             writer.add_scalar('train/loss', loss.item(), epoch * len(train_dataloader) + batch_idx)
-            
+        
         # Log epoch training loss to TensorBoard
         writer.add_scalar('train/loss_epoch', train_losses.avg, epoch)
         
@@ -586,7 +249,12 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
 
             # Move data and labels to the same device as the model
             signals = signals.to(device)
-            targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+            _, _, num_modalities = signals.shape
+            
+            if config['sig2sig']:
+                targets = targets.to(device)
+            else:
+                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
             
             # Create two augmented views of the signals also in validation in case of self-supervised contrastive pretraining
             if config['return_embedding'] and config['aug'] and config['lambda_supervised'] == 0.:
@@ -634,12 +302,16 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
             if config['lambda_supervised'] == 0.:
                 metric_values = get_simclr_metric_values(val_loss, cos_sim, pos_mask)
             else:
-                metric_values = get_metric_values(val_loss, outputs, targets)
+                metric_values = get_metric_values(val_loss, outputs, targets, config)
                 
             update_meter(val_metrics, metric_values, signals.size(0))
         
         # Log epoch validation metrics to TensorBoard
         log_meter_to_tensorboard(writer, val_metrics, epoch, name='val')
+        
+        # N.B. schedulers are usually called at the end of the epoch
+        if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'ExponentialLR':
+            scheduler.step()
         
         # Log LR
         current_lr = optimizer.param_groups[0]['lr']
@@ -704,7 +376,10 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
 
                 # Move data and labels to the same device as the model
                 signals = signals.to(device)
-                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+                if config['sig2sig']:
+                    targets = targets.to(device)
+                else:
+                    targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
                             
                 # Perform forward pass
                 if config['return_embedding']:
@@ -726,7 +401,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
                 optimizer.zero_grad()
                 
                 # N.B. schedulers are usually called at the end of the epoch, but here we apply it at the end of each batch
-                if config['lr_scheduler_enable']:
+                if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
                     scheduler.step()
                 
                 train_losses.update(loss.item(), signals.size(0))
@@ -746,7 +421,10 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
 
                 # Move data and labels to the same device as the model
                 signals = signals.to(device)
-                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+                if config['sig2sig']:
+                    targets = targets.to(device)
+                else:
+                    targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
                 
                 # Perform forward pass
                 if config['return_embedding']:
@@ -762,11 +440,15 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
                 else:
                     raise ValueError("Invalid criterion ...")
                 
-                metric_values = get_metric_values(val_loss, outputs, targets)
+                metric_values = get_metric_values(val_loss, outputs, targets, config)
                 update_meter(val_metrics, metric_values, signals.size(0))
             
             # Log epoch validation metrics to TensorBoard
             log_meter_to_tensorboard(writer, val_metrics, epoch, name='linear_probing_val')
+            
+            # N.B. schedulers are usually called at the end of the epoch
+            if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'ExponentialLR':
+                scheduler.step()
             
             # Log LR
             current_lr = optimizer.param_groups[0]['lr']
@@ -794,14 +476,21 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
     metrics = ['loss', 'sbp_mae', 'dbp_mae', 'sbp_me', 'dbp_me', 'sbp_mae_std',  'dbp_mae_std', 'sbp_me_std', 'dbp_me_std']
     test_metrics = setup_meter('test', metrics)
     
-    all_test_outputs = np.empty((0, 2), dtype=float)
-    all_test_targets = np.empty((0, 2), dtype=float)
+    if config['sig2sig']:
+        all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+        all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+    else:
+        all_test_outputs = np.empty((0, 2), dtype=float)
+        all_test_targets = np.empty((0, 2), dtype=float)
     for batch_idx, batch in enumerate(test_dataloader):
         signals, targets = batch
         
         # Move data and labels to the same device as the model
         signals = signals.to(device)
-        targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+        if config['sig2sig']:
+            targets = targets.to(device)
+        else:
+            targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
         
         # Perform forward pass
         if config['return_embedding']:
@@ -820,7 +509,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
         all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
         all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
         
-        metric_values = get_metric_values(test_loss, outputs, targets)
+        metric_values = get_metric_values(test_loss, outputs, targets, config)
         update_meter(test_metrics, metric_values, signals.size(0))
     
     # Log personalization test metrics to TensorBoard
@@ -919,7 +608,7 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
             optimizer.zero_grad()
             
             # N.B. schedulers are usually called at the end of the epoch, but here we apply it at the end of each batch
-            if config['lr_scheduler_enable']:
+            if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
                 scheduler.step()
             
             train_losses.update(loss.item(), signals.size(0))
@@ -955,11 +644,15 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
             else:
                 raise ValueError("Invalid criterion ...")
             
-            metric_values = get_metric_values(val_loss, outputs, targets)
+            metric_values = get_metric_values(val_loss, outputs, targets, config)
             update_meter(val_metrics, metric_values, signals.size(0))
         
         # Log epoch validation metrics to TensorBoard
         log_meter_to_tensorboard(writer, val_metrics, epoch, name='val')
+        
+        # N.B. schedulers are usually called at the end of the epoch
+        if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'ExponentialLR':
+            scheduler.step()
         
         # Log LR
         current_lr = optimizer.param_groups[0]['lr']
@@ -1016,7 +709,7 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
         all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
         all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
         
-        metric_values = get_metric_values(test_loss, outputs, targets)
+        metric_values = get_metric_values(test_loss, outputs, targets, config)
         update_meter(test_metrics, metric_values, signals.size(0))
     
     # Log personalization test metrics to TensorBoard

@@ -55,19 +55,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
         # Z-score on VPG and APG
         window_vpg = standardize(window_vpg, plot=args.plot, title='VPG-Z-Score', savepath=savepath)
         window_apg = standardize(window_apg, plot=args.plot, title='APG-Z-Score', savepath=savepath)
-        
-        # SBP/DBP calculation: remove first and last peak/valley index since they are just detected as peaks/valleys as there no other points before/after them)
-        peaks = find_peaks(window_abp)[1:-1]
-        valleys = find_peaks(-window_abp)[1:-1]
-        
-        # Calculate the actual SBP and DBP for the window                
-        if len(peaks) == 0 or len(valleys) == 0:
-            print(f"\t{subject_id}|{j + 1} of {n_win} - Peaks/Valleys not found for {subject_id}, in segment {segment}, window {j} [{idx_start}:{idx_stop}]")
-            continue
-        
-        sbp = np.mean(window_abp[peaks]).astype(np.float32)
-        dbp = np.mean(window_abp[valleys]).astype(np.float32)
-        
+                
         if args.ppg_emd:
             # Empirical Mode Decomposition
             imfs = get_emd_imfs(window_ppg, plot=args.plot, savepath=savepath)
@@ -76,99 +64,104 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
             # Continuous Wavelet Transform to get the scalogram (note that the high/low frequencies are the one suggest from CardioID)
             ppg_freqs = scalogram(window_ppg, fs=fs, high_freq=12.5, low_freq=0.5, num_scales=16, plot=args.plot, savepath=savepath)
             
-        # Ensure everything is in np.float32
-        window_abp = window_abp.astype(np.float32)
-        sbp = sbp.astype(np.float32)
-        dbp = dbp.astype(np.float32)
-        
-        window_ppg = window_ppg.astype(np.float32)
-        window_vpg = window_vpg.astype(np.float32)
-        window_apg = window_apg.astype(np.float32)
-        
-        window_ecg = window_ecg.astype(np.float32)
-        if args.resp:
-            window_resp = window_resp.astype(np.float32)
-        
-        # N.B.: we calculate EMD and Scalogram only after the z-score 
-        if args.ppg_emd:
-            imfs = imfs.astype(np.float32)
-            
-        if args.scalogram:
-            ppg_freqs = ppg_freqs.astype(np.float32)
-            
-        # Save into subject data
-        if args.ppg_emd and not args.scalogram:
-            if args.resp:
-                if args.sig2sig:
-                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, window_abp))
-                else:
-                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, sbp, dbp))
-            else:
-                if args.sig2sig:
-                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, window_abp))
-                else:
-                    subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, sbp, dbp))
-        elif not args.ppg_emd and args.scalogram:
-            if args.resp:
-                if args.sig2sig:
-                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, window_abp))
-                else:
-                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, sbp, dbp))
-            else:
-                if args.sig2sig:
-                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, window_abp))
-                else:
-                    subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, sbp, dbp))
+        # SBP/DBP calculation
+        sbp, dbp, peaks, valleys = compute_sp_dp(sig=window_abp, fs=fs) 
+                    
+        if sbp < 0 or dbp < 0 or len(peaks) == 0 or len(valleys) == 0:
+            print(f"\t{subject_id}|{j + 1} of {n_win} - Peaks/Valleys not found for {subject_id}, in segment {segment}, window {j} [{idx_start}:{idx_stop}]")
         else:
+            window_abp = window_abp.astype(np.float32)
+            sbp = sbp.astype(np.float32)
+            dbp = dbp.astype(np.float32)
+            
+            window_ppg = window_ppg.astype(np.float32)
+            window_vpg = window_vpg.astype(np.float32)
+            window_apg = window_apg.astype(np.float32)
+            
+            window_ecg = window_ecg.astype(np.float32)
             if args.resp:
-                if args.sig2sig:
-                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp))
-                else:
-                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, sbp, dbp))
-            else:
-                if args.sig2sig:
-                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, window_abp))
-                else:
-                    subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, sbp, dbp))
+                window_resp = window_resp.astype(np.float32)
+            
+            # N.B.: we calculate EMD and Scalogram only after the z-score 
+            if args.ppg_emd:
+                imfs = imfs.astype(np.float32)
                 
-        if args.plot:
-            plot_abp(window_abp, fs=fs, peaks=peaks, valleys=valleys, title=f'ABP [SBP {sbp:.2f} - DBP {dbp:.2f}]', save_path=savepath)
-            if args.resp:
-                if args.sig2sig:
-                    plot_signals(
-                        [window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp], 
-                        labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP', 'ABP'], 
-                        title=f'Sample Input Signals', 
-                        savepath=savepath, 
-                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm', 'mmHg']
-                        )
+            if args.scalogram:
+                ppg_freqs = ppg_freqs.astype(np.float32)
+                
+            # Save into subject data
+            if args.ppg_emd and not args.scalogram:
+                if args.resp:
+                    if args.sig2sig:
+                        subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, window_abp))
+                    else:
+                        subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, window_resp, sbp, dbp))
                 else:
-                    plot_signals(
-                        [window_ppg, window_vpg, window_apg, window_ecg, window_resp], 
-                        labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP'], 
-                        title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
-                        savepath=savepath, 
-                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm']
-                        )
+                    if args.sig2sig:
+                        subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, window_abp))
+                    else:
+                        subject_data.append((window_ppg, window_vpg, window_apg, imfs, window_ecg, None, sbp, dbp))
+            elif not args.ppg_emd and args.scalogram:
+                if args.resp:
+                    if args.sig2sig:
+                        subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, window_abp))
+                    else:
+                        subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, window_resp, sbp, dbp))
+                else:
+                    if args.sig2sig:
+                        subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, window_abp))
+                    else:
+                        subject_data.append((window_ppg, window_vpg, window_apg, ppg_freqs, window_ecg, None, sbp, dbp))
             else:
-                if args.sig2sig:
-                    plot_signals(
-                        [window_ppg, window_vpg, window_apg, window_ecg, window_abp], 
-                        labels=['PPG', 'VPG', 'APG', 'ECG', 'ABP'], 
-                        title=f'Sample Input Signals', 
-                        savepath=savepath, 
-                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'mmHg']
-                        )
+                if args.resp:
+                    if args.sig2sig:
+                        subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp))
+                    else:
+                        subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, window_resp, sbp, dbp))
                 else:
-                    plot_signals(
-                        [window_ppg, window_vpg, window_apg, window_ecg], 
-                        labels=['PPG', 'VPG', 'APG', 'ECG'], 
-                        title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
-                        savepath=savepath, 
-                        ylabels=['a.u.', 'a.u.', 'a.u.', 'mV']
-                        )
-            # No need to do the preprocessing of all subjects when plot true
-            exit()
+                    if args.sig2sig:
+                        subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, window_abp))
+                    else:
+                        subject_data.append((window_ppg, window_vpg, window_apg, window_ecg, None, sbp, dbp))
+                    
+            if args.plot:
+                plot_abp(window_abp, fs=fs, peaks=peaks, valleys=valleys, title=f'ABP [SBP {sbp:.2f} - DBP {dbp:.2f}]', save_path=savepath)
+                if args.resp:
+                    if args.sig2sig:
+                        plot_signals(
+                            [window_ppg, window_vpg, window_apg, window_ecg, window_resp, window_abp], 
+                            labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP', 'ABP'], 
+                            title=f'Sample Input Signals', 
+                            savepath=savepath, 
+                            ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm', 'mmHg']
+                            )
+                    else:
+                        plot_signals(
+                            [window_ppg, window_vpg, window_apg, window_ecg, window_resp], 
+                            labels=['PPG', 'VPG', 'APG', 'ECG', 'RESP'], 
+                            title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
+                            savepath=savepath, 
+                            ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'pm']
+                            )
+                else:
+                    if args.sig2sig:
+                        plot_signals(
+                            [window_ppg, window_vpg, window_apg, window_ecg, window_abp], 
+                            labels=['PPG', 'VPG', 'APG', 'ECG', 'ABP'], 
+                            title=f'Sample Input Signals', 
+                            savepath=savepath, 
+                            ylabels=['a.u.', 'a.u.', 'a.u.', 'mV', 'mmHg']
+                            )
+                    else:
+                        plot_signals(
+                            [window_ppg, window_vpg, window_apg, window_ecg], 
+                            labels=['PPG', 'VPG', 'APG', 'ECG'], 
+                            title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
+                            savepath=savepath, 
+                            ylabels=['a.u.', 'a.u.', 'a.u.', 'mV']
+                            )
+                # No need to do the preprocessing of all subjects when plot true
+                exit()
 
 def process_subject(subject_id, args, savepath, result_queue=None):
     
@@ -396,8 +389,51 @@ def preprocess_dataset(args):
         txn.put(key="subject_list".encode(), value=pickle.dumps(subject_id_list))
 
     print('Preprocessing completed successfully')
-    
-    
+
+
+def check_invalid_window_abp(args):
+    LMDB_MAP_SIZE = 1000 * 1000 * 1000 * 1000 # 1T
+    lmdb_folder = os.path.join(args.output_folder, args.name) 
+    lmdbenv = lmdb.open(lmdb_folder, map_size=LMDB_MAP_SIZE)
+    with lmdbenv.begin(write=True) as txn:    
+        subject_list:list = pickle.loads(txn.get("subject_list".encode()))
+        index_by_subject_id:dict = pickle.loads(txn.get("index_by_subject_id".encode()))
+        index_by_sample_id = pickle.loads(txn.get("index_by_sample_id".encode()))
+        
+        print(len(subject_list), "subjects in the dataset")
+        
+        for subject_id in subject_list:
+            sample_list = index_by_subject_id[subject_id]
+            invalid_sample_ids = []
+            valid_sample_ids = []
+            for sample_id in sample_list:
+                window_abp = np.squeeze(np.frombuffer(txn.get("{}-abp".format(sample_id).encode()), dtype="float32"))
+                sbp, dbp, peaks, valleys = compute_sp_dp(window_abp, fs=args.fs)
+                if sbp < 0 or dbp < 0 or len(peaks) == 0 or len(valleys) == 0:
+                    print(f'Error during peaks/valleys processing: no peaks or valleys found in the signal {sample_id} of subject {subject_id}.')
+                    invalid_sample_ids.append(sample_id)
+                else:
+                    valid_sample_ids.append(sample_id)
+            if len(invalid_sample_ids) > 0:
+                print(f'Invalid samples for subject {subject_id}: {invalid_sample_ids}')
+
+                # Update index_by_subject_id
+                index_by_subject_id[subject_id] = valid_sample_ids
+
+                # Remove invalid samples from index_by_sample_id
+                for invalid_sample_id in invalid_sample_ids:
+                    if invalid_sample_id in index_by_sample_id:
+                        del index_by_sample_id[invalid_sample_id]
+
+                print(f'Removed the following samples from the dataset: {invalid_sample_ids}')
+
+        # Write updated indices back to LMDB
+        txn.put("index_by_subject_id".encode(), pickle.dumps(index_by_subject_id))
+        txn.put("index_by_sample_id".encode(), pickle.dumps(index_by_sample_id))
+
+        print("LMDB dataset updated successfully.")
+
+ 
 def parseargs():
     parser = argparse.ArgumentParser(description="MIMIC III Preprocessing Pipeline")
     parser.add_argument('--input_folder', default='./raw_mimic_iii', type=str, help='path to raw dataset')
@@ -435,3 +471,8 @@ if __name__ == "__main__":
         raise ValueError('Returning both EMD of PPG and Scalogram of PPG is not possible (yet)')
     
     preprocess_dataset(args)
+    
+    #if args.sig2sig:
+    #   print("Checking for invalid windows in the dataset...")
+    #    check_invalid_window_abp(args)
+    #    print("Preprocessing and wabp checking completed successfully.")

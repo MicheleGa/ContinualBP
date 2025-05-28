@@ -1,7 +1,6 @@
 import os
-import random
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, correlate, welch, resample_poly
+from scipy.signal import butter, sosfiltfilt, filtfilt, correlate, welch, resample_poly
 from scipy.interpolate import PchipInterpolator
 import matplotlib.pyplot as plt
 import pywt
@@ -10,7 +9,23 @@ from pyampd.ampd import find_peaks
 
 
 def emd_decompose(signal, num_imfs=4, trials=50):
-    """Decomposes a signal into IMFs using EMD (pyeemd)."""
+    r"""
+    Decomposes a signal into IMFs using EMD (pyeemd).
+    
+    Parameters
+    ------------
+    signal (np.ndarray): 
+        The input signal to be decomposed.
+    num_imfs (int):
+        The number of Intrinsic Mode Functions (IMFs) to return.
+    trials (int):
+        The number of trials for the EEMD algorithm to improve robustness against noise.    
+        
+    Returns
+    ------------
+    imfs (np.ndarray):
+        A 2D NumPy array containing the first num_imfs IMFs of the signal.   
+    """
     
     emd = EEMD(max_imfs=num_imfs, spline_kind='akima', trials=trials, DTYPE=np.float32) # Initialize the EEMD object
     imfs = emd(signal)  # Compute the EMD
@@ -18,7 +33,27 @@ def emd_decompose(signal, num_imfs=4, trials=50):
     
 
 def get_emd_imfs(signal, num_imfs=4, plot=False, title="EMD", savepath='./figs'):
-    """Decomposes a signal using EMD, plots IMFs, and returns them."""
+    r"""
+    Decomposes a signal using EMD, plots IMFs, and returns them.
+    
+    Parameters
+    ------------
+    signal (np.ndarray): 
+        The input signal to be decomposed.
+    num_imfs (int):
+        The number of Intrinsic Mode Functions (IMFs) to return.
+    plot (bool, optional):
+        If True, plots the IMFs and the original signal. Defaults to False.
+    title (str, optional):
+        Title of the plot. Defaults to "EMD".
+    savepath (str, optional):
+        Path to save the plot. Defaults to './figs'.
+        
+    Returns
+    ------------
+    imfs (np.ndarray):
+        A 2D NumPy array containing the first num_imfs IMFs of the signal.
+    """
 
     imfs = emd_decompose(signal, num_imfs)
     
@@ -53,6 +88,7 @@ def get_emd_imfs(signal, num_imfs=4, plot=False, title="EMD", savepath='./figs')
         raise ValueError("IMFs are None")
     
     return imfs
+
 
 def interpolate_nan_pchip(data, plot=False, title='PCHIP Interpolation', savepath='./figs'):
     r"""
@@ -130,6 +166,98 @@ def create_windows(win_len, fs, n_samp, overlap):
     idx_stop = np.round(idx_start + win_len - 1)
 
     return idx_start, idx_stop
+
+    
+def compute_sp_dp(sig, fs=125):
+    r"""
+    Computes the systolic peak (SP) and diastolic peak (DP) of a signal (e.g. ABP).
+    Source: https://github.com/inventec-ai-center/bp-benchmark/blob/main/code/train/core/utils.py#L174
+    
+    Parameters
+    ----------
+    sig : np.ndarray
+        The input signal as a NumPy array.
+    fs : int, optional
+        The sampling frequency of the signal in Hz. Defaults to 125.
+    pk_th : float, optional 
+        The threshold for peak detection relative to the mean amplitude of valleys. Defaults to 0.6.
+    
+    Returns
+    -------
+    tuple:
+        A tuple containing the median values of the systolic peak and diastolic peak, 
+        two flags indicating if the peaks were adjusted, and the indices of the peaks and valleys.    
+    """
+    sig = sig.astype(np.float64) # Extremely important for Pyampd !!!
+    peaks = find_peaks(sig, fs)
+    valleys = find_peaks(-sig, fs)
+    
+    if len(peaks) == 0 or len(valleys) == 0:
+        print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
+        return -1, -1, [], []
+    
+    ### Remove first or last if equal to 0 or len(sig)-1
+    if peaks[0] == 0:
+        peaks = peaks[1:]    
+        if len(peaks) == 0:
+            print('Error during peaks/valleys processing: no peaks found in the signal.')
+            return -1, -1, [], []
+            
+    if valleys[0] == 0:
+        valleys = valleys[1:]
+        if len(valleys) == 0:
+            print('Error during peaks/valleys processing: no valleys found in the signal.')
+            return -1, -1, [], []
+    
+    if peaks[-1] == len(sig)-1:
+        peaks = peaks[:-1]
+        if len(peaks) == 0:
+            print('Error during peaks/valleys processing: no peaks found in the signal.')
+            return -1, -1, [], []
+    
+    if valleys[-1] == len(sig)-1:
+        valleys = valleys[:-1]
+        if len(valleys) == 0:
+            print('Error during peaks/valleys processing: no valleys found in the signal.')
+            return -1, -1, [], []
+        
+    if len(peaks) == 0 or len(valleys) == 0:
+        print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
+        return -1, -1, [], []
+    else:
+        sig = sig.astype(np.float32)  # Extremely important for Pyampd !!! This is why we are casting here
+        return np.median(sig[peaks]), np.median(sig[valleys]), peaks, valleys
+
+
+def butter_lowpass_filter(data, lowcut, fs, order):
+    r""" 
+    Butterworth band-pass filter.
+    Source: https://github.com/inventec-ai-center/bp-benchmark/blob/main/code/train/core/utils.py#L174
+    
+    Parameters
+    ----------
+    data : array
+        Signal to be filtered.
+    lowcut : float
+        Frequency lowcut for the filter. 
+    highcut : float}
+        Frequency highcut for the filter.
+    fs : float
+        Sampling rate.
+    order: int
+        Filter's order.
+
+    Returns
+    -------
+    array
+        Signal filtered with butterworth algorithm.
+    """  
+    nyq = fs * 0.5  # https://en.wikipedia.org/wiki/Nyquist_frequency
+    lowcut = lowcut / nyq  # Normalize
+    #highcut = highcut / nyq
+    # Numerator (b) and denominator (a) polynomials of the IIR filter
+    b, a = butter(order, lowcut, btype='low', analog=False)
+    return filtfilt(b, a, data)
     
 
 def align_pair(abp, raw_ppg, windowing_time, fs):

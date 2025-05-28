@@ -1,40 +1,57 @@
 import os
+import sys
+folders_to_add = ['preprocessing_utils']
+for folder in folders_to_add:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pyampd.ampd import find_peaks
-import warnings
-    
+from preprocessing_utils.signal_processing import compute_sp_dp
+
     
 def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs/dataset'):
-    """Calculates SBP and DBP distributions and plots them with mean and quartiles."""
+    r"""
+    Calculates SBP and DBP distributions and plots them with mean and quartiles.
+    
+    Parameters
+    ------------
+    dataloaders : list of DataLoader
+        List of dataloaders containing the data to analyze.
+    dataloaders_names : list of str
+        List of names corresponding to each dataloader, used for labeling the plots.
+    savepath : str, default './figs/dataset'
+        Path to save the generated plots.
+        
+    Returns
+    ------------
+    None (saves the plots to the specified savepath)   
+    """
 
     for dataloader, dataloader_name in zip(dataloaders, dataloaders_names):
         sbp_values = []
         dbp_values = []
+        map_values = []
 
         for batch in dataloader:
-            _, annotation = batch 
+            _, annotation = batch
             if isinstance(annotation, tuple):
+                # TODO: make MAP calculation also for the sig2label case
                 sbp_values.extend(annotation[0].flatten().tolist())
                 dbp_values.extend(annotation[1].flatten().tolist())
+                raise NotImplementedError("MAP calculation for sig2label case is not implemented yet.")
             else:
-                window_abp = annotation.numpy()
-                
+                window_abp = annotation.numpy()               
                 for el in range(window_abp.shape[0]):
-                
-                    peaks = find_peaks(window_abp[el])[1:-1]
-                    valleys = find_peaks(-window_abp[el])[1:-1]
-                    if len(peaks) == 0 or len(valleys) == 0:
-                        continue
-                    sbp = np.mean(window_abp[el, peaks]).astype(np.float32)
-                    dbp = np.mean(window_abp[el, valleys]).astype(np.float32)
+                    sbp, dbp, _, _ = compute_sp_dp(window_abp[el]) # Should not raise an error if the signal is valid
+                    map = (2 * dbp + sbp) / 3
                     sbp_values.extend([sbp])
                     dbp_values.extend([dbp])
+                    map_values.extend([map])
                     
         sbp_values = np.array(sbp_values)
         dbp_values = np.array(dbp_values)
+        map_values = np.array(map_values)
 
         # Calculate statistics
         sbp_mean = np.mean(sbp_values)
@@ -47,6 +64,12 @@ def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs
         dbp_q1 = np.quantile(dbp_values, 0.25)
         dbp_q3 = np.quantile(dbp_values, 0.75)
         
+        if len(map_values) > 0:
+            map_mean = np.mean(map_values)
+            map_std = np.std(map_values)
+            map_q1 = np.quantile(map_values, 0.25)
+            map_q3 = np.quantile(map_values, 0.75)
+        
         # Create the figure
         plt.figure(figsize=(10, 6))
         sns.set_palette("pastel")
@@ -56,6 +79,10 @@ def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs
 
         # Plot DBP histogram
         plt.hist(dbp_values, bins=50, alpha=0.7, label='DBP', color='lightcoral')
+        
+        if len(map_values) > 0:
+            # Plot MAP histogram
+            plt.hist(map_values, bins=50, alpha=0.7, label='MAP', color='lightgreen')
 
         # Add vertical lines for SBP
         plt.axvline(sbp_mean, color='blue', linestyle='dashed', linewidth=1, 
@@ -68,25 +95,49 @@ def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs
                     label=r'DBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(dbp_mean, dbp_std))
         plt.axvline(dbp_q1, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q1: {dbp_q1:.2f}')
         plt.axvline(dbp_q3, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q3: {dbp_q3:.2f}')
+        
+        if len(map_values) > 0:
+            # Add vertical lines for MAP
+            plt.axvline(map_mean, color='green', linestyle='dashed', linewidth=1,
+                        label=r'MAP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(map_mean, map_std))
+            plt.axvline(map_q1, color='green', linestyle='dotted', linewidth=1, label=f'MAP Q1: {map_q1:.2f}')
+            plt.axvline(map_q3, color='green', linestyle='dotted', linewidth=1, label=f'MAP Q3: {map_q3:.2f}')
+            
+            plt.title(f'{dataloader_name} SBP/DBP/MAP Distributions')
+            plt.xlabel('mmHg')
+            plt.ylabel('Density')
+            plt.legend()  # Update legend to include lines
+            plt.tight_layout()
 
+            plt.savefig(os.path.join(savepath, f'{dataloader_name}_sbp_dbp_map_distribution.jpg'))
+            plt.close()                    
+        else:
+            plt.title(f'{dataloader_name} SBP and DBP Distributions')
+            plt.xlabel('mmHg')
+            plt.ylabel('Density')
+            plt.legend()  # Update legend to include lines
+            plt.tight_layout()
 
-        plt.title(f'{dataloader_name} SBP and DBP Distributions')
-        plt.xlabel('mmHg')
-        plt.ylabel('Density')
-        plt.legend()  # Update legend to include lines
-        plt.tight_layout()
-
-        plt.savefig(os.path.join(savepath, f'{dataloader_name}_sbp_dbp_distribution.jpg'))
-        plt.close()
+            plt.savefig(os.path.join(savepath, f'{dataloader_name}_sbp_dbp_distribution.jpg'))
+            plt.close()
 
 
 def plot_subject_sample_distribution(subject_sample_dict, ids, savepath="subject_sample_distribution.png"):
     r"""
     Plots the distribution of sample counts per subject in a dataset.
     
-    Args:
-        subject_sample_dict: A dictionary where the keys are subject IDs and the values are lists of sample IDs.
-        savepath: Path to save the plot.    
+    Parameters
+    ------------
+    subject_sample_dict : dict
+        Dictionary where keys are subject IDs and values are lists of sample IDs for each subject.
+    ids : list
+        List of subject IDs to consider for the distribution plot.
+    savepath : str, optional
+        File path to save the generated plot. Defaults to "subject_sample_distribution.png".
+    
+    Returns
+    ------------
+    None (saves the plot to the specified savepath)
     """
     
     subject_sample_counts = [len(subject_sample_dict[id]) for id in ids]
@@ -217,6 +268,15 @@ def plot_signals(signals, labels=None, title="Signals Plot", fs=125, savepath='.
         The title of the plot. Defaults to "Signals Plot".
     fs (int, optional): 
         The sampling frequency of the signals. Defaults to 125.
+    savepath (str, optional):
+        The directory where the plot will be saved. Defaults to './figs'.
+    ylabels (list, optional):
+        A list of y-axis labels for each signal. If None, defaults to "Amplitude" for all signals.
+        
+    Returns
+    ------------
+    None: 
+        The function saves the plot as a .jpg file in the specified savepath.    
     """
 
     num_signals = len(signals) if isinstance(signals, list) else signals.shape[0] # Handle list or 2D array input
@@ -271,7 +331,7 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
 
     Returns
     ------------
-    None
+    None, saves the plot as a .jpg file in the specified save_path.
     """
 
     # Seconds on the x-axis, amplitude on the y-axis
