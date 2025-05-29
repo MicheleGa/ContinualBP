@@ -43,17 +43,29 @@ def plot_r_squared(gt, pd, name='', save_path='./figs/', figsize=(10, 8)):
     r2 = r2_score(y_true, y_pred)
 
     # Create the plot
-    plt.figure(figsize=figsize)
-    plt.scatter(y_true, y_pred, label="Data Points")
-    plt.xlabel("Actual Values")
-    plt.ylabel("Predicted Values")
-    plt.title(f"R-squared ({name}): {r2:.3f}")
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.scatter(y_true, y_pred, label="Data Points", alpha=0.6)
+    
+    # Add diagonal line (perfect agreement line) using axis limits
+    low_x, high_x = ax.get_xlim()
+    low_y, high_y = ax.get_ylim()
+    low = max(low_x, low_y)
+    high = min(high_x, high_y)
+    ax.plot([low, high], [low, high], ls="--", c="red", alpha=0.8, 
+            label="Perfect Agreement (R² = 1.00)", linewidth=2)
+    
+    ax.set_xlabel("Actual Values")
+    ax.set_ylabel("Predicted Values")
+    ax.set_title(f"R-squared ({name}): {r2:.3f}")
 
     # Add R-squared value to the plot
-    plt.text(0.1, 0.9, f"R-squared: {r2:.3f}", transform=plt.gca().transAxes)
+    ax.text(0.1, 0.9, f"R-squared: {r2:.3f}", transform=ax.transAxes)
     
-    plt.legend()
-    plt.grid(True)
+    # Ensure equal aspect ratio for better visualization
+    ax.set_aspect('equal')
+    
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     plt.savefig(save_path)
     plt.close()
 
@@ -329,7 +341,7 @@ def get_metric_values(loss, outputs, targets, config):
             'sbp_me': torch.mean(outputs_sbp_values - targets_sbp_values).item(),
             'dbp_me': torch.mean(outputs_dbp_values - targets_dbp_values).item(),
             'sbp_mae_std': torch.std(torch.abs(outputs_sbp_values - targets_sbp_values)).item(),
-            'dbp_mae_std': torch.std(torch.abs(outputs_sbp_values - targets_dbp_values)).item(),
+            'dbp_mae_std': torch.std(torch.abs(outputs_dbp_values - targets_dbp_values)).item(),
             'sbp_me_std': torch.std(outputs_sbp_values - targets_sbp_values).item(),
             'dbp_me_std': torch.std(outputs_dbp_values - targets_dbp_values).item(),
         }

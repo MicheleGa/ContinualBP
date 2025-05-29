@@ -19,8 +19,7 @@ class GRU(nn.Module):
                  input_seq_len_s=5,
                  hidden_dim=128,
                  num_layers=2,
-                 bidirectional=True,
-                 return_embedding=False):
+                 bidirectional=True):
         super(GRU, self).__init__()
         
         # Input Data Setup
@@ -51,12 +50,6 @@ class GRU(nn.Module):
 
         # Fully connected layer to map hidden states to output
         self.fc = nn.Linear(hidden_dim * (2 if bidirectional else 1), 1)
- 
-        # Kaiming initialization that should work fine with the z-score preprocessing
-        self.init_params() 
-        
-        # Freeze/Tune model parameters
-        #self.set_tunable_layers(set_tunable_params)
 
     def forward(self, x):
         
@@ -125,8 +118,6 @@ def parseargs():
     parser.add_argument('--hidden_dim', default=128, type=int, help='GRU hidden dimension size')
     parser.add_argument('--num_layers', default=2, type=int, help='number of GRU layers')
     parser.add_argument('--bidirectional', default=True, type=lambda x: bool(strtobool(x)), help='whether to use bidirectional GRU or not')
-    parser.add_argument('--set_tunable_params', default='all', type=str, help='which model parameters to tune (all, only regressor, only encoder, etc.)')
-    parser.add_argument('--return_embedding', default='False', type=lambda x: bool(strtobool(x)), help='whether to return the model embedding before the regressor or not')
     
     args = parser.parse_args()
     return args
@@ -147,8 +138,6 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        bidirectional=args.bidirectional,
-        set_tunable_params=args.set_tunable_params,
-        return_embedding=args.return_embedding
+        bidirectional=args.bidirectional
         )        
     net.print_summary(batch_size=args.batch_size)

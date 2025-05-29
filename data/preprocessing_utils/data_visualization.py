@@ -7,12 +7,90 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from preprocessing_utils.signal_processing import compute_sp_dp
+from preprocessing_utils.split import split_train_val_test_personalization
 
+
+def _calculate_dataset_mean_std(sbp_values, dbp_values, map_values, name, savepath):
+    sbp_values = np.array(sbp_values)
+    dbp_values = np.array(dbp_values)
+    map_values = np.array(map_values)
+
+    # Calculate statistics
+    sbp_mean = np.mean(sbp_values)
+    sbp_std = np.std(sbp_values)
+    sbp_q1 = np.quantile(sbp_values, 0.25)
+    sbp_q3 = np.quantile(sbp_values, 0.75)
+
+    dbp_mean = np.mean(dbp_values)
+    dbp_std = np.std(dbp_values)
+    dbp_q1 = np.quantile(dbp_values, 0.25)
+    dbp_q3 = np.quantile(dbp_values, 0.75)
     
-def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs/dataset'):
+    if len(map_values) > 0:
+        map_mean = np.mean(map_values)
+        map_std = np.std(map_values)
+        map_q1 = np.quantile(map_values, 0.25)
+        map_q3 = np.quantile(map_values, 0.75)
+    
+    # Create the figure
+    plt.figure(figsize=(10, 6))
+    sns.set_palette("pastel")
+
+    # Plot SBP histogram
+    plt.hist(sbp_values, bins=50, alpha=0.7, label='SBP', color='skyblue')
+
+    # Plot DBP histogram
+    plt.hist(dbp_values, bins=50, alpha=0.7, label='DBP', color='lightcoral')
+    
+    if len(map_values) > 0:
+        # Plot MAP histogram
+        plt.hist(map_values, bins=50, alpha=0.7, label='MAP', color='lightgreen')
+
+    # Add vertical lines for SBP
+    plt.axvline(sbp_mean, color='blue', linestyle='dashed', linewidth=1, 
+                label=r'SBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(sbp_mean, sbp_std))  
+    plt.axvline(sbp_q1, color='blue', linestyle='dotted', linewidth=1, label=f'SBP Q1: {sbp_q1:.2f}')
+    plt.axvline(sbp_q3, color='blue', linestyle='dotted', linewidth=1, label=f'SBP Q3: {sbp_q3:.2f}')
+
+    # Add vertical lines for DBP
+    plt.axvline(dbp_mean, color='red', linestyle='dashed', linewidth=1,
+                label=r'DBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(dbp_mean, dbp_std))
+    plt.axvline(dbp_q1, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q1: {dbp_q1:.2f}')
+    plt.axvline(dbp_q3, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q3: {dbp_q3:.2f}')
+    
+    if len(map_values) > 0:
+        # Add vertical lines for MAP
+        plt.axvline(map_mean, color='green', linestyle='dashed', linewidth=1,
+                    label=r'MAP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(map_mean, map_std))
+        plt.axvline(map_q1, color='green', linestyle='dotted', linewidth=1, label=f'MAP Q1: {map_q1:.2f}')
+        plt.axvline(map_q3, color='green', linestyle='dotted', linewidth=1, label=f'MAP Q3: {map_q3:.2f}')
+        
+        plt.title(f'{name} SBP/DBP/MAP Distributions')
+        plt.xlabel('mmHg')
+        plt.ylabel('Density')
+        plt.legend()  # Update legend to include lines
+        plt.tight_layout()
+
+        plt.savefig(os.path.join(savepath, f'{name}_sbp_dbp_map_distribution.jpg'))
+        plt.close()                    
+    else:
+        plt.title(f'{name} SBP and DBP Distributions')
+        plt.xlabel('mmHg')
+        plt.ylabel('Density')
+        plt.legend()  # Update legend to include lines
+        plt.tight_layout()
+
+        plt.savefig(os.path.join(savepath, f'{name}_sbp_dbp_distribution.jpg'))
+        plt.close()
+        
+    
+def calculate_dataloaders_mean_std(dataloaders, dataloaders_names, savepath=f'./figs/dataset'):
     r"""
-    Calculates SBP and DBP distributions and plots them with mean and quartiles.
+    Calculates SBP, DBP, and MAP distributions of the train/val/test split accessed through the corresponding dataloaders.
+    The function plots them with mean, standard deviation, and quartiles.
+    This function should be called only from dataset.py.
     
     Parameters
     ------------
@@ -49,78 +127,59 @@ def calculate_dataset_mean_std(dataloaders, dataloaders_names, savepath=f'./figs
                     dbp_values.extend([dbp])
                     map_values.extend([map])
                     
-        sbp_values = np.array(sbp_values)
-        dbp_values = np.array(dbp_values)
-        map_values = np.array(map_values)
+        _calculate_dataset_mean_std(
+            sbp_values=sbp_values,
+            dbp_values=dbp_values,
+            map_values=map_values,
+            name=dataloader_name,
+            savepath=savepath
+            )
 
-        # Calculate statistics
-        sbp_mean = np.mean(sbp_values)
-        sbp_std = np.std(sbp_values)
-        sbp_q1 = np.quantile(sbp_values, 0.25)
-        sbp_q3 = np.quantile(sbp_values, 0.75)
 
-        dbp_mean = np.mean(dbp_values)
-        dbp_std = np.std(dbp_values)
-        dbp_q1 = np.quantile(dbp_values, 0.25)
-        dbp_q3 = np.quantile(dbp_values, 0.75)
+def calculate_personalization_subjects_mean_std(dataset, args, savepath=f'./figs/dataset'):
+    r"""
+    Calculates SBP, DBP, and MAP distributions of the personalzation dataset train/val/test splits.
+    The function plots them with mean, standard deviation, and quartiles.
+    This function should be called only from dataset.py.
+    
+    Parameters
+    ------------
+    dataset: PhysioDataset obejct
+        Dataset with the list of personalization subjects to analyze.
+    savepath : str, default './figs/dataset'
+        Path to save the generated plots.
         
-        if len(map_values) > 0:
-            map_mean = np.mean(map_values)
-            map_std = np.std(map_values)
-            map_q1 = np.quantile(map_values, 0.25)
-            map_q3 = np.quantile(map_values, 0.75)
+    Returns
+    ------------
+    None (saves the plots to the specified savepath)   
+    """
+
+    for subject in dataset.subjects_for_personalization:
+                
+        # Get all samples of a subject
+        subject_sample_ids = dataset.index_by_subject_id[subject]
+        train_idx, val_idx, test_idx = split_train_val_test_personalization(
+            subject_sample_ids, 
+            fixed_train_size=dataset.personalization_sample_number
+            )
         
-        # Create the figure
-        plt.figure(figsize=(10, 6))
-        sns.set_palette("pastel")
-
-        # Plot SBP histogram
-        plt.hist(sbp_values, bins=50, alpha=0.7, label='SBP', color='skyblue')
-
-        # Plot DBP histogram
-        plt.hist(dbp_values, bins=50, alpha=0.7, label='DBP', color='lightcoral')
+        train_sampler = SubsetRandomSampler(train_idx)
+        val_sampler = SubsetRandomSampler(val_idx)
+        test_sampler = SubsetRandomSampler(test_idx)
         
-        if len(map_values) > 0:
-            # Plot MAP histogram
-            plt.hist(map_values, bins=50, alpha=0.7, label='MAP', color='lightgreen')
-
-        # Add vertical lines for SBP
-        plt.axvline(sbp_mean, color='blue', linestyle='dashed', linewidth=1, 
-                    label=r'SBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(sbp_mean, sbp_std))  
-        plt.axvline(sbp_q1, color='blue', linestyle='dotted', linewidth=1, label=f'SBP Q1: {sbp_q1:.2f}')
-        plt.axvline(sbp_q3, color='blue', linestyle='dotted', linewidth=1, label=f'SBP Q3: {sbp_q3:.2f}')
-
-        # Add vertical lines for DBP
-        plt.axvline(dbp_mean, color='red', linestyle='dashed', linewidth=1,
-                    label=r'DBP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(dbp_mean, dbp_std))
-        plt.axvline(dbp_q1, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q1: {dbp_q1:.2f}')
-        plt.axvline(dbp_q3, color='red', linestyle='dotted', linewidth=1, label=f'DBP Q3: {dbp_q3:.2f}')
+        train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=args.loader_worker)
+        val_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker)
+        test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker)
         
-        if len(map_values) > 0:
-            # Add vertical lines for MAP
-            plt.axvline(map_mean, color='green', linestyle='dashed', linewidth=1,
-                        label=r'MAP $\mu$: {:.2f}, $\sigma$: {:.2f}'.format(map_mean, map_std))
-            plt.axvline(map_q1, color='green', linestyle='dotted', linewidth=1, label=f'MAP Q1: {map_q1:.2f}')
-            plt.axvline(map_q3, color='green', linestyle='dotted', linewidth=1, label=f'MAP Q3: {map_q3:.2f}')
-            
-            plt.title(f'{dataloader_name} SBP/DBP/MAP Distributions')
-            plt.xlabel('mmHg')
-            plt.ylabel('Density')
-            plt.legend()  # Update legend to include lines
-            plt.tight_layout()
-
-            plt.savefig(os.path.join(savepath, f'{dataloader_name}_sbp_dbp_map_distribution.jpg'))
-            plt.close()                    
-        else:
-            plt.title(f'{dataloader_name} SBP and DBP Distributions')
-            plt.xlabel('mmHg')
-            plt.ylabel('Density')
-            plt.legend()  # Update legend to include lines
-            plt.tight_layout()
-
-            plt.savefig(os.path.join(savepath, f'{dataloader_name}_sbp_dbp_distribution.jpg'))
-            plt.close()
-
+        subject_fig_path = os.path.join(savepath, str(subject))
+        os.makedirs(subject_fig_path, exist_ok=True)
+        
+        calculate_dataloaders_mean_std(
+            dataloaders=[train_dataloader, val_dataloader, test_dataloader],
+            dataloaders_names=[f'{str(subject)}-Train', f'{str(subject)}-Val', f'{str(subject)}-Test'],
+            savepath=subject_fig_path
+        )
+                
 
 def plot_subject_sample_distribution(subject_sample_dict, ids, savepath="subject_sample_distribution.png"):
     r"""

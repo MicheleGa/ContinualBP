@@ -3,14 +3,127 @@ import sys
 folders_to_add = ['models']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
+import argparse
+from distutils.util import strtobool
 import time
 import yaml
-import itertools
 import numpy as np
 import random
 import torch
 from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer
 from models.UNet import AttentionGate1D, SelfAttentionBlock1D
+
+
+def parseargs():
+    parser = argparse.ArgumentParser(description="Multimodal Blood Pressure from PPG/ECG/RESP with NN - Pretraining")
+    
+    # Run setup
+    parser.add_argument('--resume', default='', type=str, help='path to latest checkpoint (default: none)')
+    parser.add_argument('--expname', default='test', type=str, help='experiment name')
+    parser.add_argument('--gpu', default="0", type=str)
+    parser.add_argument('--seed', default=42, type=int, help='random seed')
+    
+    # Generic training setup
+    parser.add_argument('--max_training_epochs', default=75, type=int, help='maximum epochs')
+    parser.add_argument('--max_lp_training_epochs', default=75, type=int, help='maximum linear probing epochs')
+    parser.add_argument('--eval_every_n_epochs', default=1, type=int, help='evaluate every n epochs')
+    parser.add_argument('--es_patience', default=10, type=int, help='early stopping patience')
+    parser.add_argument('--es_min_delta', default=0.01, type=float, help='early stopping minimum delta')
+    parser.add_argument('--es_enable', default='False', type=lambda x: bool(strtobool(x)), help='enable early stopping')
+    parser.add_argument('--enable_amp', default='False', type=lambda x: bool(strtobool(x)), help='enable automatic mixed precision')
+    
+    # Optimization setup
+    parser.add_argument('--smoothl1loss_beta', default=5, type=int, help='beta for SmoothL1Loss')
+    parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
+    parser.add_argument('--lr_linear_probe', default=0.0005, type=float, help='learning rate for personalization')
+    parser.add_argument('--lr_personalization', default=0.0005, type=float, help='learning rate for personalization')
+    parser.add_argument('--l2norm', default=0.001, type=float, help='L2 regularization')
+    parser.add_argument('--sgd_momentum', default=0.9, type=float, help='Momentum for SGD optimizer')
+    parser.add_argument('--lrsched_step', default="5, 10, 15, 20, 40", type=str, help='learning rate scheduler steps')
+    parser.add_argument('--lrsched_gamma', default=0.5, type=float, help='learning rate scheduler gamma')
+    parser.add_argument('--optimizer_type', default="AdamW", type=str, help='optimizer type')
+    parser.add_argument('--lr_scheduler_type', default="MultiStepLR", type=str, help='learning rate scheduler type')
+    parser.add_argument('--lr_scheduler_enable', default='False', type=lambda x: bool(strtobool(x)), help='enable learning rate scheduler')
+    parser.add_argument('--lr_scheduler_min_lr', default=0.0001, type=float, help='enable learning rate scheduler')
+    parser.add_argument('--lr_scheduler_warmup', default=0, type=int, help='enable learning rate scheduler')
+    
+    # Loss function setup (supervised and self-supervised)
+    parser.add_argument('--criterion', default="MSELoss", type=str, help='loss criterion')
+    parser.add_argument('--lambda_supervised', default=0., type=float, help='scale supervised loss function contribution, set 0. to prevent its application')
+    parser.add_argument('--lambda_ortho', default=0., type=float, help='induce feature orthogonality during pretraining, set 0. to prevent its application')
+    parser.add_argument('--lambda_contrastive', default=0., type=float, help='induce contrastive loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    parser.add_argument('--temperature', default=0., type=float, help='temperature scalar for SimCLR loss')
+    parser.add_argument('--lambda_msr', default=0., type=float, help='induce masked signal loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    parser.add_argument('--lambda_cwg', default=0., type=float, help='induce prev/next signal reconstruction loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    
+    # Dataset setup
+    parser.add_argument('--dataset_folder', default='./data/lmdb', type=str, help='path to dataset fodler')
+    parser.add_argument('--dataset_name', default='test', type=str, help='name of the dataset')
+    parser.add_argument('--lp_dataset_name', default='test', type=str, help='name of the dataset for linear probing')
+    parser.add_argument('--pretraining_ratio', default=0.8, type=float, help='pretraining ratio of the whole dataset')
+    parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
+    parser.add_argument('--personalization_sample_number', default=100, type=int, help='number of samples to take for personalization')
+    parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
+    parser.add_argument('--fold', default=0, type=int, help='fold number')
+    parser.add_argument('--loader_worker', default=4, type=int, help='number of data loader workers')
+    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
+    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
+    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
+    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
+    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
+    parser.add_argument('--batch_size', default=256, type=int, help='batch size')
+    parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
+    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
+
+    # Self-supervision setup
+    parser.add_argument('--masking_ratio', default=0.15, type=float, help='Ratio of signal length to mask for MSR task')
+    parser.add_argument('--augmentation_types', default='jitter,scaling,magnitude_warp,flip', type=str, help='Comma-separated list of augmentation types for SimCLR')
+    parser.add_argument('--aug_prob', default=0.2, type=float, help='Probability for each individual augmentation in RandomAugmentor')
+    parser.add_argument('--ssl', default='False', type=lambda x: bool(strtobool(x)), help='whether to do self-supervised pretraining or not')
+        
+    # Model setup
+    parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
+    parser.add_argument('--pretrained_model_checkpoint', default="./checkpoints", type=str, help='pretrained model path')
+    parser.add_argument('--proj_head_dim', default=256, type=int, help='dimension of the projection head after the feture extractor') 
+    
+    # ResGRUNet setup
+    #parser.add_argument('--gru', default='True', type=lambda x: bool(strtobool(x)), help='whether to use a GRU after CNN or not')
+    #parser.add_argument('--channels', default='1, 32, 64, 128', type=str, help='channels produced by the convolutional blocks')
+    #parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
+    #parser.add_argument('--kernel_size', default=7, type=int, help='convolutional layer kernel size')
+    #parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
+    #parser.add_argument('--supervised', default='False', type=lambda x: bool(strtobool(x)), help='whether to use the model with pretrianing or not')
+        
+    ## PhysioFormer setup
+    #parser.add_argument('--embed_dim', default=64, type=int, help='input embedding size')
+    #parser.add_argument('--hidden_dim', default=256, type=int, help='transformer hidden dimension')
+    #parser.add_argument('--num_layers', default=3, type=int, help='number of transformer layers')
+    #parser.add_argument('--n_head', default=4, type=int, help='number of self-attention heads')
+    #parser.add_argument('--head_dim', default=16, type=int, help='self-attention headd dimension')
+    
+    # UNet setup
+    parser.add_argument('--channels', default='32, 64, 128, 256, 512', type=str, help='channels produced by the convolutional blocks')
+    parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
+    parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
+    parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
+    
+    # SSL UNet additional setup
+    parser.add_argument('--proj_hidden_dim', default=512, type=int, help='Dimension of the projection head hidden dim for SimCLR')
+    
+    # GRU setup
+    parser.add_argument('--hidden_dim', default=128, type=int, help='GRU hidden dimension size')
+    parser.add_argument('--num_layers', default=2, type=int, help='number of GRU layers')
+    parser.add_argument('--bidirectional', default=True, type=lambda x: bool(strtobool(x)), help='whether to use bidirectional GRU or not')
+        
+    # Transformer setup
+    parser.add_argument('--embed_dim', default=32, type=int, help='transformer embedding dimension size')
+    parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
+    parser.add_argument('--num_encoder_layers', default=2, type=int, help='number of trasnformer layers')
+    parser.add_argument('--dim_feedforward', default=128, type=int, help='feedforward dimension size in the transformer encoder') 
+        
+    args = parser.parse_args()
+    return args
 
 
 def fixseed(SEED):
@@ -280,7 +393,7 @@ def set_trainable_parameters(model, tune, config):
         model (torch.nn.Module): 
             The model to be tuned.
         tune (str): 
-            The tuning strategy. Options are 'all', 'gru' or 'transformer', 'projection_head', 'last_linear', or 'none'.
+            The tuning strategy. Options are 'all', 'gru' or 'transformer', 'projection_head', 'last_layer', or 'none'.
         config (dict): 
             Configuration dictionary containing model settings.
     
@@ -353,7 +466,7 @@ def _handle_resgru_tuning(model, tune, config):
         for p in model.t_gru.parameters():
             p.requires_grad = False
     
-    elif tune == 'last_linear':
+    elif tune == 'last_layer':
         _freeze_resgru_feature_generators(model, config)
         for p in model.t_gru.parameters():
             p.requires_grad = False
@@ -384,7 +497,7 @@ def _handle_physioformer_tuning(model, tune, config):
         for p in model.transformer.parameters():
             p.requires_grad = False
     
-    elif tune == 'last_linear':
+    elif tune == 'last_layer':
         _freeze_physioformer_projections(model, config)
         for p in model.transformer.parameters():
             p.requires_grad = False
@@ -398,20 +511,20 @@ def _handle_physioformer_tuning(model, tune, config):
 def _handle_gru_tuning(model, tune, config):
     """Handle tuning strategy for GRU model."""
     
-    # Special cases first all/none parameters tuned
     if tune == 'all': 
-        return
+        # Train all parameters
+        for p in model.parameters():
+            p.requires_grad = True
     elif tune == 'none':
+        # Train no parameters
         for p in model.parameters():
             p.requires_grad = False
-        return
-    
-    # Model-specfic tune, look into the corresponding script where the architecture is defined
-    # For GRU either you fine-tune all the model parameters or the last linear
-    if tune == 'last_linear':
+    elif tune == 'last_layer':
         # Freeze the GRU layers (look into GRU.py for the layers'name)
         for p in model.gru.parameters():
             p.requires_grad = False
+        for p in model.fc.parameters():
+            p.requires_grad = True
     else:
         raise ValueError(f"Invalid tuning strategy for GRU: {tune}")
 
@@ -427,7 +540,7 @@ def _handle_unet_tuning(model, tune, config):
         # Train no parameters
         for p in model.parameters():
             p.requires_grad = False
-    elif tune == 'last_linear':
+    elif tune == 'last_layer':
         # Freeze everything and only leave final_conv with require_grads True
         # Model was already all tunable, but code is cleaner this way 
         for p in model.parameters():
@@ -485,7 +598,7 @@ def _handle_sslunet_tuning(model, tune, config):
     elif tune == 'none':
         # All parameters already set to False 
         pass
-    elif tune == 'last_linear':
+    elif tune == 'last_layer':
         # Only tune the final supervised convolutional layer
         for p in model.final_conv_supervised.parameters():
             p.requires_grad = True

@@ -136,8 +136,7 @@ def supervised_pretraining_training_validation_testing(
             signals = signals.to(device)
             if len(signals.shape) == 2: # For 1D signals like pure PPG, expand to [Batch, Length, 1]
                 signals = signals.unsqueeze(-1)
-            #_, _, num_modalities = signals.shape # This line is redundant after unsqueeze
-
+            
             if config['sig2sig']:
                 targets = targets.to(device)
             else:
@@ -914,7 +913,7 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
     print(f"Checkpoint loaded from {config['pretrained_model_checkpoint']}")
     pretrained_model.load_state_dict(checkpoint['model'])
     pretrained_model.eval() # to avoind incosistent results as explicitly reported at https://pytorch.org/tutorials/beginner/saving_loading_models.html
-    set_trainable_parameters(pretrained_model, 'none', config)
+    set_trainable_parameters(model=pretrained_model, tune='none', config=config)
     
     # Copy pretrained model for fine-tuning to avoid touching the original model
     personalized_model = copy.deepcopy(pretrained_model)
@@ -925,7 +924,8 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
     gc.collect()
     
     # Set the model to training model
-    set_trainable_parameters(personalized_model, config['set_tunable_params'], config)
+    # Different choice can be performed based on the model architecture
+    set_trainable_parameters(model=personalized_model, tune='last_layer', config=config)
     
     # Print trainable and non-trainable parameters
     trainable_params = sum(p.numel() for p in personalized_model.parameters() if p.requires_grad)
@@ -939,7 +939,7 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
     val_dataloader = dataloaders['val']
     test_dataloader = dataloaders['test']
     
-    # Optimizater and scheduler
+    # Optimizer and scheduler
     if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
         config['steps_per_epoch'] = len(train_dataloader)
         
@@ -958,103 +958,147 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
     best_val = float("+inf")    
     if config['es_enable']:
         early_stopping = EarlyStopping(patience=config['es_patience'], delta=config['es_min_delta'], verbose=True)
-    
-    # Personalization loop
+    else:
+        early_stopping = None
+        
+    # ---- Personalization Loop ----
     for epoch in range(config['max_training_epochs']):
         
-        # Training loop
-        set_trainable_parameters(personalized_model, config['set_tunable_params'], config)
+        # ---- Training Loop ----
+        set_trainable_parameters(model=personalized_model, tune='last_layer', config=config)
         train_losses = AverageMeter(name='train/loss')
         for batch_idx, batch in enumerate(train_dataloader):
+            
+            # Prepare data
             signals, targets = batch
-
-            # Move data and labels to the same device as the model
             signals = signals.to(device)
-            targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
-                        
-            # Perform forward pass
-            if config['return_embedding']:
-                outputs, _ = personalized_model(signals)
+            if len(signals.shape) == 2: # For 1D signals like pure PPG, expand to [Batch, Length, 1]
+                signals = signals.unsqueeze(-1)
+            
+            if config['sig2sig']:
+                targets = targets.to(device)
             else:
-                outputs = personalized_model(signals)
-            
-            # Loss 
-            if config['criterion'] == 'MSELoss':
-                loss = F.mse_loss(outputs, targets)
-            elif config['criterion'] == 'SmoothL1Loss':
-                loss = F.smooth_l1_loss(outputs, targets)
-            else:
-                raise ValueError("Invalid criterion ...")
-            
-            loss = config['lambda_supervised'] * loss
-            
+                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+
+            # Forward propagation
+            # In supervised mode, model.forward typically returns outputs and optionally embeddings
+            outputs = personalized_model(signals)
+
+            # Supervised loss
+            supervised_loss = 0.
+            if config['lambda_supervised'] != 0.:
+                if config['criterion'] == 'MSELoss':
+                    supervised_loss = F.mse_loss(outputs, targets)
+                elif config['criterion'] == 'SmoothL1Loss':
+                    supervised_loss = F.smooth_l1_loss(outputs, targets)
+                else:
+                    raise ValueError("Invalid criterion ...")
+
+            # Total loss
+            loss = config['lambda_supervised'] * supervised_loss
+
             # Backpropagation and optimization
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            
-            # N.B. schedulers are usually called at the end of the epoch, but here we apply it at the end of each batch
+
+            # N.B. schedulers are usually called at the end of the epoch, but here we apply it at the end of each batch only for cosine-warmup scheduler
             if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
                 scheduler.step()
-            
+
+            # Log training loss
             train_losses.update(loss.item(), signals.size(0))
-            
-            # Log training loss to TensorBoard
             writer.add_scalar('train/loss', loss.item(), epoch * len(train_dataloader) + batch_idx)
-            
+   
         # Log epoch training loss to TensorBoard
         writer.add_scalar('train/loss_epoch', train_losses.avg, epoch)
         
-        # Validation loop    
-        set_trainable_parameters(personalized_model, 'none', config)
-        metrics = ['loss', 'sbp_mae', 'dbp_mae', 'sbp_me', 'dbp_me', 'sbp_mae_std',  'dbp_mae_std', 'sbp_me_std', 'dbp_me_std']
-        val_metrics = setup_meter('val', metrics)
+        # ---- Validation Loop ----
+        personalized_model.eval() # Set model to evaluation mode (siwtch off batch norm/dropout etc.) for validation
+        set_trainable_parameters(model=personalized_model, tune='none', config=config) # Ensure all params are non-trainable during eval
+        
+        val_losses = AverageMeter(name='val/loss')
+        val_sbp_maes = AverageMeter(name='val/sbp_mae')
+        val_dbp_maes = AverageMeter(name='val/dbp_mae')
+        val_sbp_mes = AverageMeter(name='val/sbp_me')
+        val_dbp_mes = AverageMeter(name='val/dbp_me')
+        val_sbp_mae_stds = AverageMeter(name='val/sbp_mae_std')
+        val_dbp_mae_stds = AverageMeter(name='val/dbp_mae_std')
+        val_sbp_me_stds = AverageMeter(name='val/sbp_me_std')
+        val_dbp_me_stds = AverageMeter(name='val/dbp_me_std')
+        
         for batch_idx, batch in enumerate(val_dataloader):
+            
+            # Prepare data
             signals, targets = batch
-
-            # Move data and labels to the same device as the model
             signals = signals.to(device)
-            targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
-            
-            # Perform forward pass
-            if config['return_embedding']:
-                outputs, _ = personalized_model(signals)
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            #_, _, num_modalities = signals.shape
+
+            if config['sig2sig']:
+                targets = targets.to(device)
             else:
+                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+
+            # Forward propagation
+            with torch.no_grad(): # No gradient calculation during validation
                 outputs = personalized_model(signals)
-            
-            # Loss 
-            if config['criterion'] == 'MSELoss':
-                val_loss = F.mse_loss(outputs, targets)
-            elif config['criterion'] == 'SmoothL1Loss':
-                val_loss = F.smooth_l1_loss(outputs, targets)
-            else:
-                raise ValueError("Invalid criterion ...")
-            
+
+            # Supervised loss
+            supervised_loss = 0
+            if config['lambda_supervised'] != 0.:
+                if config['criterion'] == 'MSELoss':
+                    supervised_loss = F.mse_loss(outputs, targets)
+                elif config['criterion'] == 'SmoothL1Loss':
+                    supervised_loss = F.smooth_l1_loss(outputs, targets)
+                else:
+                    raise ValueError("Invalid criterion ...")
+
+            # Total loss for validation is just supervised loss
+            val_loss = config['lambda_supervised'] * supervised_loss
+
+            # Log validation loss and metrics
             metric_values = get_metric_values(val_loss, outputs, targets, config)
-            update_meter(val_metrics, metric_values, signals.size(0))
-        
-        # Log epoch validation metrics to TensorBoard
-        log_meter_to_tensorboard(writer, val_metrics, epoch, name='val')
-        
-        # N.B. schedulers are usually called at the end of the epoch
+            
+            val_losses.update(metric_values['loss'], signals.size(0))
+            val_sbp_maes.update(metric_values['sbp_mae'], signals.size(0))
+            val_dbp_maes.update(metric_values['dbp_mae'], signals.size(0))
+            val_sbp_mes.update(metric_values['sbp_me'], signals.size(0))
+            val_dbp_mes.update(metric_values['dbp_me'], signals.size(0))
+            val_sbp_mae_stds.update(metric_values['sbp_mae_std'], signals.size(0))
+            val_dbp_mae_stds.update(metric_values['dbp_mae_std'], signals.size(0))
+            val_sbp_me_stds.update(metric_values['sbp_me_std'], signals.size(0))
+            val_dbp_me_stds.update(metric_values['dbp_me_std'], signals.size(0))
+
+        # Log epoch validation loss and metrics (at the end of validation)
+        writer.add_scalar('val/loss_epoch', val_losses.avg, epoch)
+        writer.add_scalar('val/sbp_mae_epoch', val_sbp_maes.avg, epoch)
+        writer.add_scalar('val/dbp_mae_epoch', val_dbp_maes.avg, epoch)
+        writer.add_scalar('val/sbp_me_epoch', val_sbp_mes.avg, epoch)
+        writer.add_scalar('val/dbp_me_epoch', val_dbp_mes.avg, epoch)
+        writer.add_scalar('val/sbp_mae_std_epoch', val_sbp_mae_stds.avg, epoch)
+        writer.add_scalar('val/dbp_mae_std_epoch', val_dbp_mae_stds.avg, epoch)
+
+        # N.B. schedulers are usually called at the end of the epoch except for ths cosine-warmup
         if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'ExponentialLR':
             scheduler.step()
-        
+
         # Log LR
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar(f'{config["optimizer_type"]}', current_lr, epoch)
-        
+
         # Print losses
-        print(f"Epoch {epoch + 1}/{config['max_training_epochs']} - Train Loss {train_losses.avg}, Val Loss {val_metrics['loss'].avg}")
+        print(f"Epoch {epoch + 1}/{config['max_training_epochs']} - Train Loss {train_losses.avg:.4f}, Val Loss {val_losses.avg:.4f}")
         
         # Update best model 
-        if val_metrics['loss'].avg < best_val:
-            save_status(subject_id, epoch, model_name, save_name, personalized_model, optimizer, scheduler, val_metrics, checkpoint_path, config)
-            best_val = val_metrics['loss'].avg
+        if val_losses.avg < best_val:
+            save_status(subject_id, epoch, model_name, save_name, personalized_model, optimizer, scheduler, val_losses, checkpoint_path, config)
+            best_val = val_losses.avg
         
         #  Early stopping
         if config['es_enable']:
-            early_stopping(val_metrics['loss'].avg)
+            early_stopping(val_losses.avg)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
@@ -1063,43 +1107,81 @@ def personalization_training_validation_testing(save_name, checkpoint_path, tens
     personalized_model = get_model_architecture(config)
     load_status(subject_id, model_name, save_name, personalized_model, optimizer, scheduler, checkpoint_path, config)
     personalized_model = personalized_model.to(device)
-    set_trainable_parameters(personalized_model, 'none', config)
+    set_trainable_parameters(model=personalized_model, tune='none', config=config)
     
-    # Test loop
-    metrics = ['loss', 'sbp_mae', 'dbp_mae', 'sbp_me', 'dbp_me', 'sbp_mae_std',  'dbp_mae_std', 'sbp_me_std', 'dbp_me_std']
-    test_metrics = setup_meter('test', metrics)
-
-    all_test_outputs = np.empty((0, 2), dtype=float)
-    all_test_targets = np.empty((0, 2), dtype=float)
+    # ---- Test Loop ----
+    
+    # Meters    
+    test_losses = AverageMeter(name='test/loss')
+    test_sbp_maes = AverageMeter(name='test/sbp_mae')
+    test_dbp_maes = AverageMeter(name='test/dbp_mae')
+    test_sbp_mes = AverageMeter(name='test/sbp_me')
+    test_dbp_mes = AverageMeter(name='test/dbp_me')
+    test_sbp_mae_stds = AverageMeter(name='test/sbp_mae_std')
+    test_dbp_mae_stds = AverageMeter(name='test/dbp_mae_std')
+    test_sbp_me_stds = AverageMeter(name='test/sbp_me_std')
+    test_dbp_me_stds = AverageMeter(name='test/dbp_me_std')
+    
+    # Record outputs and targets
+    if config['sig2sig']:
+        all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+        all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+    else:
+        all_test_outputs = np.empty((0, 2), dtype=float) # Assuming SBP/DBP output shape is 2
+        all_test_targets = np.empty((0, 2), dtype=float)
+    
+    
     for batch_idx, batch in enumerate(test_dataloader):
+        
+        # Prepare data
         signals, targets = batch
-        
-        # Move data and labels to the same device as the model
         signals = signals.to(device)
-        targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
-        
-        # Perform forward pass
-        if config['return_embedding']:
-            outputs, _ = personalized_model(signals)
+        if len(signals.shape) == 2:
+            signals = signals.unsqueeze(-1)
+
+        if config['sig2sig']:
+            targets = targets.to(device)
         else:
+            targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+
+        # Perform forward pass
+        with torch.no_grad(): # No gradient calculation during testing
             outputs = personalized_model(signals)
-        
-        # Loss 
+
+        # Supervised loss (for metric logging)
         if config['criterion'] == 'MSELoss':
             test_loss = F.mse_loss(outputs, targets)
         elif config['criterion'] == 'SmoothL1Loss':
             test_loss = F.smooth_l1_loss(outputs, targets)
         else:
             raise ValueError("Invalid criterion ...")
-    
+
+        # Record predictions and ground truths
         all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
         all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
-        
+
+        # Log metrics
         metric_values = get_metric_values(test_loss, outputs, targets, config)
-        update_meter(test_metrics, metric_values, signals.size(0))
-    
-    # Log personalization test metrics to TensorBoard
-    log_meter_to_tensorboard(writer, test_metrics, epoch, name='test')
+        
+        test_losses.update(metric_values['loss'], signals.size(0))
+        test_sbp_maes.update(metric_values['sbp_mae'], signals.size(0))
+        test_dbp_maes.update(metric_values['dbp_mae'], signals.size(0))
+        test_sbp_mes.update(metric_values['sbp_me'], signals.size(0))
+        test_dbp_mes.update(metric_values['dbp_me'], signals.size(0))
+        test_sbp_mae_stds.update(metric_values['sbp_mae_std'], signals.size(0))
+        test_dbp_mae_stds.update(metric_values['dbp_mae_std'], signals.size(0))
+        test_sbp_me_stds.update(metric_values['sbp_me_std'], signals.size(0))
+        test_dbp_me_stds.update(metric_values['dbp_me_std'], signals.size(0))
+
+    # Log test metrics
+    # Note: `epoch` here is the last epoch of training, not ideal for test summary
+    writer.add_scalar('test/loss_final', test_losses.avg, epoch)
+    writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, epoch)
+    writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, epoch)
+    writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, epoch)
+    writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, epoch)
+    writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, epoch)
+    writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, epoch)
     
     writer.close()
     

@@ -1,3 +1,5 @@
+# Pretraining
+
 # SSL UNet 
 experiment_name="ssl_unet"
 mkdir "logs/$experiment_name"

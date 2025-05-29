@@ -1,34 +1,38 @@
-# Vanilla Resnet w/ PPG + ECG 
-experiment_name="personalization_proj_head_unfreeze_vanilla_resnet"
+## Personalization
+
+# GRU
+experiment_name="personalization_vanilla_gru"
 mkdir "logs/$experiment_name"
 cd ./models
-python ResGRUNet.py \
-    --ecg True \
+python GRU.py \
     --fs 125 \
     --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params all \
+    --ecg True \
+    --hidden_dim 128 \
+    --num_layers 2 \
+    --bidirectional True \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
-    --model models.ResGRUNet \
+    --model models.GRU \
     --dataset_name mimic_iii \
     --expname "$experiment_name" \
-    --pretrained_model_checkpoint ./checkpoints/vanilla_resnet/vanilla_resnet-ResGRUNet-2025_04_12-15_12_47/vanilla_resnet/ckpt/ResGRUNet \
+    --pretrained_model_checkpoint ./checkpoints/vanilla_gru/vanilla_gru-GRU-2025_05_28-17_39_44/vanilla_gru/ckpt/GRU \
     --loader_worker 4 \
+    --sig2sig True \
     --ecg True \
     --fs 125 \
     --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params projection_head \
+    --hidden_dim 128 \
+    --num_layers 2 \
+    --bidirectional True \
     --mix_pretraining_subject_samples True \
     --max_training_epochs 1000 \
-    --optimizer_type "AdamW" \
-    --lr 0.01 \
+    --optimizer_type "Adam" \
+    --lr_scheduler_enable False \
+    --criterion "SmoothL1Loss" \
     --eval_every_n_epochs 1 \
-    --batchsize 32 \
+    --batch_size 32 \
     --es_enable True \
     --es_patience 20 \
     --es_min_delta 0.005 \
@@ -37,40 +41,40 @@ python personalization.py \
     --lambda_ortho 0 \
     --lambda_contrastive 0 \
     --temperature 0 \
-    --aug False \
     > "./logs/$experiment_name/${experiment_name}_training.log"
 
-# Vanilla Resnet w/ PPG + ECG without mixing subjects during pretraining
-experiment_name="personalization_proj_head_unfreeze_vanilla_resnet_no_mix"
+# UNet
+experiment_name="personalization_unet"
 mkdir "logs/$experiment_name"
 cd ./models
-python ResGRUNet.py \
-    --ecg True \
+python UNet.py \
     --fs 125 \
     --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params all \
+    --ecg True \
+    --num_heads_attention 1 \
+    --dim_feedforward_attention 128 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
-    --model models.ResGRUNet \
+    --model models.UNet \
     --dataset_name mimic_iii \
     --expname "$experiment_name" \
-    --pretrained_model_checkpoint ./checkpoints/vanilla_resnet_no_mix/vanilla_resnet_no_mix-ResGRUNet-2025_04_12-17_49_51/vanilla_resnet_no_mix/ckpt/ResGRUNet \
+    --pretrained_model_checkpoint ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt/UNet \
     --loader_worker 4 \
+    --sig2sig True \
     --ecg True \
     --fs 125 \
     --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params projection_head \
-    --mix_pretraining_subject_samples False \
+    --ecg True \
+    --num_heads_attention 1 \
+    --dim_feedforward_attention 128 \
+    --mix_pretraining_subject_samples True \
     --max_training_epochs 1000 \
-    --optimizer_type "AdamW" \
-    --lr 0.01 \
+    --optimizer_type "Adam" \
+    --lr_scheduler_enable False \
+    --criterion "SmoothL1Loss" \
     --eval_every_n_epochs 1 \
-    --batchsize 32 \
+    --batch_size 32 \
     --es_enable True \
     --es_patience 20 \
     --es_min_delta 0.005 \
@@ -79,133 +83,4 @@ python personalization.py \
     --lambda_ortho 0 \
     --lambda_contrastive 0 \
     --temperature 0 \
-    --aug False \
     > "./logs/$experiment_name/${experiment_name}_training.log"
-
-# Vanilla Resnet w/ PPG + ECG without mixing subjects during pretraining, smaller gradient
-experiment_name="personalization_proj_head_unfreeze_vanilla_resnet_no_mix_lambda_supervised_0.0001"
-mkdir "logs/$experiment_name"
-cd ./models
-python ResGRUNet.py \
-    --ecg True \
-    --fs 125 \
-    --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params all \
-    > "../logs/$experiment_name/${experiment_name}_summary.log"
-cd ..
-python personalization.py \
-    --model models.ResGRUNet \
-    --dataset_name mimic_iii \
-    --expname "$experiment_name" \
-    --pretrained_model_checkpoint ./checkpoints/vanilla_resnet_no_mix_lambda_supervised_0.0001/vanilla_resnet_no_mix_lambda_supervised_0.0001-ResGRUNet-2025_04_12-20_27_02/vanilla_resnet_no_mix_lambda_supervised_0.0001/ckpt/ResGRUNet \
-    --loader_worker 4 \
-    --ecg True \
-    --fs 125 \
-    --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params projection_head \
-    --mix_pretraining_subject_samples False \
-    --max_training_epochs 1000 \
-    --optimizer_type "AdamW" \
-    --lr 0.01 \
-    --eval_every_n_epochs 1 \
-    --batchsize 32 \
-    --es_enable True \
-    --es_patience 20 \
-    --es_min_delta 0.005 \
-    --personalization_sample_number 100 \
-    --lambda_supervised 1 \
-    --lambda_ortho 0 \
-    --lambda_contrastive 0 \
-    --temperature 0 \
-    --aug False \
-    > "./logs/$experiment_name/${experiment_name}_training.log"
-
-# Vanilla Resnet w/ PPG + ECG without mixing subjects during pretraining, smaller gradient ortho
-experiment_name="personalization_proj_head_unfreeze_vanilla_resnet_no_mix_lambda_supervised_0.0001_ortho"
-mkdir "logs/$experiment_name"
-cd ./models
-python ResGRUNet.py \
-    --ecg True \
-    --fs 125 \
-    --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params all \
-    > "../logs/$experiment_name/${experiment_name}_summary.log"
-cd ..
-python personalization.py \
-    --model models.ResGRUNet \
-    --dataset_name mimic_iii \
-    --expname "$experiment_name" \
-    --pretrained_model_checkpoint ./checkpoints/vanilla_resnet_no_mix_lambda_supervised_0.0001_ortho/vanilla_resnet_no_mix_lambda_supervised_0.0001_ortho-ResGRUNet-2025_04_12-23_05_01/vanilla_resnet_no_mix_lambda_supervised_0.0001_ortho/ckpt/ResGRUNet \
-    --loader_worker 4 \
-    --ecg True \
-    --fs 125 \
-    --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params projection_head \
-    --mix_pretraining_subject_samples False \
-    --max_training_epochs 1000 \
-    --optimizer_type "AdamW" \
-    --lr 0.01 \
-    --eval_every_n_epochs 1 \
-    --batchsize 32 \
-    --es_enable True \
-    --es_patience 20 \
-    --es_min_delta 0.005 \
-    --personalization_sample_number 100 \
-    --lambda_supervised 1 \
-    --lambda_ortho 0 \
-    --lambda_contrastive 0 \
-    --temperature 0 \
-    --aug False \
-    > "./logs/$experiment_name/${experiment_name}_training.log"
-
-# Vanilla Resnet w/ PPG + ECG without mixing subjects during pretraining, contrastive
-experiment_name="personalization_proj_head_unfreeze_vanilla_resnet_no_mix_contrastive"
-mkdir "logs/$experiment_name"
-cd ./models
-python ResGRUNet.py \
-    --ecg True \
-    --fs 125 \
-    --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params all \
-    > "../logs/$experiment_name/${experiment_name}_summary.log"
-cd ..
-python personalization.py \
-    --model models.ResGRUNet \
-    --dataset_name mimic_iii \
-    --expname "$experiment_name" \
-    --pretrained_model_checkpoint ./checkpoints/vanilla_resnet_no_mix_contrastive/vanilla_resnet_no_mix_contrastive-ResGRUNet-2025_04_13-08_43_01/vanilla_resnet_no_mix_contrastive/ckpt/ResGRUNet \
-    --loader_worker 4 \
-    --ecg True \
-    --fs 125 \
-    --input_seq_len_s 5 \
-    --proj_head_dim 256 \
-    --return_embedding True \
-    --set_tunable_params projection_head \
-    --mix_pretraining_subject_samples False \
-    --max_training_epochs 1000 \
-    --optimizer_type "AdamW" \
-    --lr 0.01 \
-    --eval_every_n_epochs 1 \
-    --batchsize 32 \
-    --es_enable True \
-    --es_patience 20 \
-    --es_min_delta 0.005 \
-    --personalization_sample_number 100 \
-    --lambda_supervised 1 \
-    --lambda_ortho 0 \
-    --lambda_contrastive 0 \
-    --temperature 0 \
-    --aug False \
-    > "./logs/$experiment_name/${experiment_name}_training.log"
-
-

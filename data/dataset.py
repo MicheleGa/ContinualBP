@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from sklearn.model_selection import train_test_split
-from preprocessing_utils.data_visualization import plot_signals, plot_pretraining_personalization_subjects_distribution, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataset_mean_std
+from preprocessing_utils.data_visualization import plot_signals, plot_pretraining_personalization_subjects_distribution, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std, calculate_personalization_subjects_mean_std
 from preprocessing_utils.augmentations import RandomAugmentor, Identity, Jitter, TimeWarp, Scaling, MagnitudeWarp, Flip
 from preprocessing_utils.split import split_train_val_test
 
@@ -372,14 +372,21 @@ if __name__ == "__main__":
         savepath=root_figs_folder
     )
     
-    # Pretraining statistics
+    # Pretraining & personalization datasets statistics
     (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
     
     train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)    
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
-    calculate_dataset_mean_std([train_dataloader, valid_dataloader, test_dataloader], ['Train', 'Valid', 'Test'], savepath=root_figs_folder) 
+    calculate_dataloaders_mean_std(
+        dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+        dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+        savepath=root_figs_folder) 
+    calculate_personalization_subjects_mean_std(
+        dataset=dataset, 
+        args=args, 
+        savepath=root_figs_folder) 
 
     input_batch = next(iter(train_dataloader))
     sig = input_batch[0]
