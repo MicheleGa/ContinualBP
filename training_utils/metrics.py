@@ -348,32 +348,18 @@ def get_metric_values(loss, outputs, targets, config):
     return metric_values
 
 
-def get_simclr_metric_values(loss, cos_sim, pos_mask):
-    comb_sim = torch.cat([cos_sim[pos_mask.bool()][:, None],  
-                          cos_sim.masked_fill(pos_mask.bool(), -9e15)], dim=-1)
-    sim_argsort = comb_sim.argsort(dim=-1, descending=True).argmin(dim=-1)
-
-    acc_top1 = (sim_argsort == 0).float().mean()
-    acc_top5 = (sim_argsort < 5).float().mean()
-    acc_mean_pos = 1 + sim_argsort.float().mean()
-
-    metric_values = {
-        'loss': loss.item(),
-        'acc_top1': acc_top1.item(),
-        'acc_top5': acc_top5.item(),
-        'acc_mean_pos': acc_mean_pos.item(),
-    }
-    return metric_values
-
-
 def update_meter(meter, metric_values, batch_size):
-    """
+    f"""
     Function to update a meter with specified metric values.
 
-    Args:
-        meter (dict): Dictionary of AverageMeter objects.
-        metric_values (dict): Dictionary of metric names and their corresponding values.
-        batch_size (int): Batch size for weighting the updates.
+    Parameters
+    ------------
+        meter (dict): 
+            Dictionary of AverageMeter objects.
+        metric_values (dict): 
+            Dictionary of metric names and their corresponding values.
+        batch_size (int): 
+            Batch size for weighting the updates.
     """
     for metric, value in metric_values.items():
         if metric in meter:
@@ -384,10 +370,14 @@ def log_meter_to_tensorboard(writer, meter, epoch, name='val'):
     """
     Function to log metrics to TensorBoard.
 
-    Args:
-        writer (SummaryWriter): TensorBoard SummaryWriter object.
-        meter (dict): Dictionary of AverageMeter objects.
-        epoch (int): Current epoch number.
+    Parameters
+    ------------
+        writer (SummaryWriter): 
+            TensorBoard SummaryWriter object.
+        meter (dict): 
+            Dictionary of AverageMeter objects.
+        epoch (int): 
+            Current epoch number.
     """
     for metric_name, avg_meter in meter.items():
         writer.add_scalar(f'{name}/{metric_name}', avg_meter.avg, epoch)

@@ -1,11 +1,11 @@
 import argparse
 from distutils.util import strtobool
+import itertools
 from math import ceil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn, einsum
-
 from einops import rearrange, reduce
 from torchinfo import summary
 from thop import profile, clever_format
@@ -144,7 +144,6 @@ class NystromAttention(nn.Module):
         # merge and combine heads
 
         out = rearrange(out, 'b h n d -> b n (h d)', h = h)
-        out = self.to_out(out)
         out = out[:, -n:]
 
         if return_attn:
@@ -173,7 +172,7 @@ class ResidualBlock1D(nn.Module):
         out = self.relu(out)
         out = self.conv2(out)
         
-        out += identity 
+        out += identity
         
         return out
     
@@ -253,35 +252,21 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
 
-        #  Key Change: No initial unsqueeze and transpose
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         # x -> (batch_size, seq_len, channels)
-
-        seq_len = x.size(1)  # Get sequence length from input
-
-        pe = self.pe[:seq_len, :].unsqueeze(0).expand(x.size(0), -1, -1)  # Expand for batch
-
+        seq_len = x.size(1)
+        pe = self.pe[:seq_len, :].unsqueeze(0).expand(x.size(0), -1, -1)
         x = x + pe
-
         return self.dropout(x)
     
 
 class SelfAttentionBlock1D(nn.Module):
     def __init__(self, seq_len, d_model, num_heads, dim_feedforward, dropout=0.1):
         super(SelfAttentionBlock1D, self).__init__()
-        self.pos_encoder = PositionalEncoding(embed_dim=d_model, max_len=seq_len) # Positional encoding
-        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True) # Set batch_first=True
-        #self.self_attn = NystromAttention(
-        #   dim=d_model,
-        #    dim_head=(d_model // num_heads),
-        #    heads=num_heads,
-        #    num_landmarks=64,    # number of landmarks
-        #    pinv_iterations=6,    # number of moore-penrose iterations for approximating pinverse. 6 was recommended by the paper
-        #    residual=False,         # whether to do an extra residual with the value or not. supposedly faster convergence if turned on
-        #    dropout=0.25, # dropout in the attention block
-        #)
+        self.pos_encoder = PositionalEncoding(embed_dim=d_model, max_len=seq_len)
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -295,29 +280,25 @@ class SelfAttentionBlock1D(nn.Module):
 
     def forward(self, src):
         # src shape: (batch_size, channels, length) -> transform to (batch_size, length, channels) for MultiheadAttention
-        src = src.permute(0, 2, 1) # (batch_size, length, channels)
+        src = src.permute(0, 2, 1)
 
         # Add positional encoding
-        src_pe = self.pos_encoder(src) # Add PE to original shape then permute back
+        src_pe = self.pos_encoder(src)
 
-        #mask = torch.ones(size=(src_pe.size(0), src_pe.size(1)), device=src_pe.device).bool()
-        
-        # Self-attention
         attn_output, _ = self.self_attn(src_pe, src_pe, src_pe)
-        src = src + self.dropout1(attn_output) # Add & Norm
+        src = src + self.dropout1(attn_output)
         src = self.norm1(src)
 
-        # Feedforward
         ff_output = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(ff_output) # Add & Norm
+        src = src + self.dropout2(ff_output)
         src = self.norm2(src)
 
-        src = src.permute(0, 2, 1) # (batch_size, channels, length)
+        src = src.permute(0, 2, 1) # Permute back to (batch_size, channels, length)
         return src
     
 
-class EUNet(nn.Module):
-    def __init__(self,  
+class SSLUNet(nn.Module):
+    def __init__(self,
                  ecg=False,
                  resp=False,
                  sig2sig=False,
@@ -330,9 +311,10 @@ class EUNet(nn.Module):
                  kernel_size=3,
                  num_heads_attention=1,
                  dim_feedforward_attention=128,
-                 set_tunable_params='all',
-                 return_embedding=False):
-        super(EUNet, self).__init__()
+                 projection_hidden_dim=512,
+                 projection_dim=128 
+                ):
+        super(SSLUNet, self).__init__()
         
         # Input Data Setup
         self.input_seq_len = input_seq_len_s * fs
@@ -342,216 +324,327 @@ class EUNet(nn.Module):
         self.ppg_derivatives = ppg_derivatives
         self.ppg_emd = ppg_emd
         self.ppg_freqs = ppg_freqs
-        self.return_embedding = return_embedding
+        self.projection_dim = projection_dim  
         
         # Architecture Setup
         self.kernel_size = kernel_size
         self.num_heads_attention = num_heads_attention
         self.dim_feedforward_attention = dim_feedforward_attention
         
+        # For supervised tasks, use the full channel calculation
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
         self.in_channels = ppg_in_channels + ecg_in_channels + resp_in_channels
-
+            
         filters = [int(ch) for ch in channels.split(',')]
-
-        # Encoder Path
+        self.encoder_filters = filters # Store for use in other heads
+        
+        # --- Shared Encoder Path ---
         self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(self.in_channels, filters[0], stride=1), # First block stride 1, no downsampling
+            ResidualBlock1D(self.in_channels, filters[0], stride=1),
             ResidualBlock1D(filters[0], filters[1], stride=2),
             ResidualBlock1D(filters[1], filters[2], stride=2),
             ResidualBlock1D(filters[2], filters[3], stride=2),
             ResidualBlock1D(filters[3], filters[4], stride=2)
         ])
+        self.bottleneck = BottleneckBlock1D(filters[4], stride=1)
 
-        # Bottleneck
-        self.bottleneck = BottleneckBlock1D(filters[4], stride=1) # Keep same resolution at bottleneck
-
-        # Decoder Path
+        # --- Shared Decoder Path (U-Net style, leading to `sa_output`) ---
         self.decoder_blocks = nn.ModuleList([
-            # Upsample filters[4] to filters[3], then combine with skip filters[3] to output filters[3]
             ResidualBlock1D(filters[4] + filters[3], filters[3], stride=1),
             ResidualBlock1D(filters[3] + filters[2], filters[2], stride=1),
             ResidualBlock1D(filters[2] + filters[1], filters[1], stride=1),
             ResidualBlock1D(filters[1] + filters[0], filters[0], stride=1)
         ])
 
-        # Attention Gates
-        # The attention gate needs to know the channels of the gating signal (from decoder)
-        # and the channels of the skip connection (from encoder)
-        self.att_gate4 = AttentionGate1D(filters[4], filters[3], filters[3]) # Gating: Bottleneck, Skip: Enc4
-        self.att_gate3 = AttentionGate1D(filters[3], filters[2], filters[2]) # Gating: Dec1 output, Skip: Enc3
-        self.att_gate2 = AttentionGate1D(filters[2], filters[1], filters[1]) # Gating: Dec2 output, Skip: Enc2
-        self.att_gate1 = AttentionGate1D(filters[1], filters[0], filters[0]) # Gating: Dec3 output, Skip: Enc1
+        self.att_gate4 = AttentionGate1D(filters[4], filters[3], filters[3])
+        self.att_gate3 = AttentionGate1D(filters[3], filters[2], filters[2])
+        self.att_gate2 = AttentionGate1D(filters[2], filters[1], filters[1])
+        self.att_gate1 = AttentionGate1D(filters[1], filters[0], filters[0])
 
-        # Final Self-Attention Module
-        # This will operate on the output of the last decoder block before final convolution
-        # d_model should be the channels of the last decoder block output (filters[0])
         self.self_attention_stack1 = SelfAttentionBlock1D(
             seq_len=self.input_seq_len,
-            d_model=filters[0],
+            d_model=filters[0], # d_model is channels of output from last decoder block
             num_heads=num_heads_attention,
             dim_feedforward=dim_feedforward_attention
         )
         self.self_attention_stack2 = SelfAttentionBlock1D(
             seq_len=self.input_seq_len,
-            d_model=filters[0],
+            d_model=filters[0], # d_model is channels of output from last decoder block
             num_heads=num_heads_attention,
             dim_feedforward=dim_feedforward_attention
         )
+        
+        # Output embedding dimension for the SSL heads (output of last SA block)
+        # This is [Batch, filters[0], self.input_seq_len]
+        # For projection/permutation heads, we need to flatten this to a fixed-size vector
+        self.ssl_embedding_dim = filters[0] * self.input_seq_len # e.g., 32 * 625 = 20000
 
-        # Output Layer
-        # The final output is an ABP signal, which is a 1D signal of the same length as input.
-        # So, it's a 1-channel output.
-        self.final_conv = nn.Conv1d(filters[0], 1, kernel_size=1, stride=1, padding=0)
+        # --- NEW SSL HEADS (attached to `sa_output`) ---
+        # 1. Projection Head (for SimCLR)
+        self.projection_head = nn.Sequential(
+            nn.Linear(self.ssl_embedding_dim, projection_hidden_dim), # Input: flattened SA output, Output: hidden_dim
+            nn.ReLU(inplace=True),
+            nn.Linear(projection_hidden_dim, projection_dim) # Input: hidden_dim, Output: final projection_dim
+        )
+
+        # 2. Reconstruction Head (for MSR)
+        # This head takes the `sa_output` (which is already [Batch, Filters[0], Length])
+        # and directly maps it to [Batch, 2, Length] for PPG/ECG reconstruction.
+        self.reconstruction_head = nn.Conv1d(filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
+
+        # 3. Generation Head (for CWG)
+        # Takes the `sa_output` of the `current_signal` and generates the `prev_signal`/`next_signal`.
+        # `sa_output` is `[Batch, filters[0], Length]`. We want `[Batch, Length, 2]`
+        self.generation_prev_head = nn.Conv1d(filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
+        self.generation_next_head = nn.Conv1d(filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
+        
+        # --- Final Output Layer (for supervised training's direct output) ---
+        # This is the original final_conv, which maps to 1 channel (ABP)
+        self.final_conv_supervised = nn.Conv1d(filters[0], 1, kernel_size=1, stride=1, padding=0)
  
         # Kaiming initialization that should work fine with the z-score preprocessing
         self.init_params() 
         
-        # Freeze/Tune model parameters
-        #self.set_tunable_layers(set_tunable_params)
-
-    def forward(self, x):
-        
-        x = x.unsqueeze(-1) if len(x.shape) == 2 else x # x -> (batch_size, seq_len, channels)
-        
-        # x shape: [batch_size, 625, num_modalities] (if multi-modal)
-        # For Conv1d, input needs to be [batch_size, channels, length]
-        # Our input is [batch_size, length, channels]
-        x = x.permute(0, 2, 1) # -> [batch_size, num_modalities, 625]
+    def _run_full_unet_path(self, x):
+        """
+        Helper to run the full U-Net encoder-decoder-SA path.
+        This will be the shared feature extractor for all tasks.
+        Args:
+            x (torch.Tensor): Input signal [Batch, Length, N_Channels]
+        Returns:
+            torch.Tensor: Output of the last self-attention block [Batch, filters[0], Length]
+            list: Skip connections from encoder (e1, e2, e3, e4)
+        """
+        # Ensure input is 3D for processing
+        x_conv = x.unsqueeze(-1) if len(x.shape) == 2 else x # [Batch, Length, N_channels]
+        x_conv = x_conv.permute(0, 2, 1) # -> [batch_size, N_channels, Length]
 
         # Encoder
-        e1 = self.encoder_blocks[0](x) # No downsampling, length 625, channels filters[0] (32)
-        e2 = self.encoder_blocks[1](e1) # Downsample x2, length 313, channels filters[1] (64)
-        e3 = self.encoder_blocks[2](e2) # Downsample x2, length 157, channels filters[2] (128)
-        e4 = self.encoder_blocks[3](e3) # Downsample x2, length 79, channels filters[3] (256)
-        e5 = self.encoder_blocks[4](e4) # Downsample x2, length 40, channels filters[4] (512)
+        e1 = self.encoder_blocks[0](x_conv)
+        e2 = self.encoder_blocks[1](e1)
+        e3 = self.encoder_blocks[2](e2)
+        e4 = self.encoder_blocks[3](e3)
+        e5 = self.encoder_blocks[4](e4)
         
         # Bottleneck
-        b = self.bottleneck(e5) # Length 40, channels filters[4] (512)
+        b = self.bottleneck(e5)
 
         # Decoder with Attention Gates
-        # Upsampling with ConvTranspose1d / F.interpolate + Conv
-        # We need to calculate target_size for upsampling.
-        # Decoder Block 1 (from b to d1)
-        # Target size is e4.size(2)
-        # g: b (filters[4]), x: e4 (filters[3])
-        # Decoder Block 1
-        g = F.interpolate(b, size=e4.size(2), mode='linear', align_corners=True) # g is the upsampled bottleneck.
-        att_e4 = self.att_gate4(g, e4) # att_e4 is the attended encoder skip feature (e4 * psi)
-        d1 = self.decoder_blocks[0](torch.cat([g, att_e4], dim=1)) # Concatenates upsampled bottleneck (g) with attended encoder skip (att_e4)
+        g = F.interpolate(b, size=e4.size(2), mode='linear', align_corners=True)
+        att_e4 = self.att_gate4(g, e4)
+        d1 = self.decoder_blocks[0](torch.cat([g, att_e4], dim=1))
         
-        # Decoder Block 2 (from d1 to d2)
-        # Target size is e3.size(2)
-        # g: d1 (filters[3]), x: e3 (filters[2])
         g = F.interpolate(d1, size=e3.size(2), mode='linear', align_corners=True)
         att_e3 = self.att_gate3(g, e3)
         d2 = self.decoder_blocks[1](torch.cat([g, att_e3], dim=1))
 
-        # Decoder Block 3 (from d2 to d3)
-        # Target size is e2.size(2)
-        # g: d2 (filters[2]), x: e2 (filters[1])
         g = F.interpolate(d2, size=e2.size(2), mode='linear', align_corners=True)
         att_e2 = self.att_gate2(g, e2)
         d3 = self.decoder_blocks[2](torch.cat([g, att_e2], dim=1))
 
-        # Decoder Block 4 (from d3 to d4)
-        # Target size is e1.size(2) (initial length 625)
-        # g: d3 (filters[1]), x: e1 (filters[0])
         g = F.interpolate(d3, size=e1.size(2), mode='linear', align_corners=True)
         att_e1 = self.att_gate1(g, e1)
-        d4 = self.decoder_blocks[3](torch.cat([g, att_e1], dim=1)) # Output d4: filters[0] channels, original length
+        d4 = self.decoder_blocks[3](torch.cat([g, att_e1], dim=1))
 
         # Final Self-Attention Module
         sa_output = self.self_attention_stack1(d4)
         sa_output = self.self_attention_stack2(sa_output)
+        
+        # TODO: can return other features from deeper layers to increase performances
+        
+        return sa_output, [e1, e2, e3, e4, e5, b] # sa_output: [Batch, filters[0], Length], also return encoder intermediates if needed by other parts of the forward (unlikely in this setup)
 
-        # Output Layer
-        # For regression, often no final activation or a linear one implicitly.
-        # The output shape should match the input shape's length for ABP signals.
-        output = self.final_conv(sa_output)
+    def encode(self, signal):
+        """
+        Shared feature extractor for SSL tasks.
+        It runs the full U-Net encoder-decoder-SA path.
+        Args:
+            signal (torch.Tensor): Input signal [Batch, Length, 2] (PPG, ECG)
+        Returns:
+            torch.Tensor: Feature map from last SA block [Batch, filters[0], Length]
+        """
+        # Ensure the input to encode is always [Batch, Length, 2]
+        if signal.shape[-1] != 2:
+            raise ValueError(f"Expected signal with 2 modalities for encode, got {signal.shape[-1]}.")
+        
+        sa_output, _ = self._run_full_unet_path(signal)
+        return sa_output
 
-        # Permute back to [batch_size, length, channels] for consistency with input
-        output = output.permute(0, 2, 1)
+    def reconstruct(self, sa_output_embedding):
+        """
+        Reconstruction head for MSR.
+        Args:
+            sa_output_embedding (torch.Tensor): Output from last SA block [Batch, filters[0], Length]
+        Returns:
+            torch.Tensor: Reconstructed signal [Batch, Length, 2] (PPG, ECG)
+        """
+        reconstructed_signal_conv = self.reconstruction_head(sa_output_embedding)
+        return reconstructed_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
 
-        return output.squeeze(-1)
+    def project(self, sa_output_embedding):
+        """
+        Projection head for SimCLR.
+        Args:
+            sa_output_embedding (torch.Tensor): Output from last SA block [Batch, filters[0], Length]
+        Returns:
+            torch.Tensor: Projected embedding z [Batch, Projection_Dim]
+        """
+        # Flatten the sa_output_embedding to a 1D vector per sample
+        flattened_embedding = sa_output_embedding.reshape(sa_output_embedding.size(0), -1)
+        return self.projection_head(flattened_embedding)
+
+    def generate_prev_window(self, sa_output_embedding):
+        """
+        Generative head for CWG.
+        Args:
+            sa_output_embedding (torch.Tensor): Output from last SA block of the current signal
+                                                 [Batch, filters[0], Length]
+        Returns:
+            torch.Tensor: Generated prev signal [Batch, Length, 2] (PPG, ECG)
+        """
+        generated_signal_conv = self.generation_prev_head(sa_output_embedding)
+        return generated_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
+
+    def generate_next_window(self, sa_output_embedding):
+        """
+        Generative head for CWG.
+        Args:
+            sa_output_embedding (torch.Tensor): Output from last SA block of the current signal
+                                                 [Batch, filters[0], Length]
+        Returns:
+            torch.Tensor: Generated next signal [Batch, Length, 2] (PPG, ECG)
+        """
+        generated_signal_conv = self.generation_next_head(sa_output_embedding)
+        return generated_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
+
+    def forward(self, x):
+        """
+        Main forward pass for supervised training.
+        This runs the full U-Net path and then the final supervised convolution.
+        Args:
+            x (torch.Tensor): Input signal [Batch, Length, N_Channels]. N_Channels depends on args.
+        Returns:
+            torch.Tensor: Predicted output for supervised task [Batch, Length] (for sig2sig) or [Batch, 1] (for SBP/DBP if regressor is changed).
+        """
+        
+        # Ensure input is 3D for processing
+        x = x.unsqueeze(-1) if len(x.shape) == 2 else x # x -> (batch_size, seq_len, N_channels)
+        
+        # Run the full U-Net path to get the final SA output feature map
+        sa_output, _ = self._run_full_unet_path(x) # sa_output: [Batch, filters[0], Length]
+
+        # Output Layer for supervised task
+        output = self.final_conv_supervised(sa_output)
+
+        # Permute back to [batch_size, length, 1] then squeeze to [batch_size, length]
+        return output.permute(0, 2, 1).squeeze(-1)
     
     def init_params(self):
         # Fan-out focuses on the gradient distribution, and is commonly used in ResNets
         for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
     def get_input_channels(self):
-        if self.ecg:
-            ecg_in_channels = 1
-        else:
-            ecg_in_channels = 0
+        # This function defines the input channels for the initial convolutional layer
+        # based on the selected signal modalities in the *supervised* context.
         
-        if self.resp:
-            resp_in_channels = 1
-        else:
-            resp_in_channels = 0
-        
+        ppg_in_channels = 0
+        ecg_in_channels = 0
+        resp_in_channels = 0
+
+        # Determine PPG related channels
         if self.ppg_derivatives:
             ppg_in_channels = 3  # PPG + PPG' + PPG''
         elif self.ppg_emd:
             ppg_in_channels = 4  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3
         elif self.ppg_freqs:
-            ppg_in_channels = 16  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3  
-        else:
-            ppg_in_channels = 1  # PPG
+            ppg_in_channels = 16  # Scalogram output channels
+        else: # Default to just PPG if no special PPG features
+            ppg_in_channels = 1
+
+        # Determine ECG and RESP channels
+        if self.ecg:
+            ecg_in_channels = 1
+        if self.resp:
+            resp_in_channels = 1
             
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):
-        in_channels = self.get_input_channels()
-        input = torch.rand((batch_size, self.input_seq_len, in_channels[0] + in_channels[1] + in_channels[2]))
+        # The input to summary should match how `forward` is called.
+        
+        ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
+        total_input_channels = ppg_in_channels + ecg_in_channels + resp_in_channels
+        
+        print("\n--- Model Summary (Full Forward/Backward) ---")
+        dummy_input = torch.rand((batch_size, self.input_seq_len, total_input_channels))
+        summary(self, input_data=dummy_input, col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
 
-        summary(self, input_data=[input], col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
-
-        macs, num_params = profile(self, inputs=(input,))
+        # MACs calculation (for the full forward pass for consistency)
+        print("\n--- MACs and Parameters (Full Forward/Backward) ---")
+        # Use the input_main_channels for MACs calculation as it represents the typical input to the first encoder block
+        macs, num_params = profile(self, inputs=(dummy_input,), verbose=False)
         macs, num_params = clever_format([macs, num_params], "%.7f")
-        print(f'UNet has {num_params} params and {macs} macs.')
+        print(f'SSLUNet has {num_params} params and {macs} MACs.')
+
+        print("\n--- SSL Head Summaries (Attached to SA output) ---")
+        
+        # Summarize the entire model, assuming it runs the full UNet path for `encode`
+        print("Summarizing full U-Net for SSL `encode` path:")
+        sa_output_dummy, _ = self._run_full_unet_path(dummy_input)
+        print(f"  Encoder/U-Net output (SA block) shape: {sa_output_dummy.shape}")
+
+        print("\n--- Projection Head Summary (SimCLR) ---")
+        dummy_embedding_proj = torch.rand((batch_size, self.ssl_embedding_dim))
+        summary(self.projection_head, input_data=dummy_embedding_proj)
+
+        print("\n--- Reconstruction Head Summary (MSR) ---")
+        dummy_sa_output_recon = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
+        summary(self.reconstruction_head, input_data=dummy_sa_output_recon)
+
+        print("\n--- Generation Head Summary (CWG - Prev) ---")
+        dummy_sa_output_gen = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
+        summary(self.generation_prev_head, input_data=dummy_sa_output_gen)
+        
+        print("\n--- Generation Head Summary (CWG - Next) ---")
+        dummy_sa_output_gen = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
+        summary(self.generation_next_head, input_data=dummy_sa_output_gen)
+
     
     def set_tunable_layers(self, tune):
-        
         # First set all parameters to be trainable
         for p in self.parameters():
             p.requires_grad = True
         
-        # Update the whole model
         if tune == "all":
-            return 
-        # Update only the regressor last linear
+            return
         elif tune == "last_linear":
-            for p in self.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if self.ecg:
-                for p in self.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if self.resp: 
-                    for p in self.resp_feature_gen.parameters():
-                        p.requires_grad = False
-            
-            for p in self.t_gru.parameters():
-                p.requires_grad = False
-                
-            for p in self.projection_head.parameters():
-                p.requires_grad = False
+            # Freeze all layers except the supervised final_conv_supervised
+            for name, param in self.named_parameters():
+                if "final_conv_supervised" not in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+        elif tune == "encoder_only":
+            # Example: Freeze all heads, train only encoder blocks and bottleneck
+            for name, param in self.named_parameters():
+                if any(head_name in name for head_name in ["projection_head", "reconstruction_head", "permutation_head", "generation_head", "final_conv_supervised", "decoder_blocks", "att_gate", "self_attention_stack"]):
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
         else:
-            raise Exception("undefined tune")
+            raise ValueError(f"Undefined tune option: {tune}")
         
         
 def parseargs():
-    parser = argparse.ArgumentParser(description="PhysioFormer summary, # params and MACS")
+    parser = argparse.ArgumentParser(description="SSLUNet summary, # params and MACS")
 
     parser.add_argument('--batch_size', default=128, type=int, help='batch size for the dummy input')
-    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
+    parser.add_argument('--ecg', default='True', type=lambda x: bool(strtobool(x)), help='whether to load ecg or not. True for SSL')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
@@ -560,11 +653,13 @@ def parseargs():
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     parser.add_argument('--channels', default='32, 64, 128, 256, 512', type=str, help='channels produced by the convolutional blocks')
-    parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
-    parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
+    parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer')
+    parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer')
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
-    parser.add_argument('--set_tunable_params', default='all', type=str, help='which model parameters to tune (all, only regressor, only encoder, etc.)')
-    parser.add_argument('--return_embedding', default='False', type=lambda x: bool(strtobool(x)), help='whether to return the model embedding before the regressor or not')
+    
+    # New arguments for SSL mode and heads
+    parser.add_argument('--proj_head_dim', default=256, type=int, help='Dimension of the projection head output for SimCLR')
+    parser.add_argument('--proj_hidden_dim', default=512, type=int, help='Dimension of the projection head hidden dim for SimCLR')
     
     args = parser.parse_args()
     return args
@@ -572,9 +667,9 @@ def parseargs():
 
 if __name__ == "__main__":
     global args
-    args = parseargs()    
-    
-    net = EUNet(
+    args = parseargs()
+
+    net = SSLUNet(
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
@@ -587,7 +682,7 @@ if __name__ == "__main__":
         kernel_size=args.kernel_size,
         num_heads_attention=args.num_heads_attention,
         dim_feedforward_attention=args.dim_feedforward_attention,
-        set_tunable_params=args.set_tunable_params,
-        return_embedding=args.return_embedding
-        )        
+        projection_hidden_dim=args.proj_hidden_dim,
+        projection_dim=args.proj_head_dim
+        )
     net.print_summary(batch_size=args.batch_size)

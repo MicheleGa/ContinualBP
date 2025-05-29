@@ -20,7 +20,6 @@ class GRU(nn.Module):
                  hidden_dim=128,
                  num_layers=2,
                  bidirectional=True,
-                 set_tunable_params='all',
                  return_embedding=False):
         super(GRU, self).__init__()
         
@@ -32,7 +31,6 @@ class GRU(nn.Module):
         self.ppg_derivatives = ppg_derivatives
         self.ppg_emd = ppg_emd
         self.ppg_freqs = ppg_freqs
-        self.return_embedding = return_embedding
         
         # Architecture Setup
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
@@ -79,15 +77,6 @@ class GRU(nn.Module):
 
         return output.squeeze(-1)
     
-    def init_params(self):
-        # Fan-out focuses on the gradient distribution, and is commonly used in ResNets
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-    
     def get_input_channels(self):
         if self.ecg:
             ecg_in_channels = 1
@@ -118,37 +107,7 @@ class GRU(nn.Module):
 
         macs, num_params = profile(self, inputs=(input,))
         macs, num_params = clever_format([macs, num_params], "%.7f")
-        print(f'UNet has {num_params} params and {macs} macs.')
-    
-    def set_tunable_layers(self, tune):
-        
-        # First set all parameters to be trainable
-        for p in self.parameters():
-            p.requires_grad = True
-        
-        # Update the whole model
-        if tune == "all":
-            return 
-        # Update only the regressor last linear
-        elif tune == "last_linear":
-            for p in self.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if self.ecg:
-                for p in self.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if self.resp: 
-                    for p in self.resp_feature_gen.parameters():
-                        p.requires_grad = False
-            
-            for p in self.t_gru.parameters():
-                p.requires_grad = False
-                
-            for p in self.projection_head.parameters():
-                p.requires_grad = False
-        else:
-            raise Exception("undefined tune")
+        print(f'GRU has {num_params} params and {macs} macs.')
         
         
 def parseargs():

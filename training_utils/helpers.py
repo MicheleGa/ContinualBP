@@ -1,10 +1,16 @@
 import os
+import sys
+folders_to_add = ['models']
+for folder in folders_to_add:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import time
 import yaml
+import itertools
 import numpy as np
 import random
 import torch
-from models import ResGRUNet, PhysioFormer, UNet, GRU, Transformer, EUNet
+from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer
+from models.UNet import AttentionGate1D, SelfAttentionBlock1D
 
 
 def fixseed(SEED):
@@ -105,8 +111,8 @@ def save_status(subject_id, epoch, model_name, save_name, model, optimizer, sche
             Optimizer to save the state dictionary from.
         scheduler (torch.optim.lr_scheduler or None): 
             Learning rate scheduler to save the state dictionary from.
-        meter (dict): 
-            Dictionary containing validation metrics.
+        meter (AverageMeter): 
+            Validation loss meter.
         checkpoint_path (str): 
             Path where checkpoints are saved.
         config (dict): 
@@ -123,21 +129,7 @@ def save_status(subject_id, epoch, model_name, save_name, model, optimizer, sche
     to_save['optimizer'] = optimizer.state_dict()
     if scheduler is not None:
         to_save['lr_scheduler'] = scheduler.state_dict()
-    to_save['val_loss'] = meter['loss']
-    # This code can be nicer
-    if 'acc_top1' in meter.keys() and 'acc_top5' in meter.keys() and 'acc_mean_pos' in meter.keys():
-        to_save['acc_top1'] = meter['acc_top1']
-        to_save['acc_top5'] = meter['acc_top5']
-        to_save['acc_mean_pos'] = meter['acc_mean_pos']
-    else:
-        to_save['sbp_mae'] = meter['sbp_mae']
-        to_save['sbp_mae_std'] = meter['sbp_mae_std']
-        to_save['sbp_me'] = meter['sbp_me']
-        to_save['sbp_me_std'] = meter['sbp_me_std']
-        to_save['dbp_mae'] = meter['dbp_mae']
-        to_save['dbp_mae_std'] = meter['dbp_mae_std']
-        to_save['dbp_me'] = meter['dbp_me']
-        to_save['dbp_me_std'] = meter['dbp_me_std']
+    to_save['val_loss'] = meter.avg
 
     if subject_id is not None:
         out_path = os.path.join(checkpoint_path, save_name, str(subject_id), 'ckpt') 
@@ -198,21 +190,7 @@ def load_status(subject_id, model_name, save_name, model, optimizer, scheduler, 
     if scheduler is not None:
         scheduler.load_state_dict(checkpoint['lr_scheduler'])
     
-    if config['lambda_supervised'] == 0.:
-        acc_top1 = checkpoint['acc_top1']
-        acc_top5 = checkpoint['acc_top5']
-        acc_mean_pos = checkpoint['acc_mean_pos']
-        print(f"Loaded checkpoint from validation on epoch {epoch}: {checkpoint['val_loss']}, acc_top1 {acc_top1}, acc_top5 {acc_top5}, acc_mean_pos {acc_mean_pos}")
-    else:
-        val_loss = checkpoint['val_loss']
-        sbp_mae = checkpoint['sbp_mae']
-        sbp_mae_std = checkpoint['sbp_mae_std']
-        sbp_me = checkpoint['sbp_me']
-        sbp_me_std = checkpoint['sbp_me_std']
-        dbp_mae = checkpoint['dbp_mae']
-        dbp_mae_std = checkpoint['dbp_mae_std']
-        
-        print(f"Loaded checkpoint from validation on epoch {epoch}: {val_loss}, {sbp_mae} \u00B1 {sbp_mae_std}, sbp_me {sbp_me} \u00B1 sbp_me_std {sbp_me_std}, dbp_mae {dbp_mae} \u00B1 dbp_mae_std {dbp_mae_std}")
+    print(f"Loaded checkpoint from validation on epoch {epoch}: {checkpoint['val_loss']}")
     
 
 def configure_optimizer_and_scheduler(model, config):
@@ -302,7 +280,7 @@ def set_trainable_parameters(model, tune, config):
         model (torch.nn.Module): 
             The model to be tuned.
         tune (str): 
-            The tuning strategy. Options are 'all', 'gru' or 'trasnformer', 'projection_head', 'last_linear', or 'none'.
+            The tuning strategy. Options are 'all', 'gru' or 'transformer', 'projection_head', 'last_linear', or 'none'.
         config (dict): 
             Configuration dictionary containing model settings.
     
@@ -312,112 +290,255 @@ def set_trainable_parameters(model, tune, config):
             The function modifies the model parameters in place.
     """
     
-    for p in model.parameters():
-        p.requires_grad = True
-        
-    if tune == 'all':
-        return
-        
-    elif tune == 'gru' or tune == 'transformer':
-        if config['model_name'] == 'ResGRUNet':
-            for p in model.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if config['ecg']:
-                for p in model.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if config['resp']: 
-                    for p in model.resp_feature_gen.parameters():
-                        p.requires_grad = False
-        
-        elif config['model_name'] == 'PhysioFormer':
-            for p in model.ppg_linear_projection.parameters():
-                p.requires_grad = False
-            
-            if config['ecg']:
-                for p in model.ecg_linear_projection.parameters():
-                    p.requires_grad = False
-            
-                if config['resp']: 
-                    for p in model.resp_linear_projection.parameters():
-                        p.requires_grad = False
-        
-        else:
-            raise ValueError("Invalid model name ...")
+    # Model-specific parameter freezing
+    if config['model_name'] == 'ResGRUNet':
+        _handle_resgru_tuning(model, tune, config)
+    elif config['model_name'] == 'PhysioFormer':
+        _handle_physioformer_tuning(model, tune, config)
+    elif config['model_name'] == 'GRU':
+        _handle_gru_tuning(model, tune, config)
+    elif config['model_name'] == 'UNet':
+        _handle_unet_tuning(model, tune, config)
+    elif config['model_name'] == 'SSLUNet':
+        _handle_sslunet_tuning(model, tune, config)
+    else:
+        raise ValueError(f"Invalid model name: {config['model_name']}")
+
+
+def _freeze_resgru_feature_generators(model, config):
+    """Freeze feature generators for ResGRUNet based on config."""
+    for p in model.ppg_feature_gen.parameters():
+        p.requires_grad = False
     
-    elif tune == 'projection_head':
-        if config['model_name'] == 'ResGRUNet':
-            for p in model.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if config['ecg']:
-                for p in model.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if config['resp']: 
-                    for p in model.resp_feature_gen.parameters():
-                        p.requires_grad = False
-            
-            for p in model.t_gru.parameters():
-                p.requires_grad = False
-                
-        elif config['model_name'] == 'PhysioFormer':
-            for p in model.ppg_linear_projection.parameters():
-                p.requires_grad = False
-            
-            if config['ecg']:
-                for p in model.ecg_linear_projection.parameters():
-                    p.requires_grad = False
-            
-                if config['resp']: 
-                    for p in model.resp_linear_projection.parameters():
-                        p.requires_grad = False
-
-                for p in model.transformer.parameters():
-                    p.requires_grad = False
-
-    elif tune == 'last_linear':
-        if config['model_name'] == 'ResGRUNet':
-            for p in model.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if config['ecg']:
-                for p in model.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if config['resp']: 
-                    for p in model.resp_feature_gen.parameters():
-                        p.requires_grad = False
-            
-            for p in model.t_gru.parameters():
-                p.requires_grad = False
-        
-        elif config['model_name'] == 'PhysioFormer':
-            for p in model.ppg_linear_projection.parameters():
-                p.requires_grad = False
-            
-            if config['ecg']:
-                for p in model.ecg_linear_projection.parameters():
-                    p.requires_grad = False
-            
-                if config['resp']: 
-                    for p in model.resp_linear_projection.parameters():
-                        p.requires_grad = False
-
-                for p in model.transformer.parameters():
-                    p.requires_grad = False
-        else:
-            raise ValueError("Invalid model name ...")
-        
-        for p in model.projection_head.parameters():
+    if config['ecg']:
+        for p in model.ecg_feature_gen.parameters():
             p.requires_grad = False
-            
+    
+    if config['resp']:
+        for p in model.resp_feature_gen.parameters():
+            p.requires_grad = False
+
+
+def _freeze_physioformer_projections(model, config):
+    """Freeze linear projections for PhysioFormer based on config."""
+    for p in model.ppg_linear_projection.parameters():
+        p.requires_grad = False
+    
+    if config['ecg']:
+        for p in model.ecg_linear_projection.parameters():
+            p.requires_grad = False
+    
+    if config['resp']:
+        for p in model.resp_linear_projection.parameters():
+            p.requires_grad = False
+
+
+def _handle_resgru_tuning(model, tune, config):
+    """Handle tuning strategy for ResGRUNet model."""
+    
+    # Special cases first all/none parameters tuned
+    if tune == 'all': 
+        return
     elif tune == 'none':
         for p in model.parameters():
-            p.requires_grad = False    
+            p.requires_grad = False
+        return
+    
+    # Model-specfic tune, look into the corresponding script where the architecture is defined
+    if tune in ['gru', 'transformer']:
+        _freeze_resgru_feature_generators(model, config)
+    
+    elif tune == 'projection_head':
+        _freeze_resgru_feature_generators(model, config)
+        for p in model.t_gru.parameters():
+            p.requires_grad = False
+    
+    elif tune == 'last_linear':
+        _freeze_resgru_feature_generators(model, config)
+        for p in model.t_gru.parameters():
+            p.requires_grad = False
+        for p in model.projection_head.parameters():
+            p.requires_grad = False
+    
     else:
-        raise ValueError("Invalid set_tunable_params ...")
+        raise ValueError(f"Invalid tuning strategy for ResGRUNet: {tune}")
+
+
+def _handle_physioformer_tuning(model, tune, config):
+    """Handle tuning strategy for PhysioFormer model."""
+    
+    # Special cases first all/none parameters tuned
+    if tune == 'all': 
+        return
+    elif tune == 'none':
+        for p in model.parameters():
+            p.requires_grad = False
+        return
+    
+    # Model-specfic tune, look into the corresponding script where the architecture is defined
+    if tune in ['gru', 'transformer']:
+        _freeze_physioformer_projections(model, config)
+    
+    elif tune == 'projection_head':
+        _freeze_physioformer_projections(model, config)
+        for p in model.transformer.parameters():
+            p.requires_grad = False
+    
+    elif tune == 'last_linear':
+        _freeze_physioformer_projections(model, config)
+        for p in model.transformer.parameters():
+            p.requires_grad = False
+        for p in model.projection_head.parameters():
+            p.requires_grad = False
+    
+    else:
+        raise ValueError(f"Invalid tuning strategy for PhysioFormer: {tune}")
+    
+    
+def _handle_gru_tuning(model, tune, config):
+    """Handle tuning strategy for GRU model."""
+    
+    # Special cases first all/none parameters tuned
+    if tune == 'all': 
+        return
+    elif tune == 'none':
+        for p in model.parameters():
+            p.requires_grad = False
+        return
+    
+    # Model-specfic tune, look into the corresponding script where the architecture is defined
+    # For GRU either you fine-tune all the model parameters or the last linear
+    if tune == 'last_linear':
+        # Freeze the GRU layers (look into GRU.py for the layers'name)
+        for p in model.gru.parameters():
+            p.requires_grad = False
+    else:
+        raise ValueError(f"Invalid tuning strategy for GRU: {tune}")
+
+
+def _handle_unet_tuning(model, tune, config):
+    """Handle tuning strategy for UNet model."""
+    
+    if tune == 'all': 
+        # Train all parameters
+        for p in model.parameters():
+            p.requires_grad = True
+    elif tune == 'none':
+        # Train no parameters
+        for p in model.parameters():
+            p.requires_grad = False
+    elif tune == 'last_linear':
+        # Freeze everything and only leave final_conv with require_grads True
+        # Model was already all tunable, but code is cleaner this way 
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.final_conv.parameters():
+            p.requires_grad = True
+    elif tune == 'attention':
+        # Freeze everything except the AttentionGate1D and SelfAttentionBlock1D modules
+        for p in model.parameters():
+            p.requires_grad = False
+        for module in model.modules():
+            if isinstance(module, (AttentionGate1D, SelfAttentionBlock1D)):
+                for p in module.parameters():
+                    p.requires_grad = True
+    elif tune == 'decoder':
+        # Freeze encoder and bottleneck, unfreeze decoder and attention gates, and final self-attention
+        for p in model.parameters():
+            p.requires_grad = False
+        for block in model.decoder_blocks:
+            for p in block.parameters():
+                p.requires_grad = True
+        for gate in [model.att_gate1, model.att_gate2, model.att_gate3, model.att_gate4]:
+            for p in gate.parameters():
+                p.requires_grad = True
+        for p in model.self_attention_stack1.parameters():
+            p.requires_grad = True
+        for p in model.self_attention_stack2.parameters():
+            p.requires_grad = True
+        for p in model.final_conv.parameters():
+            p.requires_grad = True
+    elif tune == 'encoder':
+        # Freeze decoder and attention gates, unfreeze encoder and bottleneck
+        for p in model.parameters():
+            p.requires_grad = False
+        for block in model.encoder_blocks:
+            for p in block.parameters():
+                p.requires_grad = True
+        for p in model.bottleneck.parameters():
+            p.requires_grad = True
+    else:
+        raise ValueError(f"Invalid tuning strategy for UNet: {tune}")
+    
+
+def _handle_sslunet_tuning(model, tune, config):
+    """Handle tuning strategy for SSLUNet model."""
+
+    # Ensure all parameters are initially set to requires_grad=False
+    # This provides a clean slate for selective unfreezing given the particular SSLUNet definition
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if tune == 'all':
+        for p in model.parameters():
+            p.requires_grad = True
+    elif tune == 'none':
+        # All parameters already set to False 
+        pass
+    elif tune == 'last_linear':
+        # Only tune the final supervised convolutional layer
+        for p in model.final_conv_supervised.parameters():
+            p.requires_grad = True
+    elif tune == 'projection_head':
+        # Only tune the projection head
+        for p in model.projection_head.parameters():
+            p.requires_grad = True
+    elif tune == 'reconstruction_head':
+        # Only tune the reconstruction head
+        for p in model.reconstruction_head.parameters():
+            p.requires_grad = True
+    elif tune == 'encoder':
+        # Only tune the encoder blocks and bottleneck
+        for block in model.encoder_blocks:
+            for p in block.parameters():
+                p.requires_grad = True
+        for p in model.bottleneck.parameters():
+            p.requires_grad = True
+    elif tune == 'decoder':
+        # Only tune the decoder blocks and attention gates
+        for block in model.decoder_blocks:
+            for p in block.parameters():
+                p.requires_grad = True
+        for gate in [model.att_gate1, model.att_gate2, model.att_gate3, model.att_gate4]:
+            for p in gate.parameters():
+                p.requires_grad = True
+        for p in model.self_attention_stack1.parameters():
+            p.requires_grad = True
+        for p in model.self_attention_stack2.parameters():
+            p.requires_grad = True
+    elif tune == 'attention_modules':
+        # Tune only the attention gates and self-attention stacks
+        for gate in [model.att_gate1, model.att_gate2, model.att_gate3, model.att_gate4]:
+            for p in gate.parameters():
+                p.requires_grad = True
+        for p in model.self_attention_stack1.parameters():
+            p.requires_grad = True
+        for p in model.self_attention_stack2.parameters():
+            p.requires_grad = True
+    elif tune == 'shared_backbone':
+        # Tune the entire shared U-Net backbone (encoder, bottleneck, decoder, attention, self-attention, and the final_conv_supervised)
+        # This means everything *except* the specific SSL heads
+        for name, param in model.named_parameters():
+            if not any(head_name in name for head_name in [
+                "projection_head",
+                "reconstruction_head",
+                "permutation_head",
+                "generation_prev_head",
+                "generation_next_head"
+            ]):
+                param.requires_grad = True
+    else:
+        raise ValueError(f"Invalid tuning strategy for SSLUNet: {tune}")
 
 
 class EarlyStopping:
@@ -534,9 +655,7 @@ def get_model_architecture(config):
             channels=config['channels'],
             kernel_size=config['kernel_size'],
             num_heads_attention=config['num_heads_attention'],
-            dim_feedforward_attention=config['dim_feedforward_attention'],
-            set_tunable_params=config['set_tunable_params'],
-            return_embedding=config['return_embedding']
+            dim_feedforward_attention=config['dim_feedforward_attention']
             )
     elif config['model_name'] == 'GRU':
         model = GRU.GRU(
@@ -550,9 +669,7 @@ def get_model_architecture(config):
             input_seq_len_s=config['input_seq_len_s'],
             hidden_dim=config['hidden_dim'],
             num_layers=config['num_layers'],
-            bidirectional=config['bidirectional'],
-            set_tunable_params=config['set_tunable_params'],
-            return_embedding=config['return_embedding']
+            bidirectional=config['bidirectional']
         )
     elif config['model_name'] == 'Transformer':
         model = Transformer.Transformer(
@@ -567,12 +684,10 @@ def get_model_architecture(config):
             embed_dim=config['embed_dim'],
             num_heads=config['num_heads'],
             dim_feedforward=config['dim_feedforward'],
-            num_encoder_layers=config['num_encoder_layers'],
-            set_tunable_params=config['set_tunable_params'],
-            return_embedding=config['return_embedding']
+            num_encoder_layers=config['num_encoder_layers']
         )   
-    elif config['model_name'] == 'EUNet':
-        model = EUNet.EUNet(
+    elif config['model_name'] == 'SSLUNet':
+        model = SSLUNet.SSLUNet(
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
@@ -585,8 +700,8 @@ def get_model_architecture(config):
             kernel_size=config['kernel_size'],
             num_heads_attention=config['num_heads_attention'],
             dim_feedforward_attention=config['dim_feedforward_attention'],
-            set_tunable_params=config['set_tunable_params'],
-            return_embedding=config['return_embedding']
+            projection_hidden_dim=config['proj_hidden_dim'],
+            projection_dim=config['proj_head_dim']
             )
     else:
         raise ValueError("Invalid model name ...")

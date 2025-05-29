@@ -278,9 +278,7 @@ class Transformer(nn.Module):
                  embed_dim=128,
                  num_heads=8,
                  dim_feedforward=512,
-                 num_encoder_layers=2,
-                 set_tunable_params='all',
-                 return_embedding=False):
+                 num_encoder_layers=2):
         super(Transformer, self).__init__()
         
         # Input Data Setup
@@ -291,7 +289,6 @@ class Transformer(nn.Module):
         self.ppg_derivatives = ppg_derivatives
         self.ppg_emd = ppg_emd
         self.ppg_freqs = ppg_freqs
-        self.return_embedding = return_embedding
         
         # Architecture Setup
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
@@ -320,9 +317,6 @@ class Transformer(nn.Module):
         # Output: [batch_size, seq_len, model_dim] -> [batch_size, seq_len, output_dim=1], as output is the ABP waveform
         self.fc = nn.Linear(embed_dim, 1)
         
-        # Freeze/Tune model parameters
-        #self.set_tunable_layers(set_tunable_params)
-
     def forward(self, x):
         
         x = x.unsqueeze(-1) if len(x.shape) == 2 else x # x -> (batch_size, seq_len, channels)
@@ -373,38 +367,8 @@ class Transformer(nn.Module):
 
         macs, num_params = profile(self, inputs=(input,))
         macs, num_params = clever_format([macs, num_params], "%.7f")
-        print(f'UNet has {num_params} params and {macs} macs.')
-    
-    def set_tunable_layers(self, tune):
-        
-        # First set all parameters to be trainable
-        for p in self.parameters():
-            p.requires_grad = True
-        
-        # Update the whole model
-        if tune == "all":
-            return 
-        # Update only the regressor last linear
-        elif tune == "last_linear":
-            for p in self.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if self.ecg:
-                for p in self.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if self.resp: 
-                    for p in self.resp_feature_gen.parameters():
-                        p.requires_grad = False
-            
-            for p in self.t_gru.parameters():
-                p.requires_grad = False
-                
-            for p in self.projection_head.parameters():
-                p.requires_grad = False
-        else:
-            raise Exception("undefined tune")
-        
+        print(f'Transformer has {num_params} params and {macs} macs.')
+
         
 def parseargs():
     parser = argparse.ArgumentParser(description="PhysioFormer summary, # params and MACS")
@@ -422,8 +386,6 @@ def parseargs():
     parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
     parser.add_argument('--num_encoder_layers', default=2, type=int, help='number of trasnformer layers')
     parser.add_argument('--dim_feedforward', default=128, type=int, help='feedforward dimension size in the transformer encoder')
-    parser.add_argument('--set_tunable_params', default='all', type=str, help='which model parameters to tune (all, only regressor, only encoder, etc.)')
-    parser.add_argument('--return_embedding', default='False', type=lambda x: bool(strtobool(x)), help='whether to return the model embedding before the regressor or not')
     
     args = parser.parse_args()
     return args
@@ -445,8 +407,6 @@ if __name__ == "__main__":
         embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         dim_feedforward=args.dim_feedforward,
-        num_encoder_layers=args.num_encoder_layers,
-        set_tunable_params=args.set_tunable_params,
-        return_embedding=args.return_embedding
+        num_encoder_layers=args.num_encoder_layers
         )        
     net.print_summary(batch_size=args.batch_size)

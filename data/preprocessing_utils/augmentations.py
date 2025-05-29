@@ -49,7 +49,6 @@ class MagnitudeWarp(object):
 
     def __call__(self, inputs):
         if random.random() < self.prob:
-            inputs = inputs.unsqueeze(-1)
             orig_steps = np.arange(inputs.shape[1])
             random_warps = np.random.normal(loc=1.0, scale=self.sigma, size=(inputs.shape[0], self.knot+2, inputs.shape[2]))
             warp_steps = (np.ones((inputs.shape[2],1))*(np.linspace(0, inputs.shape[1]-1., num=self.knot+2))).T
@@ -58,7 +57,7 @@ class MagnitudeWarp(object):
                 warper = np.array([CubicSpline(warp_steps[:,dim], random_warps[i,:,dim])(orig_steps) for dim in range(inputs.shape[2])]).T
                 ret[i] = pat * warper
             
-            return torch.from_numpy(ret.squeeze(-1)).float()
+            return torch.from_numpy(ret).float()
         else:
             return inputs
         
@@ -71,10 +70,7 @@ class TimeWarp(object):
 
     def __call__(self, inputs):
         if random.random() < self.prob:
-            print(inputs.shape)
-            inputs = inputs.unsqueeze(-1)
             orig_steps = np.arange(inputs.shape[1])
-    
             random_warps = np.random.normal(loc=1.0, scale=self.sigma, size=(inputs.shape[0], self.knot+2, inputs.shape[2]))
             warp_steps = (np.ones((inputs.shape[2],1))*(np.linspace(0, inputs.shape[1]-1., num=self.knot+2))).T
             
@@ -90,11 +86,7 @@ class TimeWarp(object):
         
 
 class Identity(object):
-    """Identity augmentation that keeps the input unchanged.
-
-    Args:
-        prob (float): Probability of applying the identity augmentation.
-            It should be in the range [0, 1]. Default is 1.0.
+    r"""Identity augmentation that keeps the input unchanged.
     """
 
     def __init__(self, prob=1.0):
@@ -116,12 +108,12 @@ class Identity(object):
     
 
 class RandomAugmentor(object):
-    """Random data augmentations.
+    r"""Random data augmentations.
 
     This class applies a set of random augmentations to the input data based on
     their probabilities.
 
-    Args:
+    
         augments (list of augment class):
             List of augmentation instances.
 
@@ -159,6 +151,10 @@ class RandomAugmentor(object):
                 self.augment_probs += [identity_prob]
 
     def __call__(self, inputs):
+        if len(inputs.shape) == 1:
+            inputs = inputs.unsqueeze(0)
+        if len(inputs.shape) == 2:
+            inputs = inputs.unsqueeze(-1)
         random_state = np.random.RandomState(random.randint(0, 2**32 - 1))
         aug = random_state.choice(self.augments, p=self.augment_probs)
         return aug(inputs)

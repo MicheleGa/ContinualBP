@@ -101,8 +101,8 @@ class PhysioDataset(Dataset):
     
     def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
-        # its di is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
-        # with lmdbenv.begin(write=True) as txn: deos not run
+        # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
+        # with lmdbenv.begin(write=True) as txn: deos not make this check
         invalid_subjects = list()
         for subject in self.subject_list:
             if len(self.index_by_subject_id[subject]) <= min_subject_sample_number:
@@ -330,7 +330,7 @@ def parseargs():
     parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
     parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
     parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
-    parser.add_argument('--batchsize', default=256, type=int, help='batch size')
+    parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
@@ -375,9 +375,9 @@ if __name__ == "__main__":
     # Pretraining statistics
     (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
     
-    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=args.batchsize, num_workers=args.loader_worker, pin_memory=True)    
-    valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batchsize, num_workers=args.loader_worker, pin_memory=True)
-    test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batchsize, num_workers=args.loader_worker, pin_memory=True)
+    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)    
+    valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
+    test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
     calculate_dataset_mean_std([train_dataloader, valid_dataloader, test_dataloader], ['Train', 'Valid', 'Test'], savepath=root_figs_folder) 
 

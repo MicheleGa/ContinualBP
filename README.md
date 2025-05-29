@@ -291,6 +291,12 @@ tensorboard --logdir tensorboard/$experiment_name
 
 while it is also possible to look into training logs in the corresponding folder (_logs/$experiment_name_).
 
+Since training may take a while the following command can be useful to launch the scripts in background:
+
+```bash
+nohup ./your_script_runner.sh > /location/of/the/output/file.log 2>&1 &
+```
+
 ## Example Usage
 
 In the directory *notebooks*, it is possible to find a simple example where the model is employed to perform prediction on a test sample. Further information can be found in the brief jupyter notebook.

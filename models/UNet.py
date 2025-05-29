@@ -174,9 +174,7 @@ class UNet(nn.Module):
                  channels='32, 64, 128, 256, 512',
                  kernel_size=3,
                  num_heads_attention=1,
-                 dim_feedforward_attention=128,
-                 set_tunable_params='all',
-                 return_embedding=False):
+                 dim_feedforward_attention=128):
         super(UNet, self).__init__()
         
         # Input Data Setup
@@ -187,7 +185,6 @@ class UNet(nn.Module):
         self.ppg_derivatives = ppg_derivatives
         self.ppg_emd = ppg_emd
         self.ppg_freqs = ppg_freqs
-        self.return_embedding = return_embedding
         
         # Architecture Setup
         self.kernel_size = kernel_size
@@ -360,36 +357,6 @@ class UNet(nn.Module):
         macs, num_params = profile(self, inputs=(input,))
         macs, num_params = clever_format([macs, num_params], "%.7f")
         print(f'UNet has {num_params} params and {macs} macs.')
-    
-    def set_tunable_layers(self, tune):
-        
-        # First set all parameters to be trainable
-        for p in self.parameters():
-            p.requires_grad = True
-        
-        # Update the whole model
-        if tune == "all":
-            return 
-        # Update only the regressor last linear
-        elif tune == "last_linear":
-            for p in self.ppg_feature_gen.parameters():
-                p.requires_grad = False
-            
-            if self.ecg:
-                for p in self.ecg_feature_gen.parameters():
-                    p.requires_grad = False
-            
-                if self.resp: 
-                    for p in self.resp_feature_gen.parameters():
-                        p.requires_grad = False
-            
-            for p in self.t_gru.parameters():
-                p.requires_grad = False
-                
-            for p in self.projection_head.parameters():
-                p.requires_grad = False
-        else:
-            raise Exception("undefined tune")
         
         
 def parseargs():
@@ -408,8 +375,6 @@ def parseargs():
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
-    parser.add_argument('--set_tunable_params', default='all', type=str, help='which model parameters to tune (all, only regressor, only encoder, etc.)')
-    parser.add_argument('--return_embedding', default='False', type=lambda x: bool(strtobool(x)), help='whether to return the model embedding before the regressor or not')
     
     args = parser.parse_args()
     return args
@@ -431,8 +396,6 @@ if __name__ == "__main__":
         channels=args.channels,
         kernel_size=args.kernel_size,
         num_heads_attention=args.num_heads_attention,
-        dim_feedforward_attention=args.dim_feedforward_attention,
-        set_tunable_params=args.set_tunable_params,
-        return_embedding=args.return_embedding
+        dim_feedforward_attention=args.dim_feedforward_attention
         )        
     net.print_summary(batch_size=args.batch_size)

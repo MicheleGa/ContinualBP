@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from data.dataset import PhysioDataset
+from data.dataset_ssl import PhysioDatasetSSL
 from models.trainer import pretraining_training_validation_testing
 from training_utils.helpers import fixseed, generate_runname
 from training_utils.metrics import call_metric
@@ -17,7 +18,7 @@ from training_utils.metrics import call_metric
 
 def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_path, config, device):
     r"""
-    Pretrains a neural network model for Blood Pressure Estimation from PPG and ECG data using PyTorch Lightning.
+    Pretrains a neural network model for Blood Pressure Estimation from PPG and ECG data with supervision or self-supervision.
 
     Parameters
     ------------
@@ -69,15 +70,13 @@ def parseargs():
     
     # Run setup
     parser.add_argument('--resume', default='', type=str, help='path to latest checkpoint (default: none)')
-    parser.add_argument('--dataset_folder', default='./data/lmdb', type=str, help='path to dataset fodler')
-    parser.add_argument('--dataset_name', default='test', type=str, help='name of the dataset')
     parser.add_argument('--expname', default='test', type=str, help='experiment name')
-    parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
     parser.add_argument('--gpu', default="0", type=str)
     parser.add_argument('--seed', default=42, type=int, help='random seed')
     
     # Generic training setup
     parser.add_argument('--max_training_epochs', default=75, type=int, help='maximum epochs')
+    parser.add_argument('--max_lp_training_epochs', default=75, type=int, help='maximum linear probing epochs')
     parser.add_argument('--eval_every_n_epochs', default=1, type=int, help='evaluate every n epochs')
     parser.add_argument('--es_patience', default=10, type=int, help='early stopping patience')
     parser.add_argument('--es_min_delta', default=0.01, type=float, help='early stopping minimum delta')
@@ -93,18 +92,25 @@ def parseargs():
     parser.add_argument('--sgd_momentum', default=0.9, type=float, help='Momentum for SGD optimizer')
     parser.add_argument('--lrsched_step', default="5, 10, 15, 20, 40", type=str, help='learning rate scheduler steps')
     parser.add_argument('--lrsched_gamma', default=0.5, type=float, help='learning rate scheduler gamma')
-    parser.add_argument('--criterion', default="MSELoss", type=str, help='loss criterion')
-    parser.add_argument('--lambda_supervised', default=0., type=float, help='scale supervised loss function contribution, set 0. to prevent its application')
-    parser.add_argument('--lambda_ortho', default=0., type=float, help='induce feature orthogonality during pretraining, set 0. to prevent its application')
-    parser.add_argument('--lambda_contrastive', default=0., type=float, help='induce contrastive loss contribution to the final loss during pretraining, set 0. to prevent its application')
-    parser.add_argument('--temperature', default=0., type=float, help='temperature scalar for SimCLR loss')
     parser.add_argument('--optimizer_type', default="AdamW", type=str, help='optimizer type')
     parser.add_argument('--lr_scheduler_type', default="MultiStepLR", type=str, help='learning rate scheduler type')
     parser.add_argument('--lr_scheduler_enable', default='False', type=lambda x: bool(strtobool(x)), help='enable learning rate scheduler')
     parser.add_argument('--lr_scheduler_min_lr', default=0.0001, type=float, help='enable learning rate scheduler')
     parser.add_argument('--lr_scheduler_warmup', default=0, type=int, help='enable learning rate scheduler')
     
+    # Loss function setup (supervised and self-supervised)
+    parser.add_argument('--criterion', default="MSELoss", type=str, help='loss criterion')
+    parser.add_argument('--lambda_supervised', default=0., type=float, help='scale supervised loss function contribution, set 0. to prevent its application')
+    parser.add_argument('--lambda_ortho', default=0., type=float, help='induce feature orthogonality during pretraining, set 0. to prevent its application')
+    parser.add_argument('--lambda_contrastive', default=0., type=float, help='induce contrastive loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    parser.add_argument('--temperature', default=0., type=float, help='temperature scalar for SimCLR loss')
+    parser.add_argument('--lambda_msr', default=0., type=float, help='induce masked signal loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    parser.add_argument('--lambda_cwg', default=0., type=float, help='induce prev/next signal reconstruction loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    
     # Dataset setup
+    parser.add_argument('--dataset_folder', default='./data/lmdb', type=str, help='path to dataset fodler')
+    parser.add_argument('--dataset_name', default='test', type=str, help='name of the dataset')
+    parser.add_argument('--lp_dataset_name', default='test', type=str, help='name of the dataset for linear probing')
     parser.add_argument('--pretraining_ratio', default=0.8, type=float, help='pretraining ratio of the whole dataset')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
     parser.add_argument('--personalization_sample_number', default=100, type=int, help='number of samples to take for personalization')
@@ -117,14 +123,18 @@ def parseargs():
     parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
     parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
     parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
-    parser.add_argument('--aug', default='False', type=lambda x: bool(strtobool(x)), help='whether to use data augmentations during pretraining or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    
+
+    # Self-supervision setup
+    parser.add_argument('--masking_ratio', default=0.15, type=float, help='Ratio of signal length to mask for MSR task')
+    parser.add_argument('--augmentation_types', default='jitter,scaling,magnitude_warp,flip', type=str, help='Comma-separated list of augmentation types for SimCLR')
+    parser.add_argument('--aug_prob', default=0.2, type=float, help='Probability for each individual augmentation in RandomAugmentor')
+    parser.add_argument('--ssl', default='False', type=lambda x: bool(strtobool(x)), help='whether to do self-supervised pretraining or not')
+        
     # Generic model setup
-    parser.add_argument('--set_tunable_params', default='all', type=str, help='which model parameters to tune (all, only regressor, only encoder, etc.)')
-    parser.add_argument('--return_embedding', default='True', type=lambda x: bool(strtobool(x)), help='whether to return the model embedding before the regressor or not')
+    parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
     parser.add_argument('--proj_head_dim', default=256, type=int, help='dimension of the projection head after the feture extractor') 
     
     # ResGRUNet setup
@@ -147,6 +157,9 @@ def parseargs():
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
+    
+    # SSL UNet additional setup
+    parser.add_argument('--proj_hidden_dim', default=512, type=int, help='Dimension of the projection head hidden dim for SimCLR')
     
     # GRU setup
     parser.add_argument('--hidden_dim', default=128, type=int, help='GRU hidden dimension size')
@@ -189,7 +202,7 @@ if __name__ == "__main__":
     if not os.path.exists(figure_path):
         os.makedirs(figure_path)
 
-    print(f'Dataset folder: {args.dataset_folder}')
+    print(f'Dataset folder: {os.path.join(args.dataset_folder, args.dataset_name)}')
     print(f'Checkpoint folder: {checkpoint_path}')
     print(f'Tensorboard folder: {tensorboard_path}')
     print(f'Figure folder: {tensorboard_path}')
@@ -219,22 +232,45 @@ if __name__ == "__main__":
     if (config['ppg_derivatives'] or config['ppg_emd'] or config['ppg_freqs']) and config['ecg']: 
         raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')  
     
-    dataset = PhysioDataset(
-        seed=config['seed'],
-        lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-        pretraining_ratio=config['pretraining_ratio'],
-        pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-        personalization_sample_number=config['personalization_sample_number'],
-        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
-        fs=config['fs'],
-        input_seq_len_s=config['input_seq_len_s'],
-        ecg=config['ecg'],
-        resp=config['resp'],
-        sig2sig=config['sig2sig'],
-        ppg_derivatives=config['ppg_derivatives'],
-        ppg_emd=config['ppg_emd'],
-        ppg_freqs=config['ppg_freqs']
-    )
-    
+    if not config['ssl']:
+        # Load data and annotation
+        dataset = PhysioDataset(
+            seed=config['seed'],
+            lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+            pretraining_ratio=config['pretraining_ratio'],
+            pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+            personalization_sample_number=config['personalization_sample_number'],
+            mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs']
+        )
+    else:
+        # Load data
+        dataset = PhysioDatasetSSL(
+            seed=config['seed'],
+            lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+            pretraining_ratio=config['pretraining_ratio'],
+            pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+            personalization_sample_number=config['personalization_sample_number'],
+            mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs'],
+            masking_ratio=config['masking_ratio'],
+            augmentation_types=config['augmentation_types'].split(','),
+            aug_prob=config['aug_prob']
+        )
+        
     ## Pretraining
     pretraining(args.expname, model_name, dataset, checkpoint_path, tensorboard_path, config, device)
