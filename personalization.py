@@ -3,41 +3,33 @@ import sys
 folders_to_add = ['data', 'models', 'training_utils']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
+import copy
 import shutil
 import pprint
 import gc
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SubsetRandomSampler
 import pytorch_lightning as pl
-from data.dataset import PhysioDataset
+from data.online_dataset import OnlinePhysioDataset, ContinualLearningDataset
 from data.preprocessing_utils.split import split_train_val_test_personalization
-from models.trainer import personalization_training_validation_testing
-from training_utils.helpers import fixseed, generate_runname, get_model_architecture, set_trainable_parameters, parseargs
-from training_utils.metrics import call_metric
+from training_utils.helpers import fixseed, generate_runname, get_model_architecture, set_trainable_parameters, parseargs, configure_optimizer_and_scheduler, EarlyStopping
+from training_utils.metrics import call_metric, AverageMeter, get_metric_values
 
-
-def copy_chekpoint_for_resume_training(checkpoint_path, save_name, subject_id, pretrained_filename):
-    # Copy the pretrained_checkpoint to the new subject directory to continue training without interfering with the pretrained model
-    # N.B. the ckpt_path override the default_root_dir behavior in the Trainer
-    new_checkpoint_dir = os.path.join(checkpoint_path, save_name, str(subject_id), 'ckpt')
-    os.makedirs(new_checkpoint_dir, exist_ok=True) 
-    new_checkpoint_path = os.path.join(new_checkpoint_dir, f'{model_name}.ckpt')
-    shutil.copy(pretrained_filename, new_checkpoint_path)
-    
-    # IMPORTANT: remember to add ", ckpt_path=new_checkpoint_path" when calling .fit() on the trainer
 
 def personalization(save_name, model_name, dataset, checkpoint_path, tensorboard_path, config, device, save_models=False):
     
     # Get test subjects
-    personalization_subjects = dataset.subjects_for_personalization
+    personalization_subjects = dataset.base_dataset.subject_list
     
     # Load pretrained model
     pretrained_model = get_model_architecture(config)
     checkpoint = torch.load(config['pretrained_model_checkpoint'], weights_only=False)
     print(f"Checkpoint loaded from {config['pretrained_model_checkpoint']}")
     pretrained_model.load_state_dict(checkpoint['model'])
-    pretrained_model.eval() # to avoind incosistent results as explicitly reported at https://pytorch.org/tutorials/beginner/saving_loading_models.html
+    pretrained_model.eval() # to avoid incosistent results as explicitly reported at https://pytorch.org/tutorials/beginner/saving_loading_models.html
     pretrained_model = pretrained_model.to(device)
     set_trainable_parameters(model=pretrained_model, tune='none', config=config)
     
@@ -54,47 +46,57 @@ def personalization(save_name, model_name, dataset, checkpoint_path, tensorboard
         
         print(f"{subject_counter}/{len(personalization_subjects)} testing subject {subject_id} without personalization")
 
-        # Get all samples of a subject
-        subject_sample_ids = dataset.index_by_subject_id[subject_id]
+        # N.B. access with subject counter and not the subject id, which is provided by the subject list
+        online_subject_id = continual_ds.base_dataset.subject_list[subject_counter] 
+        continual_ds.set_active_subject(subject_id)
         
-        # Get first X samples for training, the remaining are divided in X% for valid and test (chronological split)
-        # Note the minimum amount of samples a subject can have from the dataset plot in figs
-        _, _, test_idx = split_train_val_test_personalization(
-            subject_sample_ids, 
-            fixed_train_size=dataset.personalization_sample_number
-            )
-        
-        test_sampler = SubsetRandomSampler(test_idx)
-        test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config["batch_size"], num_workers=config["loader_worker"])
+        # --- Simulate Online Training Loop for a Subject --- 
+        sample_count = 0
+        while True:
+            break
+            sample_data = continual_ds.get_next_sample() # Returns a dict
+            if sample_data is None:
+                break # No more samples for this subject
 
-        for _, batch in enumerate(test_dataloader):
+            signals = sample_data['sig_tensor'] # Use the tensor version
+            targets = sample_data['annotation_tensor'] # Use the tensor version
+            abp_valid = sample_data['abp_valid']
+        
+            # TODO: semi-supervised logic on unlabeled samples tbd
+            if not abp_valid:
+                continue
             
-            # Prepare data
-            signals, targets = batch
-            signals = signals.to(device)
-            if len(signals.shape) == 2:
-                signals = signals.unsqueeze(-1)
-
+            # Prepare input data
+            signals = signals.to(device)            
             if config['sig2sig']:
                 targets = targets.to(device)
             else:
-                targets = torch.cat((batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+                targets = torch.cat((targets[1][0].to(device), targets[1][1].to(device)), dim=-1)
+
+            # Add batch dimension
+            signals = signals.unsqueeze(0)
+            targets = targets.unsqueeze(0)
             
             # Perform forward pass
-            outputs = pretrained_model(signals)
+            with torch.no_grad(): # No gradient calculation during testing
+                outputs = pretrained_model(signals)
+                
+            sample_count += 1
         
             all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
             all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
+            
+        print(f"Finished processing {sample_count} samples for Subject {online_subject_id}.")
         
     # Log test metrics and plot them
-    print('Results w/o personalization')
-    _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'test_pretraining'), plot=True)    
+    #print('Results w/o personalization')
+    #_ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'test_pretraining'), plot=True)    
     
     # Deallocate the pretrained model to free memory
     del pretrained_model
     gc.collect()
     
-    ## --- Personalization ~ Training/Val/Test ---
+    ## --- Personalization ---
     
     # Record outputs and targets
     if config['sig2sig']:
@@ -108,42 +110,105 @@ def personalization(save_name, model_name, dataset, checkpoint_path, tensorboard
         
         print(f"{subject_counter}/{len(personalization_subjects)} personalizing subject {subject_id}")
 
-        # Get all samples of a subject
-        subject_sample_ids = dataset.index_by_subject_id[subject_id]
+        # N.B. access with subject counter and not the subject id, which is provided by the subject list
+        online_subject_id = continual_ds.base_dataset.subject_list[subject_counter] 
+        continual_ds.set_active_subject(subject_id)
         
-        # Get first X samples for training, the remaining are divided in X% for val and test (chronological split)
-        # Note the minimum amount of samples a subject can have from the dataset plot in figs
-        train_idx, val_idx, test_idx = split_train_val_test_personalization(
-            subject_sample_ids, 
-            fixed_train_size=dataset.personalization_sample_number
-            )
+        # Load pretrained model
+        pretrained_model = get_model_architecture(config)
+        checkpoint = torch.load(config['pretrained_model_checkpoint'], weights_only=False)
+        print(f"Checkpoint loaded from {config['pretrained_model_checkpoint']}")
+        pretrained_model.load_state_dict(checkpoint['model'])
+        pretrained_model.eval() # to avoind incosistent results as explicitly reported at https://pytorch.org/tutorials/beginner/saving_loading_models.html
+        set_trainable_parameters(model=pretrained_model, tune='none', config=config)
         
-        train_sampler = SubsetRandomSampler(train_idx)
-        val_sampler = SubsetRandomSampler(val_idx)
-        test_sampler = SubsetRandomSampler(test_idx)
+        # Copy pretrained model for fine-tuning to avoid touching the original model
+        personalized_model = copy.deepcopy(pretrained_model)
+        personalized_model = personalized_model.to(device)
+        
+        # Deallocate the pretrained model to free memory
+        del pretrained_model
+        gc.collect()
+        
+        # Logging to TensorBoard Summary Writer
+        writer = SummaryWriter(log_dir=os.path.join(tensorboard_path, str(subject_id)))
+        
+        # Set the model to training model
+        # Different choice can be performed based on the model architecture
+        set_trainable_parameters(model=personalized_model, tune='last_layer', config=config)
+        
+        # Print trainable and non-trainable parameters
+        trainable_params = sum(p.numel() for p in personalized_model.parameters() if p.requires_grad)
+        non_trainable_params = sum(p.numel() for p in personalized_model.parameters() if not p.requires_grad)
 
-        train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=config["batch_size"], num_workers=config["loader_worker"])
-        val_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=config["batch_size"], num_workers=config["loader_worker"])
-        test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config["batch_size"], num_workers=config["loader_worker"])
+        print(f"Trainable parameters: {trainable_params} / {trainable_params + non_trainable_params} ({trainable_params / (trainable_params + non_trainable_params) * 100:.2f}%)")
+        print(f"Non-trainable parameters: {non_trainable_params} / {trainable_params + non_trainable_params} ({non_trainable_params / (trainable_params + non_trainable_params) * 100:.2f}%)")
         
-        test_targets, test_outputs = personalization_training_validation_testing(
-            save_name=save_name,
-            checkpoint_path=checkpoint_path,
-            tensorboard_path=tensorboard_path,
-            model_name=model_name,
-            subject_id=subject_id,
-            dataloaders={
-                'train': train_dataloader,
-                'val': val_dataloader,
-                'test': test_dataloader
-            },
-            config=config,
-            device=device,
-            save_models=save_models
-        )
+        # Optimizer (TODO: no scheduler at the moment)        
+        optim_sched = configure_optimizer_and_scheduler(personalized_model, config)
+        optimizer = optim_sched['optimizer']
         
-        all_test_outputs = np.concatenate((all_test_outputs, test_outputs), axis=0)
-        all_test_targets = np.concatenate((all_test_targets, test_targets), axis=0)
+        # --- Simulate Online Training Loop for a Subject --- 
+        sample_count = 0
+        train_losses = AverageMeter(name='train/loss')
+        while True:
+            sample_data = continual_ds.get_next_sample() # Returns a dict
+            if sample_data is None:
+                break # No more samples for this subject
+
+            signals = sample_data['sig_tensor'] # Use the tensor version
+            targets = sample_data['annotation_tensor'] # Use the tensor version
+            abp_valid = sample_data['abp_valid']
+        
+            # TODO: semi-supervised logic on unlabeled samples tbd
+            if not abp_valid:
+                continue
+            
+            # Prepare input data
+            signals = signals.to(device)            
+            if config['sig2sig']:
+                targets = targets.to(device)
+            else:
+                targets = torch.cat((targets[1][0].to(device), targets[1][1].to(device)), dim=-1)
+
+            # Add batch dimension
+            signals = signals.unsqueeze(0)
+            targets = targets.unsqueeze(0)
+            
+            outputs = personalized_model(signals)
+
+            # Supervised loss
+            supervised_loss = 0.
+            if config['lambda_supervised'] != 0.:
+                if config['criterion'] == 'MSELoss':
+                    supervised_loss = F.mse_loss(outputs, targets)
+                elif config['criterion'] == 'SmoothL1Loss':
+                    supervised_loss = F.smooth_l1_loss(outputs, targets)
+                else:
+                    raise ValueError("Invalid criterion ...")
+
+            # Total loss
+            loss = config['lambda_supervised'] * supervised_loss
+
+            # Backpropagation and optimization
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Log training loss
+            train_losses.update(loss.item(), signals.size(0))
+            writer.add_scalar('train/loss', loss.item(), sample_count) # N.B. logging on each sample
+            
+            sample_count += 1
+        
+            all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
+            all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
+        
+        
+        writer.close()
+    
+        # Remove the writer
+        #shutil.rmtree(os.path.join(tensorboard_path, str(subject_id)))
         
     print('Results w/ personalization')
     _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'test_personalization'), plot=True)    
@@ -207,14 +272,9 @@ if __name__ == "__main__":
     if (config['ppg_derivatives'] or config['ppg_emd'] or config['ppg_freqs']) and config['ecg']: 
         raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')  
     
-    # Load data and annotation
-    dataset = PhysioDataset(
-        seed=config['seed'],
+    # Instantiate OnlinePhysioDataset (the base for continual learning)
+    online_physio_dataset_base = OnlinePhysioDataset(
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-        pretraining_ratio=config['pretraining_ratio'],
-        pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-        personalization_sample_number=config['personalization_sample_number'],
-        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
         fs=config['fs'],
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
@@ -225,8 +285,12 @@ if __name__ == "__main__":
         ppg_freqs=config['ppg_freqs']
     )
     
+    # --- Continual Learning Setup ---
+    continual_ds = ContinualLearningDataset(online_physio_dataset_base)
+
+    
     ## Personalization
-    personalization(args.expname, model_name, dataset, checkpoint_path, tensorboard_path, config, device)
+    personalization(args.expname, model_name, continual_ds, checkpoint_path, tensorboard_path, config, device)
 
 
 

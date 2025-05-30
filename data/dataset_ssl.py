@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from sklearn.model_selection import train_test_split
-from preprocessing_utils.data_visualization import plot_signals, plot_pretraining_personalization_subjects_distribution, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataset_mean_std
+from preprocessing_utils.data_visualization import plot_signals, plot_pretraining_personalization_subjects_distribution, plot_subject_sample_distribution, plot_train_val_test_samples_distribution
 from preprocessing_utils.augmentations import RandomAugmentor, Identity, Jitter, TimeWarp, Scaling, MagnitudeWarp, Flip 
 from preprocessing_utils.split import split_train_val_test
 
@@ -570,7 +570,13 @@ class PhysioDatasetSSL(Dataset):
         # 2. Masked Signal for MSR
         # Apply masking to the current_ppg_ecg_stacked
         current_ppg_ecg_tensor = torch.from_numpy(current_ppg_ecg_stacked)
-        masked_current_ppg_ecg, mask_indices = self._mask_signal(current_ppg_ecg_tensor, self.masking_ratio, masking_strategy='fixed_spans', num_spans=5)
+        masked_current_ppg_ecg, mask_indices = self._mask_signal(
+            current_ppg_ecg_tensor, 
+            self.masking_ratio, 
+            masking_strategy='physiological', 
+            min_span_length=5,
+            max_span_length=25
+            )
 
         # 3. Augmented Signals for SimCLR
         # Apply two different augmentations to the current_ppg_ecg_stacked
@@ -619,9 +625,9 @@ def parseargs():
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     # New arguments for self-supervised learning
-    parser.add_argument('--masking_ratio', default=0.15, type=float, help='Ratio of signal length to mask for MSR task')
+    parser.add_argument('--masking_ratio', default=0.08, type=float, help='Ratio of signal length to mask for MSR task')
     parser.add_argument('--augmentation_types', default='jitter,scaling,magnitude_warp,flip', type=str, help='Comma-separated list of augmentation types for SimCLR')
-    parser.add_argument('--aug_prob', default=0.2, type=float, help='Probability for each individual augmentation in RandomAugmentor')
+    parser.add_argument('--aug_prob', default=0.5, type=float, help='Probability for each individual augmentation in RandomAugmentor')
 
     args = parser.parse_args()
     return args

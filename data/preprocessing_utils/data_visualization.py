@@ -6,6 +6,7 @@ for folder in folders_to_add:
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import seaborn as sns
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from preprocessing_utils.signal_processing import compute_sp_dp
@@ -422,3 +423,114 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
     plt.legend(loc='upper right')
     plt.savefig(os.path.join(save_path, f'{title}.jpg'))
     plt.close()
+    
+
+def plot_subject_validity_over_time(subject_id, subject_windows, window_length, fs, savepath):
+    if not subject_windows:
+        print(f"No valid windows to plot for Subject {subject_id}.")
+        return
+
+    # Extract MAP, and validity flags
+    map_values = []
+    abp_validity = []
+    ppg_validity = []
+    ecg_validity = []
+
+    for window_data in subject_windows:
+        # Use raw ABP if available, otherwise just use a placeholder
+        current_abp = window_data['abp_raw']
+        if current_abp is not None and len(current_abp) > 0:
+            map_val = np.mean(current_abp) # Use Mean Arterial Pressure (MAP) for overall trend
+        else:
+            map_val = np.nan # Use NaN for invalid ABP windows
+
+        map_values.append(map_val)
+        abp_validity.append(window_data['abp_valid'])
+        ppg_validity.append(window_data['ppg_valid'])
+        ecg_validity.append(window_data['ecg_valid'])
+
+    num_windows = len(subject_windows)
+    time_axis = np.arange(num_windows) * window_length # Time in seconds
+
+    fig, ax = plt.subplots(figsize=(15, 6)) # Use ax for direct plotting
+    ax.plot(time_axis, map_values, label='Mean ABP (MAP)', color='black', alpha=0.7)
+    ax.set_xlabel('Time (seconds)')
+    ax.set_ylabel('Mean ABP (mmHg)')
+    ax.set_title(f'Subject S{subject_id} ABP and Signal Validity Over Time')
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    # Mark regions based on validity flags
+    current_region_type = None
+    current_region_start_idx = 0
+    current_region_type_color = None # Initialize color
+
+    # Define color map for regions
+    region_colors = {
+        'supervised': 'red',
+        'unlabeled': 'blue',
+        'invalid': 'gray',
+        'unknown': 'white'
+    }
+
+    for i in range(num_windows):
+        is_supervised = ppg_validity[i] and ecg_validity[i] and abp_validity[i]
+        is_unlabeled_candidate = ppg_validity[i] and ecg_validity[i] and not abp_validity[i]
+        is_invalid_input = not ppg_validity[i] or not ecg_validity[i]
+
+        if is_supervised:
+            region_type = 'supervised'
+        elif is_unlabeled_candidate:
+            region_type = 'unlabeled'
+        elif is_invalid_input:
+            region_type = 'invalid'
+        else: # Should not happen if logic is correct, but for safety
+            region_type = 'unknown'
+
+        if current_region_type is None:
+            current_region_type = region_type
+            current_region_start_idx = i
+            current_region_type_color = region_colors[region_type]
+        elif region_type != current_region_type:
+            # End of previous region, plot it
+            ax.axvspan(time_axis[current_region_start_idx], time_axis[i],
+                       facecolor=current_region_type_color, alpha=0.1)
+            current_region_type = region_type
+            current_region_start_idx = i
+            current_region_type_color = region_colors[region_type]
+
+    # Plot the last region
+    if current_region_type is not None:
+        ax.axvspan(time_axis[current_region_start_idx], time_axis[num_windows - 1] + window_length,
+                   facecolor=current_region_type_color, alpha=0.1)
+
+    # Custom legend for the shaded regions and the line plot
+    # Get handles and labels for existing plot elements (the MAP line)
+    handles, labels = ax.get_legend_handles_labels()
+
+    # Create dummy patches for the region types for the legend
+    legend_patches = [
+        Patch(facecolor='red', alpha=0.1, label='Supervised (PPG,ECG,ABP Valid)'),
+        Patch(facecolor='blue', alpha=0.1, label='Unlabeled (PPG,ECG Valid,ABP Invalid)'),
+        Patch(facecolor='gray', alpha=0.1, label='Invalid Input (PPG or ECG Invalid)')
+    ]
+
+    # Combine handles and labels. Filter out any duplicate labels if ax.axvspan also created labels
+    # We explicitly define the labels for the patches to avoid duplicates from axvspan
+    all_handles = handles + legend_patches
+    all_labels = labels + [patch.get_label() for patch in legend_patches]
+
+    # Create a new list of unique handles and labels in the desired order
+    unique_legend_elements = {}
+    for h, l in zip(all_handles, all_labels):
+        # Prioritize the explicitly defined patch labels if a key exists
+        if l not in unique_legend_elements:
+            unique_legend_elements[l] = h
+        # If the label already exists, ensure the handle is the one we prefer (e.g., the line vs. a small shaded region if there's overlap)
+        # For this case, line handles are typically added first from ax.get_legend_handles_labels()
+        # and then patches, so the line will be correctly picked for 'Mean ABP (MAP)'.
+
+    ax.legend(handles=list(unique_legend_elements.values()), labels=list(unique_legend_elements.keys()))
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(savepath, f'subject_{subject_id}_validity_plot.png'))
+    plt.close() # Close the figure to free up memory

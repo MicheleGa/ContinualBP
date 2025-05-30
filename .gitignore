@@ -12,7 +12,7 @@ attempts/
 data/lmdb/*
 data/raw_mimic_iii/*
 data/raw_vital_db/*
-data/old/
+data/data_logs/*
 
 # Checkpoints
 checkpoints/

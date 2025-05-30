@@ -179,51 +179,32 @@ def process_subject(subject_id, args, savepath, result_queue=None):
     window_length = args.window_length # seconds
     window_overlap = args.window_overlap # overlap in seconds
     
-    if len(subject_abps.shape) == 2:
-        # Each subject has 30 segments with the required signals
-        for segment in range(subject_abps.shape[0]):
-            
-            # Get annotation segment
-            abp = subject_abps[segment, :]
-            
-            # Get input signal segments
-            ppg = subject_ppgs[segment, :]
-            ecg = subject_ecgs[segment, :]
-            if args.resp:
-                resp = subject_resps[segment, :]
+    # Each subject has 30 segments with the required signals
+    for segment in range(subject_abps.shape[0]):
+        
+        # Get annotation segment
+        abp = subject_abps[segment, :]
+        
+        # Get input signal segments
+        ppg = subject_ppgs[segment, :]
+        ecg = subject_ecgs[segment, :]
+        if args.resp:
+            resp = subject_resps[segment, :]
 
-            process_windows(
-                abp=abp,
-                ppg=ppg,
-                ecg=ecg,
-                resp=resp if args.resp else None,
-                subject_id=subject_id,
-                subject_data=subject_data,
-                segment=segment,
-                fs=fs,
-                window_length=window_length,
-                window_overlap=window_overlap,
-                args=args,
-                savepath=savepath
-            )
-    elif len(subject_abps.shape) == 1:
-        # Each subject has 1 segment with the required signals
         process_windows(
-                abp=subject_abps,
-                ppg=subject_ppgs,
-                ecg=subject_ecgs,
-                resp=subject_resps if args.resp else None,
-                subject_id=subject_id,
-                subject_data=subject_data,
-                segment=0,
-                fs=fs,
-                window_length=window_length,
-                window_overlap=window_overlap,
-                args=args,
-                savepath=savepath
-            )
-    else:
-        raise ValueError(f"Invalid number of segments for subject {subject_id}: {len(subject_abps)}")
+            abp=abp,
+            ppg=ppg,
+            ecg=ecg,
+            resp=resp if args.resp else None,
+            subject_id=subject_id,
+            subject_data=subject_data,
+            segment=segment,
+            fs=fs,
+            window_length=window_length,
+            window_overlap=window_overlap,
+            args=args,
+            savepath=savepath
+        )
     
     print(f'Completed {subject_id}')
     result_queue.put((int(subject_id[1:]), subject_data)) # subject id is integer

@@ -189,8 +189,13 @@ def compute_sp_dp(sig, fs=125):
         two flags indicating if the peaks were adjusted, and the indices of the peaks and valleys.    
     """
     sig = sig.astype(np.float64) # Extremely important for Pyampd !!!
-    peaks = find_peaks(sig, fs)
-    valleys = find_peaks(-sig, fs)
+    
+    try:
+        # Can raise error for very malformed waveforms
+        peaks = find_peaks(sig, fs)
+        valleys = find_peaks(-sig, fs)
+    except:
+        return -1, -1, [], []
     
     if len(peaks) == 0 or len(valleys) == 0:
         print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
