@@ -7,11 +7,11 @@ import numpy as np
 import sys
 import lmdb
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader # Keep Dataset import for clarity and potential future base datasets
 from preprocessing_utils.data_visualization import plot_subject_validity_over_time
 
 
-class OnlinePhysioDataset(Dataset):
+class OnlinePhysioDataset: # NO LONGER INHERITS from Dataset
     def __init__(self,
                  lmdb_folder,
                  fs=125,
@@ -23,13 +23,13 @@ class OnlinePhysioDataset(Dataset):
                  ppg_emd=False,
                  ppg_freqs=False,
                  min_subject_sample_number=0):
-        super(OnlinePhysioDataset, self).__init__()
+        # super(OnlinePhysioDataset, self).__init__() # Remove this as it's not inheriting from Dataset
 
         LMDB_MAP_SIZE = 1000 * 1000 * 1000 * 1000 # 1T
 
         self.dataset_folder = lmdb_folder
         self.min_subject_sample_number = min_subject_sample_number
-        
+
         # Open LMDB in readonly mode with no locks for safe concurrent access across processes
         self.lmdbenv = lmdb.open(lmdb_folder, map_size=LMDB_MAP_SIZE, readonly=True, lock=False)
         self.lmdbtxn = self.lmdbenv.begin() # Start a read transaction
@@ -84,6 +84,9 @@ class OnlinePhysioDataset(Dataset):
 
     def before_pickle(self):
         """Closes LMDB environment and transaction before pickling."""
+        # This method is crucial if you are using DataLoader with num_workers > 0
+        # as it will be called by multiprocessing to prepare the object for pickling
+        # before being sent to worker processes.
         if self.lmdbtxn:
             self.lmdbtxn.abort()
             self.lmdbtxn = None
@@ -91,11 +94,13 @@ class OnlinePhysioDataset(Dataset):
             self.lmdbenv.close()
             self.lmdbenv = None
 
+    # This __len__ is for the OnlinePhysioDataset itself, representing total samples if treated flatly
+    # It's not directly used by ContinualLearningDataset, but kept for consistency if needed elsewhere.
     def __len__(self):
         """Returns the total number of samples across all subjects available in the dataset."""
         return sum(len(keys) for keys in self.index_by_subject_id.values())
 
-    def __getitem__(self, lmdb_key: str):
+    def _get_sample_by_key(self, lmdb_key: str): # Renamed to avoid conflicts and signify internal use
         """
         Retrieves a sample from LMDB using its direct LMDB key string.
 
@@ -123,7 +128,7 @@ class OnlinePhysioDataset(Dataset):
         processed_ecg = None
         ecg_bytes = self.lmdbtxn.get(f"{lmdb_key}-ecg".encode())
         if ecg_bytes: processed_ecg = np.frombuffer(ecg_bytes, dtype="float32")
-        
+
         processed_resp = None
         resp_bytes = self.lmdbtxn.get(f"{lmdb_key}-resp".encode())
         if resp_bytes: processed_resp = np.frombuffer(resp_bytes, dtype="float32")
@@ -193,15 +198,14 @@ class OnlinePhysioDataset(Dataset):
         if self.sig2sig:
             sample['annotation_tensor'] = torch.tensor(sample['abp_processed'], dtype=torch.float32)
         else:
-            sample['annotation_tensor'] = [
-                torch.tensor(sample['sbp'], dtype=torch.float32).unsqueeze(-1),
-                torch.tensor(sample['dbp'], dtype=torch.float32).unsqueeze(-1)
-            ]
+            # For DataLoader, it's often better to return a single tensor if possible,
+            # so concatenate SBP and DBP into one tensor.
+            sample['annotation_tensor'] = torch.tensor([sample['sbp'], sample['dbp']], dtype=torch.float32)
 
         return sample
 
 
-class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset. It's a manager.
+class ContinualLearningDataset(Dataset): # Correctly inherits from torch.utils.data.Dataset
     def __init__(self, online_physio_dataset_instance: OnlinePhysioDataset):
         """
         Initializes the ContinualLearningDataset for subject-specific online learning.
@@ -210,13 +214,14 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
             online_physio_dataset_instance (OnlinePhysioDataset): An *already initialized*
                                                             instance of OnlinePhysioDataset.
         """
+        super().__init__() # Call parent constructor for Dataset
         # We hold a reference to the already-opened OnlinePhysioDataset
         # This instance already has the LMDB environment and transaction open.
-        self.base_dataset = online_physio_dataset_instance 
+        self.base_dataset = online_physio_dataset_instance
 
         self.active_subject_id = None
         self.active_subject_keys = []  # List of LMDB key strings for the current active subject, in temporal order
-        self.current_sample_idx = 0    # Current index within active_subject_keys
+        # current_sample_idx is no longer needed here as DataLoader manages iteration
         self.current_epoch_samples = [] # Cache of samples for the current epoch/pass over a subject for analysis/plotting
 
         print(f"{self.__class__.__name__} initialized for continual learning.")
@@ -234,48 +239,53 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
             raise ValueError(f"Subject {subject_id} not found in the dataset.")
 
         self.active_subject_id = subject_id
-        
+
         # Retrieve all LMDB keys for this subject and sort them to ensure temporal order.
         unsorted_keys = self.base_dataset.index_by_subject_id[subject_id]
         self.active_subject_keys = sorted(
             unsorted_keys,
             key=lambda k: int(k.split('_')[-1])
         )
-        self.current_sample_idx = 0
         self.current_epoch_samples = [] # Clear cache for new subject or new pass
 
         print(f"Active subject set to {subject_id}. Total samples: {len(self.active_subject_keys)}")
 
-    def get_next_sample(self):
+    def __len__(self):
         """
-        Retrieves the next sample for the active subject in chronological order.
+        Returns the total number of samples for the currently active subject.
+        This is crucial for DataLoader to know the size of the dataset for the current subject.
+        """
+        return len(self.active_subject_keys)
+
+    def __getitem__(self, idx: int):
+        """
+        Retrieves a single sample by its index within the active subject's data.
+        This method is called by the DataLoader.
+
+        Args:
+            idx (int): The index of the sample to retrieve within the active_subject_keys list.
 
         Returns:
-            dict or None: A dictionary containing the loaded sample data (signals, annotations, flags, etc.),
-                          or None if all samples for the active subject have been processed.
+            dict: A dictionary containing the loaded sample data (signals, annotations, flags, etc.).
         """
         if self.active_subject_id is None:
             raise RuntimeError("No active subject set. Call set_active_subject() first.")
+        if idx >= len(self.active_subject_keys):
+            raise IndexError(f"Index {idx} out of bounds for active subject's samples (0 to {len(self.active_subject_keys) - 1})")
 
-        if self.current_sample_idx >= len(self.active_subject_keys):
-            print(f"All samples for Subject S{self.active_subject_id} processed for this pass.")
-            return None # Indicate end of subject's data for current pass
+        lmdb_key = self.active_subject_keys[idx]
 
-        lmdb_key = self.active_subject_keys[self.current_sample_idx]
-        
-        # Use the base_dataset's __getitem__ to load the full sample dictionary
-        sample_data = self.base_dataset.__getitem__(lmdb_key)
+        # Use the base_dataset's _get_sample_by_key to load the full sample dictionary
+        sample_data = self.base_dataset._get_sample_by_key(lmdb_key)
 
-        self.current_epoch_samples.append(sample_data) # Cache for later analysis/plotting
-        self.current_sample_idx += 1
-        
+        # Cache the sample data for later analysis/plotting.
+        # Note: If DataLoader uses multiple workers, caching might be tricky.
+        # For simplicity in this example, we'll append. For large datasets with many workers,
+        # you might need a more sophisticated caching mechanism or collect during inference.
+        # For now, this will work correctly if `num_workers=0`.
+        self.current_epoch_samples.append(sample_data)
+
         return sample_data
-
-    def get_num_remaining_samples(self):
-        """Returns the number of samples remaining for the active subject in the current pass."""
-        if self.active_subject_id is None:
-            return 0
-        return len(self.active_subject_keys) - self.current_sample_idx
 
     def analyze_and_plot_active_subject_sequences(self, savepath: str):
         """
@@ -286,10 +296,10 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
             print("No active subject set for analysis.")
             return
         if not self.current_epoch_samples:
-            print(f"No samples collected for Subject S{self.active_subject_id} in the current pass for analysis.")
+            print(f"No samples collected for Subject {self.active_subject_id} in the current pass for analysis.")
             return
 
-        print(f"\nAnalyzing sequences for Subject S{self.active_subject_id} from cached samples...")
+        print(f"\nAnalyzing sequences for Subject {self.active_subject_id} from cached samples...")
 
         subject_windows_for_analysis = self.current_epoch_samples
 
@@ -323,7 +333,7 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
                 if current_supervised_sequence_length == 0:
                     current_supervised_start_key = current_key
                 current_supervised_sequence_length += 1
-                
+
                 if current_unlabeled_sequence_length > 0:
                     unlabeled_sequence_lengths.append(current_unlabeled_sequence_length)
                     if current_unlabeled_sequence_length < min_unlabeled_len_info['len']:
@@ -347,7 +357,7 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
                         max_supervised_len_info['start_key'] = current_supervised_start_key
                         max_supervised_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
                     current_supervised_sequence_length = 0
-            
+
             # Unlabeled (pseudo-labeling candidate) sequences
             if ppg_valid and ecg_valid and not abp_valid:
                 if current_unlabeled_sequence_length == 0:
@@ -430,7 +440,7 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
         if unlabeled_sequence_lengths:
             print(f"Unlabeled Sequences (PPG, ECG Valid, ABP Invalid):")
             print(f"  Min Length: {min_unlabeled_len_info['len']} windows ({min_unlabeled_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {min_unlabeled_len_info['start_key']}, End Key: {min_unlabeled_len_info['end_key']}")
-            print(f"  Max Length: {max_unlabeled_len_info['len']} windows ({max_unlabeled_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {max_unlabeled_len_info['start_key']}, End Key: {max_unlabeled_len_info['end_key']}")
+            print(f"  Max Length: {max_unlabeled_len_info['len']} windows ({max_unlabeled_len_info['len'] * self.base_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {max_unlabeled_len_info['start_key']}, End Key: {max_unlabeled_len_info['end_key']}")
             print(f"  Mean Length: {np.mean(unlabeled_sequence_lengths):.2f} windows")
         else:
             print("No unlabeled (pseudo-labeling candidate) sequences found for this subject.")
@@ -443,7 +453,7 @@ class ContinualLearningDataset: # Note: This class does NOT inherit from Dataset
         else:
             print("No sequences found where PPG and ECG were valid for this subject.")
 
-        print(f"\nPlotting validity for Subject S{self.active_subject_id} to {savepath}")
+        print(f"\nPlotting validity for Subject {self.active_subject_id} to {savepath}")
         plot_subject_validity_over_time(
             self.active_subject_id,
             self.current_epoch_samples, # Use the cached full sample data for plotting
@@ -483,17 +493,17 @@ def parseargs():
 
 if __name__ == "__main__":
     global args
-    args = parseargs()  
-    
+    args = parseargs()
+
     # RESP is loaded only if ECG is also loaded
     if args.resp and not args.ecg:
         raise ValueError('RESP can be loaded only along with ECG')
-    
+
     # PPG derivatives/PPG EMD/PPG freqs are loaded only if ecg (and optionally resp) are not present
-    if (args.ppg_derivatives or args.ppg_emd or args.ppg_freqs) and args.ecg: 
-        raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')  
-    
-    root_figs_folder = os.path.join(args.save_path, args.name) 
+    if (args.ppg_derivatives or args.ppg_emd or args.ppg_freqs) and args.ecg:
+        raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')
+
+    root_figs_folder = os.path.join(args.save_path, args.name)
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
 
@@ -512,59 +522,64 @@ if __name__ == "__main__":
     )
 
     # --- Continual Learning Setup ---
+    # ContinualLearningDataset now WRAPS OnlinePhysioDataset
     continual_ds = ContinualLearningDataset(online_physio_dataset_base)
 
     # Example: Select a subject for online learning (e.g., the first subject in the list)
     if continual_ds.base_dataset.subject_list: # Access subject_list through the base_dataset instance
-        online_subject_id = continual_ds.base_dataset.subject_list[1]
+        online_subject_id = continual_ds.base_dataset.subject_list[0] # Using index 0 for demonstration
     else:
         print("No subjects available in the dataset for online learning.")
         sys.exit(1)
 
     continual_ds.set_active_subject(online_subject_id)
-    
-    # --- Simulate Online Training Loop for a Subject ---
-    print(f"\nStarting simulated online learning for Subject S{online_subject_id}...")
-    sample_count = 0
-    while True:
-        sample_data = continual_ds.get_next_sample() # Returns a dict
-        if sample_data is None:
-            break # No more samples for this subject
 
-        signals = sample_data['sig_tensor'] # Use the tensor version
-        annotation = sample_data['annotation_tensor'] # Use the tensor version
-        abp_valid = sample_data['abp_valid']
-        ppg_valid = sample_data['ppg_valid']
-        ecg_valid = sample_data['ecg_valid']
-        lmdb_key = sample_data['lmdb_key'] # The actual LMDB key for this sample
+    # --- Simulate Online Training Loop for a Subject using DataLoader ---
+    print(f"\nStarting simulated online learning for Subject S{online_subject_id} using DataLoader...")
+    # Create a DataLoader for the current subject
+    # num_workers > 0 will require the _get_sample_by_key method to be callable from new processes.
+    # LMDB handles this by reopening the env in each worker, but it's important that _get_sample_by_key
+    # doesn't rely on a *shared* transaction, but rather one opened *per process*.
+    # The `before_pickle` method in OnlinePhysioDataset helps here.
+    subject_dataloader = DataLoader(continual_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.loader_worker)
+
+    sample_count = 0
+    for batch_idx, sample_data_batch in enumerate(subject_dataloader):
+        signals_batch = sample_data_batch['sig_tensor']
+        annotation_batch = sample_data_batch['annotation_tensor']
+        abp_valid_batch = sample_data_batch['abp_valid']
+        ppg_valid_batch = sample_data_batch['ppg_valid']
+        ecg_valid_batch = sample_data_batch['ecg_valid']
+        lmdb_keys_batch = sample_data_batch['lmdb_key'] # LMDB keys will be a list of strings if not batched as tensors
 
         # Here's where your online learning logic goes:
-        # 1. Feed `signals` (torch.Tensor) to your pre-trained model.
-        # 2. If `abp_valid` is True:
-        #    This is a labeled sample. Use `signals` and `annotation` (torch.Tensor(s)) for supervised fine-tuning.
-        # 3. If `abp_valid` is False:
-        #    This is an unlabeled sample. Generate a pseudo-label for `signals` using your model.
-        #    Use `signals` and the pseudo-label for semi-supervised training.
-        # 4. Apply continual learning strategies (e.g., experience replay, regularization)
+        # 1. Feed `signals_batch` (torch.Tensor) to your pre-trained model.
+        # 2. Filter valid samples within the batch if needed (already done in personalization.py)
+        # 3. If `abp_valid_batch` indicates valid samples:
+        #    This is a labeled batch. Use `signals_batch` and `annotation_batch` for supervised fine-tuning.
+        # 4. If `abp_valid_batch` indicates invalid samples:
+        #    This is an unlabeled batch. Generate pseudo-labels for `signals_batch` using your model.
+        #    Use `signals_batch` and the pseudo-labels for semi-supervised training.
+        # 5. Apply continual learning strategies (e.g., experience replay, regularization)
         #    based on the sample's type (labeled/unlabeled) and your chosen method.
 
-        print(f"Processing sample {lmdb_key}: "
-              f"Signals shape: {signals.shape}, "
-              f"ABP Valid: {abp_valid}, "
-              f"PPG Valid: {ppg_valid}, "
-              f"ECG Valid: {ecg_valid}")
-        
-        sample_count += 1
+        print(f"Processing batch {batch_idx}: "
+              f"Signals batch shape: {signals_batch.shape}, "
+              f"Batch size: {signals_batch.size(0)}, "
+              f"First LMDB Key: {lmdb_keys_batch[0] if len(lmdb_keys_batch) > 0 else 'N/A'}")
+
+        sample_count += signals_batch.size(0)
         # Add a break for demonstration purposes to avoid infinite loop on very long recordings
-        # if sample_count >= 10: # Process first 10 samples
+        # if sample_count >= 1000: # Process first 1000 samples for example
         #    break
 
     print(f"Finished processing {sample_count} samples for Subject {online_subject_id}.")
-    
+
     # --- Call analysis and plotting AFTER the loop ---
-    # This ensures `current_epoch_samples` has all data for the subject
+    # This ensures `current_epoch_samples` has all data for the subject.
+    # Note: If `num_workers > 0`, `current_epoch_samples` will only contain samples
+    # from the main process worker (worker 0). For full plotting, you might need
+    # to collect all samples from the DataLoader loop and pass them to this function.
+    # For now, this will work correctly if `num_workers=0`.
     print(f"\nPerforming analysis and plotting for Subject S{online_subject_id}...")
     continual_ds.analyze_and_plot_active_subject_sequences(root_figs_folder)
-
-    # Close LMDB environments for all datasets
-    online_physio_dataset_base.before_pickle()

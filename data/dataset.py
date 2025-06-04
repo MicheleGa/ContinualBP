@@ -380,14 +380,14 @@ if __name__ == "__main__":
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
-    calculate_dataloaders_mean_std(
-        dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-        dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-        savepath=root_figs_folder) 
-    calculate_personalization_subjects_mean_std(
-        dataset=dataset, 
-        args=args, 
-        savepath=root_figs_folder) 
+    #calculate_dataloaders_mean_std(
+    #    dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+    #    dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+    #    savepath=root_figs_folder) 
+    #calculate_personalization_subjects_mean_std(
+    #    dataset=dataset, 
+    #    args=args, 
+    #    savepath=root_figs_folder) 
 
     input_batch = next(iter(train_dataloader))
     sig = input_batch[0]

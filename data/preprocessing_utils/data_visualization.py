@@ -397,7 +397,7 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
     # Seconds on the x-axis, amplitude on the y-axis
     t = np.arange(0, (len(signal) / fs), 1.0 / fs)
     
-    plt.figure(figsize=(10, 6))  # Adjust figure size as needed
+    plt.figure(figsize=(12, 4))  # Adjust figure size as needed
     plt.title(f'{title}')
     plt.xlabel('s')
     plt.ylabel('mmHg')
@@ -456,7 +456,7 @@ def plot_subject_validity_over_time(subject_id, subject_windows, window_length, 
     ax.plot(time_axis, map_values, label='Mean ABP (MAP)', color='black', alpha=0.7)
     ax.set_xlabel('Time (seconds)')
     ax.set_ylabel('Mean ABP (mmHg)')
-    ax.set_title(f'Subject S{subject_id} ABP and Signal Validity Over Time')
+    ax.set_title(f'Subject {subject_id} ABP and Signal Validity Over Time')
     ax.grid(True, linestyle='--', alpha=0.6)
 
     # Mark regions based on validity flags
@@ -466,9 +466,9 @@ def plot_subject_validity_over_time(subject_id, subject_windows, window_length, 
 
     # Define color map for regions
     region_colors = {
-        'supervised': 'red',
+        'supervised': 'green',
         'unlabeled': 'blue',
-        'invalid': 'gray',
+        'invalid': 'red',
         'unknown': 'white'
     }
 
@@ -509,9 +509,9 @@ def plot_subject_validity_over_time(subject_id, subject_windows, window_length, 
 
     # Create dummy patches for the region types for the legend
     legend_patches = [
-        Patch(facecolor='red', alpha=0.1, label='Supervised (PPG,ECG,ABP Valid)'),
+        Patch(facecolor='green', alpha=0.1, label='Supervised (PPG,ECG,ABP Valid)'),
         Patch(facecolor='blue', alpha=0.1, label='Unlabeled (PPG,ECG Valid,ABP Invalid)'),
-        Patch(facecolor='gray', alpha=0.1, label='Invalid Input (PPG or ECG Invalid)')
+        Patch(facecolor='red', alpha=0.1, label='Invalid Input (PPG or ECG Invalid)')
     ]
 
     # Combine handles and labels. Filter out any duplicate labels if ax.axvspan also created labels

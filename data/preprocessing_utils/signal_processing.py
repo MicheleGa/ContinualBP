@@ -168,7 +168,7 @@ def create_windows(win_len, fs, n_samp, overlap):
     return idx_start, idx_stop
 
     
-def compute_sp_dp(sig, fs=125):
+def compute_sp_dp(sig, fs=125, verbose=False):
     r"""
     Computes the systolic peak (SP) and diastolic peak (DP) of a signal (e.g. ABP).
     Source: https://github.com/inventec-ai-center/bp-benchmark/blob/main/code/train/core/utils.py#L174
@@ -198,36 +198,42 @@ def compute_sp_dp(sig, fs=125):
         return -1, -1, [], []
     
     if len(peaks) == 0 or len(valleys) == 0:
-        print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
+        if verbose:
+            print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
         return -1, -1, [], []
     
     ### Remove first or last if equal to 0 or len(sig)-1
     if peaks[0] == 0:
         peaks = peaks[1:]    
         if len(peaks) == 0:
-            print('Error during peaks/valleys processing: no peaks found in the signal.')
+            if verbose:
+                print('Error during peaks/valleys processing: no peaks found in the signal.')
             return -1, -1, [], []
             
     if valleys[0] == 0:
         valleys = valleys[1:]
         if len(valleys) == 0:
-            print('Error during peaks/valleys processing: no valleys found in the signal.')
+            if verbose:
+                print('Error during peaks/valleys processing: no valleys found in the signal.')
             return -1, -1, [], []
     
     if peaks[-1] == len(sig)-1:
         peaks = peaks[:-1]
         if len(peaks) == 0:
-            print('Error during peaks/valleys processing: no peaks found in the signal.')
+            if verbose:
+                print('Error during peaks/valleys processing: no peaks found in the signal.')
             return -1, -1, [], []
     
     if valleys[-1] == len(sig)-1:
         valleys = valleys[:-1]
         if len(valleys) == 0:
-            print('Error during peaks/valleys processing: no valleys found in the signal.')
+            if verbose:
+                print('Error during peaks/valleys processing: no valleys found in the signal.')
             return -1, -1, [], []
         
     if len(peaks) == 0 or len(valleys) == 0:
-        print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
+        if verbose:
+            print('Error during peaks/valleys processing: no peaks or valleys found in the signal.')
         return -1, -1, [], []
     else:
         sig = sig.astype(np.float32)  # Extremely important for Pyampd !!! This is why we are casting here
@@ -307,7 +313,7 @@ def align_pair(abp, raw_ppg, windowing_time, fs):
     return a_abp, a_rppg, shift-window_size
 
 
-def autocorrelation_filter(ppg_signal, threshold=0.7, plot=False, title='Autocorrelation Filter', savepath='./figs'):
+def autocorrelation_filter(ppg_signal, threshold=0.7, verbose=False, plot=False, title='Autocorrelation Filter', savepath='./figs'):
     """
     Applies an autocorrelation filter to discard invalid PPG signals.
 
@@ -339,7 +345,8 @@ def autocorrelation_filter(ppg_signal, threshold=0.7, plot=False, title='Autocor
         max_autocorr = np.max(autocorr[peaks])
         is_valid = max_autocorr >= threshold
     except:
-        print('Error during autocorrelation filtering: empty autocorrelation or no peaks detected in the autocorrelation')
+        if verbose:
+            print('Error during autocorrelation filtering: empty autocorrelation or no peaks detected in the autocorrelation')
         return False
 
     if plot:

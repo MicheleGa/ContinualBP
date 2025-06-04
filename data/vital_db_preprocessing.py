@@ -50,12 +50,45 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data_list, segment,
         dbp = -1.0
 
         # 1. ABP Validity Check
-        temp_sbp, temp_dbp, peaks, valleys = compute_sp_dp(sig=window_abp, fs=fs)
-        if temp_sbp > 0 and temp_dbp > 0 and len(peaks) > 0 and len(valleys) > 0:
-            abp_valid = True
-            sbp = float(temp_sbp)
-            dbp = float(temp_dbp)
-            processed_abp = window_abp.astype(np.float32)
+        # Define filtering criteria based on https://www.nature.com/articles/s41597-024-04041-1
+        if window_abp.max() <= 200 and window_abp.min() >= 30:  
+            temp_sbp, temp_dbp, peaks, valleys = compute_sp_dp(sig=window_abp, fs=fs)
+            if temp_sbp > 0 and temp_dbp > 0 and len(peaks) > 0 and len(valleys) > 0:
+                # Calculate pulse pressure
+                pulse_pressure = temp_sbp - temp_dbp
+                
+                # 1. Maximum and minimum blood pressure boundaries (200 and 30 mmHg)
+                bp_within_extreme_bounds = (30 <= temp_sbp <= 200) and (30 <= temp_dbp <= 200)
+                
+                # 2. Systolic blood pressure should not be inferior to 60 mmHg
+                sbp_above_minimum = temp_sbp >= 60
+                
+                # 3. Diastolic blood pressure should not exceed 120 mmHg
+                dbp_below_maximum = temp_dbp <= 120
+                
+                # 4. Pulse pressure constraints
+                # - Should not be superior to 100 mmHg (high pulse pressure reference)
+                # - Should not be inferior to narrow pulse pressure (quarter of SBP value)
+                narrow_pulse_pressure = temp_sbp / 4
+                pulse_pressure_valid = (narrow_pulse_pressure <= pulse_pressure <= 100)
+                
+                # Apply all filtering criteria
+                abp_is_valid = (bp_within_extreme_bounds and 
+                                sbp_above_minimum and 
+                                dbp_below_maximum and 
+                                pulse_pressure_valid)
+                
+                if abp_is_valid:
+                    abp_valid = True
+                    sbp = float(temp_sbp)
+                    dbp = float(temp_dbp)
+                    processed_abp = window_abp.astype(np.float32)
+                else:
+                    abp_valid = False
+            else:
+                abp_valid = False
+        else:
+                abp_valid = False
         
         # 2. PPG and ECG Validity Check using Autocorrelation Filter
         ppg_is_valid = autocorrelation_filter(window_ppg)
@@ -63,13 +96,9 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data_list, segment,
 
         if ppg_is_valid:
             ppg_valid = True
-        else:
-            print(f"\t{subject_id}|{j + 1} of {n_win} - PPG signal invalid for {subject_id}, in segment {segment}, window {j} [{idx_start}:{idx_stop}]")
 
         if ecg_is_valid:
             ecg_valid = True
-        else:
-            print(f"\t{subject_id}|{j + 1} of {n_win} - ECG signal invalid for {subject_id}, in segment {segment}, window {j} [{idx_start}:{idx_stop}]")
 
         # --- Conditional Preprocessing based on signal validity ---
         if ppg_valid and ecg_valid:

@@ -110,8 +110,8 @@ class Identity(object):
 class RandomAugmentor(object):
     r"""Random data augmentations.
 
-    This class applies a set of random augmentations to the input data based on
-    their probabilities.
+    This class applies multiple augmentations independently to the input data, 
+    each with their own probability.
 
     
         augments (list of augment class):
@@ -119,11 +119,11 @@ class RandomAugmentor(object):
 
     Example:
         >>> augments_cfg = [
-                Jitter(prob=0.2),
-                Scaling(prob=0.2),
-                Flip(prob=0.2),
-                MagnitudeWarp(prob=0.2),
-                TimeWarp(prob=0.2)
+                Jitter(prob=0.5),
+                Scaling(prob=0.5),
+                Flip(prob=0.5),
+                MagnitudeWarp(prob=0.5),
+                TimeWarp(prob=0.5)
             ]
         >>> augments = RandomAugmentor(augments_cfg)
         >>> sig = torch.randn(256, 125, 1)
@@ -132,29 +132,15 @@ class RandomAugmentor(object):
 
     def __init__(self, augments):
         super(RandomAugmentor, self).__init__()
-
         self.augments = augments
-        self.augment_probs = [aug.prob for aug in self.augments]
-
-        has_identity = any([isinstance(aug, Identity) for aug in self.augments])
-        if has_identity:
-            assert sum(self.augment_probs) == 1.0, \
-                'The sum of augmentation probabilities should equal to 1,' \
-                ' but got {:.2f}'.format(sum(self.augment_probs))
-        else:
-            assert sum(self.augment_probs) <= 1.0, \
-                'The sum of augmentation probabilities should be less than or ' \
-                'equal to 1, but got {:.2f}'.format(sum(self.augment_probs))
-            identity_prob = 1 - sum(self.augment_probs)
-            if identity_prob > 0:
-                self.augments += [Identity(prob=identity_prob)]
-                self.augment_probs += [identity_prob]
 
     def __call__(self, inputs):
         if len(inputs.shape) == 1:
             inputs = inputs.unsqueeze(0)
         if len(inputs.shape) == 2:
             inputs = inputs.unsqueeze(-1)
-        random_state = np.random.RandomState(random.randint(0, 2**32 - 1))
-        aug = random_state.choice(self.augments, p=self.augment_probs)
-        return aug(inputs)
+            
+        result = inputs
+        for aug in self.augments:
+            result = aug(result)
+        return result

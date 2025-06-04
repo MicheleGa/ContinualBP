@@ -1,9 +1,11 @@
-Dataset folder: ./data/lmdb
-Checkpoint folder: ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19
-Tensorboard folder: ./tensorboard/unet/unet-UNet-2025_05_28-23_19_19
-Figure folder: ./tensorboard/unet/unet-UNet-2025_05_28-23_19_19
+Dataset folder: ./data/lmdb/mimic_iii
+Checkpoint folder: ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41
+Tensorboard folder: ./tensorboard/unet/unet-UNet-2025_06_02-10_23_41
+Figure folder: ./tensorboard/unet/unet-UNet-2025_06_02-10_23_41
 Configuration for the run:
-{'aug': False,
+{'attention_type': 'self_attention',
+ 'aug_prob': 0.5,
+ 'augmentation_types': 'jitter,scaling,magnitude_warp,flip',
  'batch_size': 128,
  'bidirectional': True,
  'channels': '32, '
@@ -11,7 +13,7 @@ Configuration for the run:
              '128, '
              '256, '
              '512',
- 'checkpoint_path': './checkpoints/unet/unet-UNet-2025_05_28-23_19_19',
+ 'checkpoint_path': './checkpoints/unet/unet-UNet-2025_06_02-10_23_41',
  'criterion': 'SmoothL1Loss',
  'dataset_folder': './data/lmdb',
  'dataset_name': 'mimic_iii',
@@ -25,7 +27,7 @@ Configuration for the run:
  'es_patience': 10,
  'eval_every_n_epochs': 1,
  'expname': 'unet',
- 'figure_path': './figs/unet/unet-UNet-2025_05_28-23_19_19',
+ 'figure_path': './figs/unet/unet-UNet-2025_06_02-10_23_41',
  'fold': 0,
  'fs': 125,
  'gpu': '0',
@@ -34,12 +36,13 @@ Configuration for the run:
  'kernel_size': 3,
  'l2norm': 0.001,
  'lambda_contrastive': 0.0,
+ 'lambda_cwg': 0.0,
+ 'lambda_msr': 0.0,
  'lambda_ortho': 0.0,
  'lambda_supervised': 1.0,
  'loader_worker': 4,
+ 'lp_dataset_name': 'test',
  'lr': 0.001,
- 'lr_linear_probe': 0.0005,
- 'lr_personalization': 0.0005,
  'lr_scheduler_enable': True,
  'lr_scheduler_min_lr': 0.0001,
  'lr_scheduler_type': 'ExponentialLR',
@@ -50,6 +53,8 @@ Configuration for the run:
                  '15, '
                  '20, '
                  '40',
+ 'masking_ratio': 0.08,
+ 'max_lp_training_epochs': 75,
  'max_training_epochs': 50,
  'mix_pretraining_subject_samples': True,
  'model': 'models.UNet',
@@ -63,19 +68,20 @@ Configuration for the run:
  'ppg_derivatives': False,
  'ppg_emd': False,
  'ppg_freqs': False,
+ 'pretrained_model_checkpoint': './checkpoints',
  'pretraining_ratio': 0.8,
  'pretraining_tr_val_tt_split_ratio': '0.7,0.1,0.2',
  'proj_head_dim': 256,
+ 'proj_hidden_dim': 512,
  'resp': False,
  'resume': '',
- 'return_embedding': False,
  'seed': 42,
- 'set_tunable_params': 'all',
  'sgd_momentum': 0.9,
  'sig2sig': True,
  'smoothl1loss_beta': 5,
+ 'ssl': False,
  'temperature': 0.0,
- 'tensorboard_path': './tensorboard/unet/unet-UNet-2025_05_28-23_19_19'}
+ 'tensorboard_path': './tensorboard/unet/unet-UNet-2025_06_02-10_23_41'}
 PhysioDataset initialized with following configuration:
 {'Pretraining Ratio': 0.8,
  'Samples': 594333,
@@ -87,120 +93,114 @@ Pretraining train/val/test sets samples are sampled from the same subject set
                                        'Valid': 47536}}
 Trainable parameters: 5098529 / 5098529 (100.00%)
 Non-trainable parameters: 0 / 5098529 (0.00%)
-Epoch 1/50 - Train Loss 12.3846549992493, Val Loss 9.483655821711316
-Epoch 0 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 2/50 - Train Loss 8.929910070109397, Val Loss 8.261270388574642
-Epoch 1 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 3/50 - Train Loss 7.649171897987228, Val Loss 7.191697533786277
-Epoch 2 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 4/50 - Train Loss 6.697081466448631, Val Loss 6.387715403538527
-Epoch 3 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 5/50 - Train Loss 6.046501451241203, Val Loss 5.993023902067469
-Epoch 4 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 6/50 - Train Loss 5.568097434697445, Val Loss 5.5117971063342335
-Epoch 5 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 7/50 - Train Loss 5.225373994389538, Val Loss 5.377526709384205
-Epoch 6 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 8/50 - Train Loss 4.958041173137825, Val Loss 5.064815552858181
-Epoch 7 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 9/50 - Train Loss 4.743539006669142, Val Loss 4.7895664631096615
-Epoch 8 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 10/50 - Train Loss 4.561861266250718, Val Loss 4.784736385332619
-Epoch 9 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 11/50 - Train Loss 4.408018695280365, Val Loss 4.572700917620484
-Epoch 10 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 12/50 - Train Loss 4.271803779291391, Val Loss 4.5025971592255045
-Epoch 11 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 13/50 - Train Loss 4.143505082447254, Val Loss 4.3969215565119395
-Epoch 12 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 14/50 - Train Loss 4.03516767792258, Val Loss 4.306985978043389
-Epoch 13 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 15/50 - Train Loss 3.9279230751297587, Val Loss 4.214533038670589
-Epoch 14 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 16/50 - Train Loss 3.8378801238039966, Val Loss 4.110797517751451
-Epoch 15 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 17/50 - Train Loss 3.742957608642553, Val Loss 4.167442722940076
-Epoch 18/50 - Train Loss 3.6663119497668033, Val Loss 3.9907412784182235
-Epoch 17 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 19/50 - Train Loss 3.5880108716371315, Val Loss 3.919317972375182
-Epoch 18 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 20/50 - Train Loss 3.513131126271463, Val Loss 3.90842785156363
-Epoch 19 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 21/50 - Train Loss 3.449762274966266, Val Loss 3.8075392057662136
-Epoch 20 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 22/50 - Train Loss 3.3763228149602065, Val Loss 3.7885419061712766
-Epoch 21 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 23/50 - Train Loss 3.3164197583279793, Val Loss 3.7653178810792434
-Epoch 22 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 24/50 - Train Loss 3.255291745696865, Val Loss 3.7610613538214994
-Epoch 23 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 25/50 - Train Loss 3.2005633319323747, Val Loss 3.6117780719771204
-Epoch 24 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 26/50 - Train Loss 3.1498452203005884, Val Loss 3.56837357129765
-Epoch 25 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 27/50 - Train Loss 3.0979728697584124, Val Loss 3.57597119268124
-Epoch 28/50 - Train Loss 3.0447492587937863, Val Loss 3.5138213246890246
-Epoch 27 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 29/50 - Train Loss 2.9950098818396027, Val Loss 3.4624811893599237
-Epoch 28 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 30/50 - Train Loss 2.950906088140344, Val Loss 3.44519704738798
-Epoch 29 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 31/50 - Train Loss 2.905569463742411, Val Loss 3.3847873287945633
-Epoch 30 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 32/50 - Train Loss 2.8587878737945585, Val Loss 3.3509851438515277
-Epoch 31 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 33/50 - Train Loss 2.8188640762622796, Val Loss 3.3241951327579105
-Epoch 32 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 34/50 - Train Loss 2.783405244190303, Val Loss 3.3328577534833848
-Epoch 35/50 - Train Loss 2.7362439555209335, Val Loss 3.334127586484156
-Epoch 36/50 - Train Loss 2.7025743594216762, Val Loss 3.252567566592699
-Epoch 35 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 37/50 - Train Loss 2.6768543580792308, Val Loss 3.261073720451157
-Epoch 38/50 - Train Loss 2.6308624904918125, Val Loss 3.215384722879462
-Epoch 37 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 39/50 - Train Loss 2.6053676498385117, Val Loss 3.2036165374170364
-Epoch 38 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 40/50 - Train Loss 2.569276326611935, Val Loss 3.1685753703237745
-Epoch 39 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 41/50 - Train Loss 2.5418633649343265, Val Loss 3.141432048174236
-Epoch 40 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 42/50 - Train Loss 2.5126558829103307, Val Loss 3.1366520337246357
-Epoch 41 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 43/50 - Train Loss 2.4810401918266414, Val Loss 3.1371212093086203
-Epoch 44/50 - Train Loss 2.455462142677982, Val Loss 3.085912883181397
-Epoch 43 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 45/50 - Train Loss 2.4286052028344085, Val Loss 3.077747889778422
-Epoch 44 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 46/50 - Train Loss 2.4039760707716287, Val Loss 3.0700177364740977
-Epoch 45 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 47/50 - Train Loss 2.3778865446632977, Val Loss 3.0452044633693944
-Epoch 46 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 48/50 - Train Loss 2.3566620352807215, Val Loss 3.0407242280632025
-Epoch 47 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 49/50 - Train Loss 2.332690142489011, Val Loss 3.0367827674669274
-Epoch 48 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Epoch 50/50 - Train Loss 2.3105026172768395, Val Loss 3.0207303435422883
-Epoch 49 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt
-Checkpoint loaded from ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19/unet/ckpt/UNet
-Loaded checkpoint from validation on epoch 49: val/loss 3.105562 (3.020730), val/sbp_mae 5.658944 (4.788177) ± val/sbp_mae_std 5.677276 (4.679655), sbp_me val/sbp_me -0.664424 (0.331171) ± sbp_me_std val/sbp_me_std 8.030293 (6.656959), dbp_mae val/dbp_mae 1.982478 (2.357002) ± dbp_mae_std val/dbp_mae_std 14.659561 (13.773085)
-SBP MAE μ 4.798920154571533 ±  4.758760452270508 / ME μ -0.3815283477306366 ± 6.747582912445068
-DBP MAE μ 2.3703293800354004 ±  2.5071301460266113 / ME μ 0.19888010621070862 ± 3.444504499435425
+Epoch 1/50 - Train Loss 12.4840, Val Loss 9.7890
+Epoch 0 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 2/50 - Train Loss 9.3416, Val Loss 8.3612
+Epoch 1 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 3/50 - Train Loss 7.8786, Val Loss 7.3848
+Epoch 2 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 4/50 - Train Loss 6.8483, Val Loss 6.6810
+Epoch 3 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 5/50 - Train Loss 6.1744, Val Loss 6.2077
+Epoch 4 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 6/50 - Train Loss 5.7111, Val Loss 5.8247
+Epoch 5 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 7/50 - Train Loss 5.3831, Val Loss 5.4436
+Epoch 6 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 8/50 - Train Loss 5.1205, Val Loss 5.2073
+Epoch 7 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 9/50 - Train Loss 4.9157, Val Loss 5.0497
+Epoch 8 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 10/50 - Train Loss 4.7389, Val Loss 4.9409
+Epoch 9 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 11/50 - Train Loss 4.5719, Val Loss 4.7970
+Epoch 10 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 12/50 - Train Loss 4.4230, Val Loss 4.7868
+Epoch 11 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 13/50 - Train Loss 4.2909, Val Loss 4.5186
+Epoch 12 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 14/50 - Train Loss 4.1729, Val Loss 4.5553
+Epoch 15/50 - Train Loss 4.0689, Val Loss 4.3930
+Epoch 14 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 16/50 - Train Loss 3.9735, Val Loss 4.2926
+Epoch 15 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 17/50 - Train Loss 3.8862, Val Loss 4.2805
+Epoch 16 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 18/50 - Train Loss 3.8023, Val Loss 4.2165
+Epoch 17 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 19/50 - Train Loss 3.7232, Val Loss 4.1665
+Epoch 18 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 20/50 - Train Loss 3.6480, Val Loss 4.0968
+Epoch 19 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 21/50 - Train Loss 3.5805, Val Loss 4.0417
+Epoch 20 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 22/50 - Train Loss 3.5126, Val Loss 3.9711
+Epoch 21 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 23/50 - Train Loss 3.4499, Val Loss 3.9232
+Epoch 22 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 24/50 - Train Loss 3.3884, Val Loss 3.9105
+Epoch 23 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 25/50 - Train Loss 3.3354, Val Loss 3.8176
+Epoch 24 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 26/50 - Train Loss 3.2788, Val Loss 3.7976
+Epoch 25 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 27/50 - Train Loss 3.2280, Val Loss 3.8100
+Epoch 28/50 - Train Loss 3.1810, Val Loss 3.7356
+Epoch 27 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 29/50 - Train Loss 3.1331, Val Loss 3.7552
+Epoch 30/50 - Train Loss 3.0806, Val Loss 3.6971
+Epoch 29 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 31/50 - Train Loss 3.0386, Val Loss 3.6526
+Epoch 30 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 32/50 - Train Loss 2.9956, Val Loss 3.6574
+Epoch 33/50 - Train Loss 2.9546, Val Loss 3.6888
+Epoch 34/50 - Train Loss 2.9180, Val Loss 3.6002
+Epoch 33 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 35/50 - Train Loss 2.8759, Val Loss 3.5701
+Epoch 34 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 36/50 - Train Loss 2.8406, Val Loss 3.5522
+Epoch 35 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 37/50 - Train Loss 2.8039, Val Loss 3.5293
+Epoch 36 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 38/50 - Train Loss 2.7708, Val Loss 3.5144
+Epoch 37 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 39/50 - Train Loss 2.7376, Val Loss 3.5267
+Epoch 40/50 - Train Loss 2.7066, Val Loss 3.4571
+Epoch 39 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 41/50 - Train Loss 2.6787, Val Loss 3.4604
+Epoch 42/50 - Train Loss 2.6508, Val Loss 3.4435
+Epoch 41 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 43/50 - Train Loss 2.6181, Val Loss 3.4444
+Epoch 44/50 - Train Loss 2.5936, Val Loss 3.4261
+Epoch 43 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 45/50 - Train Loss 2.5660, Val Loss 3.4314
+Epoch 46/50 - Train Loss 2.5403, Val Loss 3.4425
+Epoch 47/50 - Train Loss 2.5179, Val Loss 3.3979
+Epoch 46 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 48/50 - Train Loss 2.4945, Val Loss 3.4115
+Epoch 49/50 - Train Loss 2.4712, Val Loss 3.3827
+Epoch 48 - checkpoint saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt
+Epoch 50/50 - Train Loss 2.4519, Val Loss 3.4008
+Checkpoint loaded from ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41/unet/ckpt/UNet
+Loaded checkpoint from validation on epoch 48: 3.382674654177727
+SBP MAE μ 5.397979259490967 ±  5.275842189788818 / ME μ 0.5660484433174133 ± 7.526771068572998
+DBP MAE μ 2.6119232177734375 ±  2.6687591075897217 / ME μ -0.4343946874141693 ± 3.7088701725006104
 BHS grading standard:
 		 ≤ 5 	 ≤ 10 	 ≤ 15
 	 Grade A 60% 	 85% 	 95%
 	 Grade B 50% 	 75% 	 90%
 	 Grade C 40% 	 65% 	 85%
 SBP:
-		 64.48997191927053% 	 89.4639420295952% 	 96.4052459430182%
-BHS standard grade for SBP: A
+		 59.66471398672738% 	 85.92387703374946% 	 94.62364460523963%
+BHS standard grade for SBP: B
 BHS grading standard:
 		 ≤ 5 	 ≤ 10 	 ≤ 15
 	 Grade A 60% 	 85% 	 95%
 	 Grade B 50% 	 75% 	 90%
 	 Grade C 40% 	 65% 	 85%
 DBP:
-		 89.89093739154212% 	 98.33408706077847% 	 99.49728132263391%
+		 86.88934930534376% 	 97.86923004112197% 	 99.45731623949602%
 BHS standard grade for DBP: A
 AAMI grade for SBP: Acceptable
 AAMI grade for DBP: Acceptable
-Pretraining completed, best model and configuration saved in ./checkpoints/unet/unet-UNet-2025_05_28-23_19_19
+Pretraining completed, best model and configuration saved in ./checkpoints/unet/unet-UNet-2025_06_02-10_23_41

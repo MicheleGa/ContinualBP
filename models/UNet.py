@@ -194,57 +194,50 @@ class UNet(nn.Module):
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
         self.in_channels = ppg_in_channels + ecg_in_channels + resp_in_channels
 
-        filters = [int(ch) for ch in channels.split(',')]
+        self.filters = [int(ch) for ch in channels.split(',')]
+        num_layers = len(self.filters)
 
         # Encoder Path
-        self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(self.in_channels, filters[0], stride=1), # First block stride 1, no downsampling
-            ResidualBlock1D(filters[0], filters[1], stride=2),
-            ResidualBlock1D(filters[1], filters[2], stride=2),
-            ResidualBlock1D(filters[2], filters[3], stride=2),
-            ResidualBlock1D(filters[3], filters[4], stride=2)
-        ])
+        self.encoder_blocks = nn.ModuleList()
+        # First encoder block with input_channels
+        self.encoder_blocks.append(ResidualBlock1D(self.in_channels, self.filters[0], stride=1))
+        # Subsequent encoder blocks
+        for i in range(num_layers - 1):
+            self.encoder_blocks.append(ResidualBlock1D(self.filters[i], self.filters[i+1], stride=2))
 
         # Bottleneck
-        self.bottleneck = BottleneckBlock1D(filters[4], stride=1) # Keep same resolution at bottleneck
+        self.bottleneck = BottleneckBlock1D(self.filters[-1], stride=1)
 
         # Decoder Path
-        self.decoder_blocks = nn.ModuleList([
-            # Upsample filters[4] to filters[3], then combine with skip filters[3] to output filters[3]
-            ResidualBlock1D(filters[4] + filters[3], filters[3], stride=1),
-            ResidualBlock1D(filters[3] + filters[2], filters[2], stride=1),
-            ResidualBlock1D(filters[2] + filters[1], filters[1], stride=1),
-            ResidualBlock1D(filters[1] + filters[0], filters[0], stride=1)
-        ])
-
+        self.decoder_blocks = nn.ModuleList()
         # Attention Gates
-        # The attention gate needs to know the channels of the gating signal (from decoder)
-        # and the channels of the skip connection (from encoder)
-        self.att_gate4 = AttentionGate1D(filters[4], filters[3], filters[3]) # Gating: Bottleneck, Skip: Enc4
-        self.att_gate3 = AttentionGate1D(filters[3], filters[2], filters[2]) # Gating: Dec1 output, Skip: Enc3
-        self.att_gate2 = AttentionGate1D(filters[2], filters[1], filters[1]) # Gating: Dec2 output, Skip: Enc2
-        self.att_gate1 = AttentionGate1D(filters[1], filters[0], filters[0]) # Gating: Dec3 output, Skip: Enc1
+        self.att_gates = nn.ModuleList()
+
+        # Decoder blocks and attention gates
+        for i in range(num_layers - 1, 0, -1):
+            g_channels = self.filters[i]
+            x_channels = self.filters[i-1]
+            inter_channels = self.filters[i-1] # Typically inter_channels is smaller, can be x_channels
+            
+            self.att_gates.append(AttentionGate1D(g_channels, x_channels, inter_channels))
+            self.decoder_blocks.append(ResidualBlock1D(g_channels + x_channels, x_channels, stride=1))
 
         # Final Self-Attention Module
-        # This will operate on the output of the last decoder block before final convolution
-        # d_model should be the channels of the last decoder block output (filters[0])
         self.self_attention_stack1 = SelfAttentionBlock1D(
             seq_len=self.input_seq_len,
-            d_model=filters[0],
+            d_model=self.filters[0],
             num_heads=num_heads_attention,
             dim_feedforward=dim_feedforward_attention
         )
         self.self_attention_stack2 = SelfAttentionBlock1D(
             seq_len=self.input_seq_len,
-            d_model=filters[0],
+            d_model=self.filters[0],
             num_heads=num_heads_attention,
             dim_feedforward=dim_feedforward_attention
         )
 
         # Output Layer
-        # The final output is an ABP signal, which is a 1D signal of the same length as input.
-        # So, it's a 1-channel output.
-        self.final_conv = nn.Conv1d(filters[0], 1, kernel_size=1, stride=1, padding=0)
+        self.final_conv = nn.Conv1d(self.filters[0], 1, kernel_size=1, stride=1, padding=0)
  
         # Kaiming initialization that should work fine with the z-score preprocessing
         self.init_params() 
@@ -262,54 +255,40 @@ class UNet(nn.Module):
         x = x.permute(0, 2, 1) # -> [batch_size, num_modalities, 625]
 
         # Encoder
-        e1 = self.encoder_blocks[0](x) # No downsampling, length 625, channels filters[0] (32)
-        e2 = self.encoder_blocks[1](e1) # Downsample x2, length 313, channels filters[1] (64)
-        e3 = self.encoder_blocks[2](e2) # Downsample x2, length 157, channels filters[2] (128)
-        e4 = self.encoder_blocks[3](e3) # Downsample x2, length 79, channels filters[3] (256)
-        e5 = self.encoder_blocks[4](e4) # Downsample x2, length 40, channels filters[4] (512)
+        encoder_features = []
+        current_x = x
+        for i, encoder_block in enumerate(self.encoder_blocks):
+            current_x = encoder_block(current_x)
+            encoder_features.append(current_x)
         
         # Bottleneck
-        b = self.bottleneck(e5) # Length 40, channels filters[4] (512)
+        b = self.bottleneck(encoder_features[-1])
 
         # Decoder with Attention Gates
-        # Upsampling with ConvTranspose1d / F.interpolate + Conv
-        # We need to calculate target_size for upsampling.
-        # Decoder Block 1 (from b to d1)
-        # Target size is e4.size(2)
-        # g: b (filters[4]), x: e4 (filters[3])
-        # Decoder Block 1
-        g = F.interpolate(b, size=e4.size(2), mode='linear', align_corners=True) # g is the upsampled bottleneck.
-        att_e4 = self.att_gate4(g, e4) # att_e4 is the attended encoder skip feature (e4 * psi)
-        d1 = self.decoder_blocks[0](torch.cat([g, att_e4], dim=1)) # Concatenates upsampled bottleneck (g) with attended encoder skip (att_e4)
-        
-        # Decoder Block 2 (from d1 to d2)
-        # Target size is e3.size(2)
-        # g: d1 (filters[3]), x: e3 (filters[2])
-        g = F.interpolate(d1, size=e3.size(2), mode='linear', align_corners=True)
-        att_e3 = self.att_gate3(g, e3)
-        d2 = self.decoder_blocks[1](torch.cat([g, att_e3], dim=1))
+        # The loop iterates from the last encoder feature to the first one (excluding the first block's input)
+        decoder_output = b
+        num_layers = len(self.filters)
+        for i in range(num_layers - 1):
+            # i = 0 corresponds to the last decoder block (upsampling from filters[-1] to filters[-2])
+            # i = 1 corresponds to upsampling from filters[-2] to filters[-3], and so on.
+            # encoder_features[num_layers - 2 - i] gives the correct skip connection.
+            # E.g., for num_layers = 5:
+            # i = 0: skip_connection = encoder_features[3] (e4), g = decoder_output (b)
+            # i = 1: skip_connection = encoder_features[2] (e3), g = decoder_output (d1)
+            # and so on.
+            
+            skip_connection_idx = num_layers - 2 - i
+            skip_connection = encoder_features[skip_connection_idx]
 
-        # Decoder Block 3 (from d2 to d3)
-        # Target size is e2.size(2)
-        # g: d2 (filters[2]), x: e2 (filters[1])
-        g = F.interpolate(d2, size=e2.size(2), mode='linear', align_corners=True)
-        att_e2 = self.att_gate2(g, e2)
-        d3 = self.decoder_blocks[2](torch.cat([g, att_e2], dim=1))
-
-        # Decoder Block 4 (from d3 to d4)
-        # Target size is e1.size(2) (initial length 625)
-        # g: d3 (filters[1]), x: e1 (filters[0])
-        g = F.interpolate(d3, size=e1.size(2), mode='linear', align_corners=True)
-        att_e1 = self.att_gate1(g, e1)
-        d4 = self.decoder_blocks[3](torch.cat([g, att_e1], dim=1)) # Output d4: filters[0] channels, original length
+            g = F.interpolate(decoder_output, size=skip_connection.size(2), mode='linear', align_corners=True)
+            att_skip = self.att_gates[i](g, skip_connection)
+            decoder_output = self.decoder_blocks[i](torch.cat([g, att_skip], dim=1))
 
         # Final Self-Attention Module
-        sa_output = self.self_attention_stack1(d4)
+        sa_output = self.self_attention_stack1(decoder_output)
         sa_output = self.self_attention_stack2(sa_output)
 
         # Output Layer
-        # For regression, often no final activation or a linear one implicitly.
-        # The output shape should match the input shape's length for ABP signals.
         output = self.final_conv(sa_output)
 
         # Permute back to [batch_size, length, channels] for consistency with input
@@ -371,7 +350,7 @@ def parseargs():
     parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--channels', default='32, 64, 128, 256, 512', type=str, help='channels produced by the convolutional blocks')
+    parser.add_argument('--channels', default='32, 64, 128, 256, 512', type=str, help='comma separated list of channels produced by the convolutional blocks')
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')

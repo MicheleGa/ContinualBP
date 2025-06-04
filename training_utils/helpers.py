@@ -10,7 +10,7 @@ import yaml
 import numpy as np
 import random
 import torch
-from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer, EUNet
+from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer, EUNet, SSLEUNet
 from models.UNet import AttentionGate1D, SelfAttentionBlock1D
 
 
@@ -35,8 +35,6 @@ def parseargs():
     # Optimization Setup
     parser.add_argument('--smoothl1loss_beta', default=5, type=int, help='beta for SmoothL1Loss')
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
-    parser.add_argument('--lr_linear_probe', default=0.0005, type=float, help='learning rate for personalization')
-    parser.add_argument('--lr_personalization', default=0.0005, type=float, help='learning rate for personalization')
     parser.add_argument('--l2norm', default=0.001, type=float, help='L2 regularization')
     parser.add_argument('--sgd_momentum', default=0.9, type=float, help='Momentum for SGD optimizer')
     parser.add_argument('--lrsched_step', default="5, 10, 15, 20, 40", type=str, help='learning rate scheduler steps')
@@ -62,7 +60,6 @@ def parseargs():
     parser.add_argument('--lp_dataset_name', default='test', type=str, help='name of the dataset for linear probing')
     parser.add_argument('--pretraining_ratio', default=0.8, type=float, help='pretraining ratio of the whole dataset')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
-    parser.add_argument('--personalization_sample_number', default=100, type=int, help='number of samples to take for personalization')
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
     parser.add_argument('--fold', default=0, type=int, help='fold number')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of data loader workers')
@@ -75,11 +72,18 @@ def parseargs():
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
+    
+    # Personalization Setup
+    parser.add_argument('--personalization_sample_number', default=100, type=float, help='number of samples to take for personalization (-1.0 to use all samples)')
+    parser.add_argument('--num_personalization_subjects', default=100, type=int, help='number of subjects to for personalization')
+    parser.add_argument('--num_passes', default=3, type=int, help='number of passes on the same batch during personalization')
+    parser.add_argument('--tune', default='all', type=str, help='which part of the model to training during pretraining')
 
     # Self-supervision Setup
     parser.add_argument('--masking_ratio', default=0.08, type=float, help='Ratio of signal length to mask for MSR task')
     parser.add_argument('--augmentation_types', default='jitter,scaling,magnitude_warp,flip', type=str, help='Comma-separated list of augmentation types for SimCLR')
     parser.add_argument('--aug_prob', default=0.5, type=float, help='Probability for each individual augmentation in RandomAugmentor')
+    parser.add_argument('--data_aug', default='False', type=lambda x: bool(strtobool(x)), help='whether to use data augmentations also for the MSR and CWG SSL tasks or not')
     parser.add_argument('--ssl', default='False', type=lambda x: bool(strtobool(x)), help='whether to do self-supervised pretraining or not')
         
     # Model Setup
@@ -419,6 +423,8 @@ def set_trainable_parameters(model, tune, config):
         _handle_eunet_tuning(model, tune, config)
     elif config['model_name'] == 'SSLUNet':
         _handle_sslunet_tuning(model, tune, config)
+    elif config['model_name'] == 'SSLEUNet':
+        _handle_ssl_eunet_tuning(model, tune, config)
     else:
         raise ValueError(f"Invalid model name: {config['model_name']}")
 
@@ -547,7 +553,6 @@ def _handle_unet_tuning(model, tune, config):
             p.requires_grad = False
     elif tune == 'last_layer':
         # Freeze everything and only leave final_conv with require_grads True
-        # Model was already all tunable, but code is cleaner this way 
         for p in model.parameters():
             p.requires_grad = False
         for p in model.final_conv.parameters():
@@ -560,34 +565,49 @@ def _handle_unet_tuning(model, tune, config):
             if isinstance(module, (AttentionGate1D, SelfAttentionBlock1D)):
                 for p in module.parameters():
                     p.requires_grad = True
+        # Also unfreeze the final convolution layer, as it's typically part of the "head"
+        for p in model.final_conv.parameters():
+            p.requires_grad = True
     elif tune == 'decoder':
         # Freeze encoder and bottleneck, unfreeze decoder and attention gates, and final self-attention
         for p in model.parameters():
             p.requires_grad = False
+        
+        # Unfreeze all decoder blocks
         for block in model.decoder_blocks:
             for p in block.parameters():
                 p.requires_grad = True
-        for gate in [model.att_gate1, model.att_gate2, model.att_gate3, model.att_gate4]:
+        
+        # Unfreeze all attention gates
+        for gate in model.att_gates: # Iterate directly over the nn.ModuleList
             for p in gate.parameters():
                 p.requires_grad = True
+        
+        # Unfreeze self-attention stacks
         for p in model.self_attention_stack1.parameters():
             p.requires_grad = True
         for p in model.self_attention_stack2.parameters():
             p.requires_grad = True
+        
+        # Unfreeze final convolution
         for p in model.final_conv.parameters():
             p.requires_grad = True
     elif tune == 'encoder':
         # Freeze decoder and attention gates, unfreeze encoder and bottleneck
         for p in model.parameters():
             p.requires_grad = False
+        
+        # Unfreeze all encoder blocks
         for block in model.encoder_blocks:
             for p in block.parameters():
                 p.requires_grad = True
+        
+        # Unfreeze bottleneck
         for p in model.bottleneck.parameters():
             p.requires_grad = True
     else:
         raise ValueError(f"Invalid tuning strategy for UNet: {tune}")
-    
+        
 
 def _handle_eunet_tuning(model, tune, config):
     """Handle tuning strategy for UNet model."""
@@ -749,6 +769,128 @@ def _handle_sslunet_tuning(model, tune, config):
                 param.requires_grad = True
     else:
         raise ValueError(f"Invalid tuning strategy for SSLUNet: {tune}")
+    
+
+def _handle_ssl_eunet_tuning(model, tune, config):
+    """Handle tuning strategy for SSLEUNet model, considering SSL heads."""
+    
+    if tune == 'all': 
+        # Train all parameters
+        for p in model.parameters():
+            p.requires_grad = True
+    elif tune == 'none':
+        # Train no parameters
+        for p in model.parameters():
+            p.requires_grad = False
+    elif tune == 'last_layer':
+        # Freeze everything and only leave final_conv_supervised and SSL heads with require_grads True
+        for p in model.parameters():
+            p.requires_grad = False
+        
+        # Supervised head
+        for p in model.final_conv_supervised.parameters():
+            p.requires_grad = True
+        
+        # SSL heads
+        for p in model.projection_head.parameters():
+            p.requires_grad = True
+        for p in model.reconstruction_head.parameters():
+            p.requires_grad = True
+        for p in model.generation_prev_head.parameters():
+            p.requires_grad = True
+        for p in model.generation_next_head.parameters():
+            p.requires_grad = True
+
+    elif tune == 'attention':
+        # Freeze everything except the AttentionGate1D and the final attention/GRU modules
+        for p in model.parameters():
+            p.requires_grad = False
+        for module in model.att_gates: # Iterate through the ModuleList of AttentionGates
+            for p in module.parameters():
+                p.requires_grad = True
+        
+        # Unfreeze the selected final processing layer
+        if model.attention_type == 'self_attention':
+            for p in model.self_attention_stack1.parameters():
+                p.requires_grad = True
+            for p in model.self_attention_stack2.parameters():
+                p.requires_grad = True
+        elif model.attention_type == 'nystrom_attention':
+            for p in model.nystrom_attention_block.parameters():
+                p.requires_grad = True
+        elif model.attention_type == 'gru':
+            for p in model.gru_layer.parameters():
+                p.requires_grad = True
+            for p in model.gru_proj.parameters():
+                p.requires_grad = True
+        
+        # Also unfreeze the final convolution layer for supervised task, and SSL heads
+        for p in model.final_conv_supervised.parameters():
+            p.requires_grad = True
+        for p in model.projection_head.parameters():
+            p.requires_grad = True
+        for p in model.reconstruction_head.parameters():
+            p.requires_grad = True
+        for p in model.generation_prev_head.parameters():
+            p.requires_grad = True
+        for p in model.generation_next_head.parameters():
+            p.requires_grad = True
+
+    elif tune == 'decoder':
+        # Freeze encoders and bottleneck, unfreeze decoder blocks, attention gates, and final attention/GRU
+        for p in model.parameters():
+            p.requires_grad = False
+        
+        for block in model.decoder_blocks:
+            for p in block.parameters():
+                p.requires_grad = True
+        for gate in model.att_gates: # Iterate through the ModuleList of AttentionGates
+            for p in gate.parameters():
+                p.requires_grad = True
+        
+        # Unfreeze the selected final processing layer
+        if model.attention_type == 'self_attention':
+            for p in model.self_attention_stack1.parameters():
+                p.requires_grad = True
+            for p in model.self_attention_stack2.parameters():
+                p.requires_grad = True
+        elif model.attention_type == 'nystrom_attention':
+            for p in model.nystrom_attention_block.parameters():
+                p.requires_grad = True
+        elif model.attention_type == 'gru':
+            for p in model.gru_layer.parameters():
+                p.requires_grad = True
+            for p in model.gru_proj.parameters():
+                p.requires_grad = True
+        
+        # Also unfreeze the final convolution layer for supervised task, and SSL heads
+        for p in model.final_conv_supervised.parameters():
+            p.requires_grad = True
+        for p in model.projection_head.parameters():
+            p.requires_grad = True
+        for p in model.reconstruction_head.parameters():
+            p.requires_grad = True
+        for p in model.generation_prev_head.parameters():
+            p.requires_grad = True
+        for p in model.generation_next_head.parameters():
+            p.requires_grad = True
+            
+    elif tune == 'encoder':
+        # Freeze decoder, attention gates, final attention/GRU, and all heads; unfreeze all modality-specific encoders and bottleneck
+        for p in model.parameters():
+            p.requires_grad = False
+        
+        # Unfreeze modality-specific encoders
+        for encoder_blocks in [model.ppg_encoder_blocks, model.ecg_encoder_blocks, model.resp_encoder_blocks]:
+            for block in encoder_blocks:
+                for p in block.parameters():
+                    p.requires_grad = True
+        
+        # Unfreeze bottleneck
+        for p in model.bottleneck.parameters():
+            p.requires_grad = True
+    else:
+        raise ValueError(f"Invalid tuning strategy for SSLEUNet: {tune}")
 
 
 class EarlyStopping:
@@ -928,6 +1070,22 @@ def get_model_architecture(config):
             dim_feedforward_attention=config['dim_feedforward_attention'],
             projection_hidden_dim=config['proj_hidden_dim'],
             projection_dim=config['proj_head_dim']
+            )
+    elif config['model_name'] == 'SSLEUNet':
+        model = SSLEUNet.SSLEUNet(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            ppg_derivatives=config['ppg_derivatives'],
+            ppg_emd=config['ppg_emd'],
+            ppg_freqs=config['ppg_freqs'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            channels=config['channels'], 
+            kernel_size=config['kernel_size'],
+            num_heads_attention=config['num_heads_attention'],
+            dim_feedforward_attention=config['dim_feedforward_attention'],
+            attention_type=config['attention_type'] 
             )
     else:
         raise ValueError("Invalid model name ...")
