@@ -1,7 +1,7 @@
 ## Personalization
 
 # Efficient UNet
-experiment_name="personalization_vanilla_eunet"
+experiment_name="personalization_eunet_last_layer"
 mkdir "logs/$experiment_name"
 cd ./models
 python EUNet.py \
@@ -21,7 +21,7 @@ python personalization.py \
     --batch_size 128 \
     --tune 'last_layer' \
     --channels "16,32,64" \
-    --num_personalization_subjects 3 \
+    --num_personalization_subjects 100 \
     --num_passes 8 \
     --lr 0.003 \
     --sig2sig True \

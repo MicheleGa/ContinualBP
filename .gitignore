@@ -1,6 +1,7 @@
 # Python packages
 __pycache__/
 data/__pycache__
+training_utils/__pycache__
 
 # VSCode settings
 .vscode/
@@ -13,17 +14,18 @@ data/lmdb/*
 data/raw_mimic_iii/*
 data/raw_vital_db/*
 data/data_logs/*
+data/data_figs/*
 
 # Checkpoints
 checkpoints/
 
 # Logs
-#logs/
+logs/
 
 # TensorBoard logs
-#tensorboard/
+tensorboard/
 
 # Figures
-#figs/
+figs/
 
 
