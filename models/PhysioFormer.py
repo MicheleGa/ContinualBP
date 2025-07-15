@@ -269,9 +269,6 @@ class PhysioFormer(nn.Module):
     def __init__(self, 
                  ecg=False, 
                  resp=False, 
-                 ppg_derivatives=False,
-                 ppg_emd=False, 
-                 ppg_freqs=False,  
                  embed_dim=768,
                  n_head=12, 
                  head_dim=64,
@@ -279,17 +276,13 @@ class PhysioFormer(nn.Module):
                  num_layers=3,  
                  proj_head_dim=128,
                  input_seq_len=625,
-                 return_embedding=False,
-                 set_tunable_params='all'):
+                 return_embedding=False):
         super(PhysioFormer, self).__init__()
         
         # Input Data Setup
         self.input_seq_len = input_seq_len
         self.ecg = ecg
         self.resp = resp
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
         self.return_embedding = return_embedding
                 
         # Feature Extractor Definition
@@ -322,9 +315,6 @@ class PhysioFormer(nn.Module):
         
         # Kaiming initialization that should work fine with the z-score preprocessing
         self.init_params() 
-        
-        # Freeze/Tune model parameters
-        self.set_tunable_layers(set_tunable_params)
         
     def forward(self, x):
         
@@ -376,7 +366,6 @@ class PhysioFormer(nn.Module):
             return out
     
     def init_params(self):
-        # Fan-out focuses on the gradient distribution, and is commonly used in ResNets
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
@@ -395,14 +384,8 @@ class PhysioFormer(nn.Module):
         else:
             resp_in_channels = 0
         
-        if self.ppg_derivatives:
-            ppg_in_channels = 3  # PPG + PPG' + PPG''
-        elif self.ppg_emd:
-            ppg_in_channels = 4  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3
-        elif self.ppg_freqs:
-            ppg_in_channels = 16  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3  
-        else:
-            ppg_in_channels = 1  # PPG
+        # PPG must always be present
+        ppg_in_channels = 1 
             
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
@@ -416,45 +399,12 @@ class PhysioFormer(nn.Module):
         macs, num_params = clever_format([macs, num_params], "%.7f")
         print(f'PhysioFormer has {num_params} params and {macs} macs.')
 
-    def set_tunable_layers(self, tune):
-        
-        # First set all parameters to be trainable
-        for p in self.parameters():
-            p.requires_grad = True
-        
-        # Update the whole model
-        if tune == "all":
-            return 
-        # Update only the regressor last linear
-        elif tune == "last_linear":
-            for p in self.ppg_linear_projection.parameters():
-                p.requires_grad = False
-            
-            if self.ecg:
-                for p in self.ecg_linear_projection.parameters():
-                    p.requires_grad = False
-            
-                if self.resp: 
-                    for p in self.resp_linear_projection.parameters():
-                        p.requires_grad = False
-            
-            for p in self.transformer.parameters():
-                p.requires_grad = False
-                
-            for p in self.projection_head.parameters():
-                p.requires_grad = False
-        else:
-            raise Exception("undefined tune")
-    
 
 def parseargs():
     parser = argparse.ArgumentParser(description="PhysioFormer summary, # params and MACS")
 
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     parser.add_argument('--embed_dim', default=48, type=int, help='input embedding size')
@@ -463,7 +413,6 @@ def parseargs():
     parser.add_argument('--n_head', default=4, type=int, help='number of self-attention heads')
     parser.add_argument('--head_dim', default=12, type=int, help='self-attention headd dimension')
     parser.add_argument('--proj_head_dim', default=128, type=int, help='dimension of the projection head after the feture extractor') 
-    parser.add_argument('--set_tunable_params', default='all', type=str, help='which model parameters to tune (all, only regressor, only encoder, etc.)')
     parser.add_argument('--return_embedding', default='False', type=lambda x: bool(strtobool(x)), help='whether to return the model embedding before the regressor or not')
     
     args = parser.parse_args()
@@ -477,9 +426,6 @@ if __name__ == "__main__":
     net = PhysioFormer(
         ecg=args.ecg,
         resp=args.resp,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
         embed_dim=args.embed_dim, 
         n_head=args.n_head, 
         head_dim=args.head_dim, 
@@ -487,8 +433,7 @@ if __name__ == "__main__":
         proj_head_dim=args.proj_head_dim,
         num_layers=args.num_layers, 
         input_seq_len=int(args.input_seq_len_s * args.fs),
-        return_embedding=args.return_embedding,
-        set_tunable_params=args.set_tunable_params
-        )
+        return_embedding=args.return_embedding
+    )
     net.print_summary()
     

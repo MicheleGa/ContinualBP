@@ -12,9 +12,9 @@ attempts/
 # Datasets
 data/lmdb/*
 data/raw_mimic_iii/*
+data/raw_mimic_iii_xl/*
 data/raw_vital_db/*
 data/data_logs/*
-data/data_figs/*
 
 # Checkpoints
 checkpoints/

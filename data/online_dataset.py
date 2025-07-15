@@ -19,9 +19,6 @@ class OnlinePhysioDataset: # NO LONGER INHERITS from Dataset
                  ecg=False,
                  resp=False,
                  sig2sig=False,
-                 ppg_derivatives=False,
-                 ppg_emd=False,
-                 ppg_freqs=False,
                  min_subject_sample_number=0):
         # super(OnlinePhysioDataset, self).__init__() # Remove this as it's not inheriting from Dataset
 
@@ -45,9 +42,6 @@ class OnlinePhysioDataset: # NO LONGER INHERITS from Dataset
         self.ecg = ecg
         self.resp = resp
         self.sig2sig = sig2sig
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
         self.sample_length_in_samples = self.fs * self.input_seq_len_s
@@ -61,9 +55,6 @@ class OnlinePhysioDataset: # NO LONGER INHERITS from Dataset
                 "Include ECG": ecg,
                 "Include RESP": resp,
                 "Signal-to-Signal Prediction": sig2sig,
-                "Include PPG Derivatives": ppg_derivatives,
-                "Include PPG EMD": ppg_emd,
-                "Include PPG Freqs": ppg_freqs,
                 "Min Subject Sample Number": min_subject_sample_number,
                 "Total Subjects Available": len(self.subject_list),
             }

@@ -166,9 +166,6 @@ class UNet(nn.Module):
                  ecg=False,
                  resp=False,
                  sig2sig=False,
-                 ppg_derivatives=False,
-                 ppg_emd=False,
-                 ppg_freqs=False,
                  fs=125,
                  input_seq_len_s=5,
                  channels='32, 64, 128, 256, 512',
@@ -182,9 +179,6 @@ class UNet(nn.Module):
         self.ecg = ecg
         self.resp = resp
         self.sig2sig = sig2sig
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
         
         # Architecture Setup
         self.kernel_size = kernel_size
@@ -242,9 +236,6 @@ class UNet(nn.Module):
         # Kaiming initialization that should work fine with the z-score preprocessing
         self.init_params() 
         
-        # Freeze/Tune model parameters
-        #self.set_tunable_layers(set_tunable_params)
-
     def forward(self, x):
         
         x = x.unsqueeze(-1) if len(x.shape) == 2 else x # x -> (batch_size, seq_len, channels)
@@ -265,17 +256,12 @@ class UNet(nn.Module):
         b = self.bottleneck(encoder_features[-1])
 
         # Decoder with Attention Gates
-        # The loop iterates from the last encoder feature to the first one (excluding the first block's input)
         decoder_output = b
         num_layers = len(self.filters)
         for i in range(num_layers - 1):
             # i = 0 corresponds to the last decoder block (upsampling from filters[-1] to filters[-2])
             # i = 1 corresponds to upsampling from filters[-2] to filters[-3], and so on.
             # encoder_features[num_layers - 2 - i] gives the correct skip connection.
-            # E.g., for num_layers = 5:
-            # i = 0: skip_connection = encoder_features[3] (e4), g = decoder_output (b)
-            # i = 1: skip_connection = encoder_features[2] (e3), g = decoder_output (d1)
-            # and so on.
             
             skip_connection_idx = num_layers - 2 - i
             skip_connection = encoder_features[skip_connection_idx]
@@ -306,6 +292,14 @@ class UNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def get_input_channels(self):
+        
+        ppg_in_channels = 0
+        ecg_in_channels = 0
+        resp_in_channels = 0
+        
+        # PPG must be always present
+        ppg_in_channels = 1 
+        
         if self.ecg:
             ecg_in_channels = 1
         else:
@@ -315,15 +309,6 @@ class UNet(nn.Module):
             resp_in_channels = 1
         else:
             resp_in_channels = 0
-        
-        if self.ppg_derivatives:
-            ppg_in_channels = 3  # PPG + PPG' + PPG''
-        elif self.ppg_emd:
-            ppg_in_channels = 4  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3
-        elif self.ppg_freqs:
-            ppg_in_channels = 16  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3  
-        else:
-            ppg_in_channels = 1  # PPG
             
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
@@ -345,9 +330,6 @@ def parseargs():
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     parser.add_argument('--channels', default='32, 64, 128, 256, 512', type=str, help='comma separated list of channels produced by the convolutional blocks')
@@ -367,14 +349,11 @@ if __name__ == "__main__":
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         channels=args.channels,
         kernel_size=args.kernel_size,
         num_heads_attention=args.num_heads_attention,
         dim_feedforward_attention=args.dim_feedforward_attention
-        )        
+    )        
     net.print_summary(batch_size=args.batch_size)

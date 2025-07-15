@@ -270,9 +270,6 @@ class Transformer(nn.Module):
                  ecg=False,
                  resp=False,
                  sig2sig=False,
-                 ppg_derivatives=False,
-                 ppg_emd=False,
-                 ppg_freqs=False,
                  fs=125,
                  input_seq_len_s=5,
                  embed_dim=128,
@@ -286,9 +283,6 @@ class Transformer(nn.Module):
         self.ecg = ecg
         self.resp = resp
         self.sig2sig = sig2sig
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
         
         # Architecture Setup
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
@@ -338,6 +332,14 @@ class Transformer(nn.Module):
         return output.squeeze(-1)
     
     def get_input_channels(self):
+        
+        ppg_in_channels = 0
+        ecg_in_channels = 0
+        resp_in_channels = 0
+        
+        # PPG must be always present
+        ppg_in_channels = 1 
+        
         if self.ecg:
             ecg_in_channels = 1
         else:
@@ -348,15 +350,6 @@ class Transformer(nn.Module):
         else:
             resp_in_channels = 0
         
-        if self.ppg_derivatives:
-            ppg_in_channels = 3  # PPG + PPG' + PPG''
-        elif self.ppg_emd:
-            ppg_in_channels = 4  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3
-        elif self.ppg_freqs:
-            ppg_in_channels = 16  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3  
-        else:
-            ppg_in_channels = 1  # PPG
-            
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):
@@ -399,14 +392,11 @@ if __name__ == "__main__":
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         dim_feedforward=args.dim_feedforward,
         num_encoder_layers=args.num_encoder_layers
-        )        
+    )        
     net.print_summary(batch_size=args.batch_size)

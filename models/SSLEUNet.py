@@ -361,17 +361,12 @@ class SSLEUNet(nn.Module):
                  ecg=False,
                  resp=False,
                  sig2sig=False,
-                 ppg_derivatives=False,
-                 ppg_emd=False,
-                 ppg_freqs=False,
                  fs=125,
                  input_seq_len_s=5,
                  channels='16, 32, 64, 128', # Updated channels to match EUNet's example
                  kernel_size=3,
                  num_heads_attention=1,
                  dim_feedforward_attention=128,
-                 projection_hidden_dim=512,
-                 projection_dim=128,
                  attention_type='self_attention' # Added attention_type
                 ):
         super(SSLEUNet, self).__init__()
@@ -381,10 +376,6 @@ class SSLEUNet(nn.Module):
         self.ecg = ecg
         self.resp = resp
         self.sig2sig = sig2sig
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
-        self.projection_dim = projection_dim  
         
         # Architecture Setup
         self.kernel_size = kernel_size
@@ -490,30 +481,11 @@ class SSLEUNet(nn.Module):
         else:
             raise ValueError(f"Unknown attention_type: {self.attention_type}. Choose from 'self_attention', 'nystrom_attention', 'gru'.")
         
-        # Output embedding dimension for the SSL heads (output of last attention/GRU block)
-        # This is [Batch, filters[0], self.input_seq_len]
-        # For projection/permutation heads, we need to flatten this to a fixed-size vector
-        self.ssl_embedding_dim = self.encoder_filters[0] * self.input_seq_len # e.g., 32 * 625 = 20000
-
-        # --- NEW SSL HEADS (attached to `sa_output`) ---
-        # 1. Projection Head (for SimCLR)
-        self.projection_head = nn.Sequential(
-            nn.Linear(self.ssl_embedding_dim, projection_hidden_dim), # Input: flattened SA output, Output: hidden_dim
-            nn.ReLU(inplace=True),
-            nn.Linear(projection_hidden_dim, projection_dim) # Input: hidden_dim, Output: final projection_dim
-        )
-
-        # 2. Reconstruction Head (for MSR)
+        # --- Reconstruction Head (for MSR) ---
         # This head takes the `sa_output` (which is already [Batch, Filters[0], Length])
         # and directly maps it to [Batch, 2, Length] for PPG/ECG reconstruction.
         self.reconstruction_head = nn.Conv1d(self.encoder_filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
 
-        # 3. Generation Head (for CWG)
-        # Takes the `sa_output` of the `current_signal` and generates the `prev_signal`/`next_signal`.
-        # `sa_output` is `[Batch, filters[0], Length]`. We want `[Batch, Length, 2]`
-        self.generation_prev_head = nn.Conv1d(self.encoder_filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
-        self.generation_next_head = nn.Conv1d(self.encoder_filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
-        
         # --- Final Output Layer (for supervised training's direct output) ---
         # This is the original final_conv, which maps to 1 channel (ABP)
         self.final_conv_supervised = nn.Conv1d(self.encoder_filters[0], 1, kernel_size=1, stride=1, padding=0)
@@ -623,7 +595,7 @@ class SSLEUNet(nn.Module):
             sa_output = self.self_attention_stack1(d)
             sa_output = self.self_attention_stack2(sa_output)
         
-        return sa_output, None # Skip connections not directly returned by this modified _run_full_unet_path
+        return sa_output, None 
     
     def encode(self, signal):
         """
@@ -647,42 +619,7 @@ class SSLEUNet(nn.Module):
         """
         reconstructed_signal_conv = self.reconstruction_head(sa_output_embedding)
         return reconstructed_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
-
-    def project(self, sa_output_embedding):
-        """
-        Projection head for SimCLR.
-        Args:
-            sa_output_embedding (torch.Tensor): Output from last attention/GRU block [Batch, filters[0], Length]
-        Returns:
-            torch.Tensor: Projected embedding z [Batch, Projection_Dim]
-        """
-        # Flatten the sa_output_embedding to a 1D vector per sample
-        flattened_embedding = sa_output_embedding.reshape(sa_output_embedding.size(0), -1)
-        return self.projection_head(flattened_embedding)
-
-    def generate_prev_window(self, sa_output_embedding):
-        """
-        Generative head for CWG.
-        Args:
-            sa_output_embedding (torch.Tensor): Output from last attention/GRU block of the current signal
-                                                 [Batch, filters[0], Length]
-        Returns:
-            torch.Tensor: Generated prev signal [Batch, Length, 2] (PPG, ECG)
-        """
-        generated_signal_conv = self.generation_prev_head(sa_output_embedding)
-        return generated_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
-
-    def generate_next_window(self, sa_output_embedding):
-        """
-        Generative head for CWG.
-        Args:
-            sa_output_embedding (torch.Tensor): Output from last attention/GRU block of the current signal
-                                                 [Batch, filters[0], Length]
-        Returns:
-            torch.Tensor: Generated next signal [Batch, Length, 2] (PPG, ECG)
-        """
-        generated_signal_conv = self.generation_next_head(sa_output_embedding)
-        return generated_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
+    
 
     def forward(self, x):
         """
@@ -724,22 +661,13 @@ class SSLEUNet(nn.Module):
                         param.data.fill_(0)
     
     def get_input_channels(self):
-        # This function defines the input channels for the initial convolutional layer
-        # based on the selected signal modalities in the *supervised* context.
         
         ppg_in_channels = 0
         ecg_in_channels = 0
         resp_in_channels = 0
 
-        # Determine PPG related channels
-        if self.ppg_derivatives:
-            ppg_in_channels = 3  # PPG + PPG' + PPG''
-        elif self.ppg_emd:
-            ppg_in_channels = 4  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3
-        elif self.ppg_freqs:
-            ppg_in_channels = 16  # Scalogram output channels
-        else: # Default to just PPG if no special PPG features
-            ppg_in_channels = 1
+        # PPG must be always present
+        ppg_in_channels = 1
 
         # Determine ECG and RESP channels
         if self.ecg:
@@ -750,7 +678,6 @@ class SSLEUNet(nn.Module):
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):
-        # The input to summary should match how `forward` is called.
         
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
         total_input_channels = ppg_in_channels + ecg_in_channels + resp_in_channels
@@ -773,47 +700,10 @@ class SSLEUNet(nn.Module):
         sa_output_dummy, _ = self._run_full_unet_path(dummy_input)
         print(f"  Encoder/U-Net output (final attention/GRU block) shape: {sa_output_dummy.shape}")
 
-        print("\n--- Projection Head Summary (SimCLR) ---")
-        dummy_embedding_proj = torch.rand((batch_size, self.ssl_embedding_dim))
-        summary(self.projection_head, input_data=dummy_embedding_proj)
-
         print("\n--- Reconstruction Head Summary (MSR) ---")
         dummy_sa_output_recon = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
         summary(self.reconstruction_head, input_data=dummy_sa_output_recon)
-
-        print("\n--- Generation Head Summary (CWG - Prev) ---")
-        dummy_sa_output_gen = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
-        summary(self.generation_prev_head, input_data=dummy_sa_output_gen)
-        
-        print("\n--- Generation Head Summary (CWG - Next) ---")
-        dummy_sa_output_gen = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
-        summary(self.generation_next_head, input_data=dummy_sa_output_gen)
-
-    
-    def set_tunable_layers(self, tune):
-        # First set all parameters to be trainable
-        for p in self.parameters():
-            p.requires_grad = True
-        
-        if tune == "all":
-            return
-        elif tune == "last_linear":
-            # Freeze all layers except the supervised final_conv_supervised and SSL heads
-            for name, param in self.named_parameters():
-                if any(head_name in name for head_name in ["final_conv_supervised", "projection_head", "reconstruction_head", "generation_prev_head", "generation_next_head"]):
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-        elif tune == "encoder_only":
-            # Train only encoder blocks and bottleneck, freeze all decoder and head layers
-            for name, param in self.named_parameters():
-                if any(block_name in name for block_name in ["ppg_encoder_blocks", "ecg_encoder_blocks", "resp_encoder_blocks", "bottleneck"]):
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-        else:
-            raise ValueError(f"Undefined tune option: {tune}")
-        
+            
         
 def parseargs():
     parser = argparse.ArgumentParser(description="SSLUNet summary, # params and MACS")
@@ -822,19 +712,12 @@ def parseargs():
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ecg or not. True for SSL')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     parser.add_argument('--channels', default='16, 32, 64, 128', type=str, help='channels produced by the convolutional blocks') # Updated default channels
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer')
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer')
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
-    
-    # New arguments for SSL mode and heads
-    parser.add_argument('--proj_head_dim', default=256, type=int, help='Dimension of the projection head output for SimCLR')
-    parser.add_argument('--proj_hidden_dim', default=512, type=int, help='Dimension of the projection head hidden dim for SimCLR')
     parser.add_argument('--attention_type', default='self_attention', type=str, # Added attention_type argument
                         choices=['self_attention', 'nystrom_attention', 'gru'], 
                         help='Type of final processing layer: "self_attention", "nystrom_attention", or "gru"')
@@ -851,17 +734,12 @@ if __name__ == "__main__":
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         channels=args.channels,
         kernel_size=args.kernel_size,
         num_heads_attention=args.num_heads_attention,
         dim_feedforward_attention=args.dim_feedforward_attention,
-        projection_hidden_dim=args.proj_hidden_dim,
-        projection_dim=args.proj_head_dim,
-        attention_type=args.attention_type # Passed attention_type to model constructor
-        )
+        attention_type=args.attention_type
+    )
     net.print_summary(batch_size=args.batch_size)

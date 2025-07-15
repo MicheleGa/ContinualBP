@@ -58,7 +58,6 @@ def parseargs():
     parser.add_argument('--dataset_folder', default='./data/lmdb', type=str, help='path to dataset fodler')
     parser.add_argument('--dataset_name', default='test', type=str, help='name of the dataset')
     parser.add_argument('--lp_dataset_name', default='test', type=str, help='name of the dataset for linear probing')
-    parser.add_argument('--pretraining_ratio', default=0.8, type=float, help='pretraining ratio of the whole dataset')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
     parser.add_argument('--fold', default=0, type=int, help='fold number')
@@ -66,9 +65,6 @@ def parseargs():
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
@@ -82,6 +78,7 @@ def parseargs():
     # Self-supervision Setup
     parser.add_argument('--apply_masking', default='False', type=lambda x: bool(strtobool(x)), help='whether to apply masking for self-supervision or not')
     parser.add_argument('--masking_ratio', default=0.08, type=float, help='Ratio of signal length to mask for MSR task')
+    parser.add_argument('--masking_strategy', default='physiological', type=str, help='which type of masking to apply for self-supervision')
     parser.add_argument('--augmentation_types', default='jitter,scaling,magnitude_warp,flip', type=str, help='Comma-separated list of augmentation types for SimCLR')
     parser.add_argument('--aug_prob', default=0.5, type=float, help='Probability for each individual augmentation in RandomAugmentor')
     parser.add_argument('--data_aug', default='False', type=lambda x: bool(strtobool(x)), help='whether to use data augmentations also for the MSR and CWG SSL tasks or not')
@@ -548,16 +545,19 @@ def _handle_unet_tuning(model, tune, config):
         # Train all parameters
         for p in model.parameters():
             p.requires_grad = True
+            
     elif tune == 'none':
         # Train no parameters
         for p in model.parameters():
             p.requires_grad = False
+            
     elif tune == 'last_layer':
         # Freeze everything and only leave final_conv with require_grads True
         for p in model.parameters():
             p.requires_grad = False
         for p in model.final_conv.parameters():
             p.requires_grad = True
+            
     elif tune == 'attention':
         # Freeze everything except the AttentionGate1D and SelfAttentionBlock1D modules
         for p in model.parameters():
@@ -569,6 +569,7 @@ def _handle_unet_tuning(model, tune, config):
         # Also unfreeze the final convolution layer, as it's typically part of the "head"
         for p in model.final_conv.parameters():
             p.requires_grad = True
+            
     elif tune == 'decoder':
         # Freeze encoder and bottleneck, unfreeze decoder and attention gates, and final self-attention
         for p in model.parameters():
@@ -720,10 +721,6 @@ def _handle_sslunet_tuning(model, tune, config):
         # Only tune the final supervised convolutional layer
         for p in model.final_conv_supervised.parameters():
             p.requires_grad = True
-    elif tune == 'projection_head':
-        # Only tune the projection head
-        for p in model.projection_head.parameters():
-            p.requires_grad = True
     elif tune == 'reconstruction_head':
         # Only tune the reconstruction head
         for p in model.reconstruction_head.parameters():
@@ -761,11 +758,7 @@ def _handle_sslunet_tuning(model, tune, config):
         # This means everything *except* the specific SSL heads
         for name, param in model.named_parameters():
             if not any(head_name in name for head_name in [
-                "projection_head",
-                "reconstruction_head",
-                "permutation_head",
-                "generation_prev_head",
-                "generation_next_head"
+                "reconstruction_head"
             ]):
                 param.requires_grad = True
     else:
@@ -788,18 +781,10 @@ def _handle_ssl_eunet_tuning(model, tune, config):
         for p in model.parameters():
             p.requires_grad = False
         
-        # Supervised head
+        # Also unfreeze the final convolution layer for supervised task, and SSL heads
         for p in model.final_conv_supervised.parameters():
             p.requires_grad = True
-        
-        # SSL heads
-        for p in model.projection_head.parameters():
-            p.requires_grad = True
         for p in model.reconstruction_head.parameters():
-            p.requires_grad = True
-        for p in model.generation_prev_head.parameters():
-            p.requires_grad = True
-        for p in model.generation_next_head.parameters():
             p.requires_grad = True
 
     elif tune == 'attention':
@@ -828,13 +813,7 @@ def _handle_ssl_eunet_tuning(model, tune, config):
         # Also unfreeze the final convolution layer for supervised task, and SSL heads
         for p in model.final_conv_supervised.parameters():
             p.requires_grad = True
-        for p in model.projection_head.parameters():
-            p.requires_grad = True
         for p in model.reconstruction_head.parameters():
-            p.requires_grad = True
-        for p in model.generation_prev_head.parameters():
-            p.requires_grad = True
-        for p in model.generation_next_head.parameters():
             p.requires_grad = True
 
     elif tune == 'decoder':
@@ -867,13 +846,7 @@ def _handle_ssl_eunet_tuning(model, tune, config):
         # Also unfreeze the final convolution layer for supervised task, and SSL heads
         for p in model.final_conv_supervised.parameters():
             p.requires_grad = True
-        for p in model.projection_head.parameters():
-            p.requires_grad = True
         for p in model.reconstruction_head.parameters():
-            p.requires_grad = True
-        for p in model.generation_prev_head.parameters():
-            p.requires_grad = True
-        for p in model.generation_next_head.parameters():
             p.requires_grad = True
             
     elif tune == 'encoder':
@@ -969,9 +942,6 @@ def get_model_architecture(config):
         model = ResGRUNet.ResGRUNet(
             ecg=config['ecg'],
             resp=config['resp'], 
-            ppg_derivatives=config['ppg_derivatives'], 
-            ppg_emd=config['ppg_emd'], 
-            ppg_freqs=config['ppg_freqs'],
             channels=config['channels'], 
             kernel_size=config['kernel_size'], 
             act=config['act'], 
@@ -979,14 +949,11 @@ def get_model_architecture(config):
             proj_head_dim=config['proj_head_dim'], 
             input_seq_len=int(config['input_seq_len_s'] * config['fs']),
             return_embedding=config['return_embedding']
-            )
+        )
     elif config['model_name'] == 'PhysioFormer':
         model = PhysioFormer.PhysioFormer(
             ecg=config['ecg'],
             resp=config['resp'], 
-            ppg_derivatives=config['ppg_derivatives'], 
-            ppg_emd=config['ppg_emd'], 
-            ppg_freqs=config['ppg_freqs'],
             embed_dim=config['embed_dim'], 
             n_head=config['n_head'], 
             head_dim=config['head_dim'], 
@@ -994,30 +961,24 @@ def get_model_architecture(config):
             num_layers=config['num_layers'], 
             input_seq_len=int(config['input_seq_len_s'] * config['fs']),
             return_embedding=config['return_embedding']
-            )
+        )
     elif config['model_name'] == 'UNet':
         model = UNet.UNet(
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             channels=config['channels'],
             kernel_size=config['kernel_size'],
             num_heads_attention=config['num_heads_attention'],
             dim_feedforward_attention=config['dim_feedforward_attention']
-            )
+        )
     elif config['model_name'] == 'GRU':
         model = GRU.GRU(
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             hidden_dim=config['hidden_dim'],
@@ -1029,9 +990,6 @@ def get_model_architecture(config):
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             embed_dim=config['embed_dim'],
@@ -1044,9 +1002,6 @@ def get_model_architecture(config):
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             channels=config['channels'], 
@@ -1054,32 +1009,24 @@ def get_model_architecture(config):
             num_heads_attention=config['num_heads_attention'],
             dim_feedforward_attention=config['dim_feedforward_attention'],
             attention_type=config['attention_type'] 
-            ) 
+        ) 
     elif config['model_name'] == 'SSLUNet':
         model = SSLUNet.SSLUNet(
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             channels=config['channels'],
             kernel_size=config['kernel_size'],
             num_heads_attention=config['num_heads_attention'],
             dim_feedforward_attention=config['dim_feedforward_attention'],
-            projection_hidden_dim=config['proj_hidden_dim'],
-            projection_dim=config['proj_head_dim']
-            )
+        )
     elif config['model_name'] == 'SSLEUNet':
         model = SSLEUNet.SSLEUNet(
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             channels=config['channels'], 
@@ -1087,7 +1034,7 @@ def get_model_architecture(config):
             num_heads_attention=config['num_heads_attention'],
             dim_feedforward_attention=config['dim_feedforward_attention'],
             attention_type=config['attention_type'] 
-            )
+        )
     else:
         raise ValueError("Invalid model name ...")
     

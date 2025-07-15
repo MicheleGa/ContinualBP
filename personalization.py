@@ -387,10 +387,6 @@ if __name__ == "__main__":
     if config['resp'] and not config['ecg']:
         raise ValueError('RESP can be loaded only along with ECG')
 
-    # PPG derivatives/PPG EMD/PPG freqs are loaded only if ecg (and optionally resp) are not present
-    if (config['ppg_derivatives'] or config['ppg_emd'] or config['ppg_freqs']) and config['ecg']:
-        raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')
-
     # Instantiate OnlinePhysioDataset (the base for continual learning)
     # This remains unchanged, as it's the core LMDB interface.
     online_physio_dataset_base = OnlinePhysioDataset(
@@ -399,10 +395,7 @@ if __name__ == "__main__":
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
         resp=config['resp'],
-        sig2sig=config['sig2sig'],
-        ppg_derivatives=config['ppg_derivatives'],
-        ppg_emd=config['ppg_emd'],
-        ppg_freqs=config['ppg_freqs']
+        sig2sig=config['sig2sig']
     )
 
     # --- Continual Learning Setup ---

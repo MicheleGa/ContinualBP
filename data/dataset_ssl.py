@@ -20,22 +20,18 @@ class PhysioDatasetSSL(Dataset):
     def __init__(self,
                  seed,
                  lmdb_folder,
-                 pretraining_ratio=0.8,
                  pretraining_split_ratio=[0.7, 0.1, 0.2],
-                 personalization_sample_number=50,
                  mix_pretraining_subject_samples=False,
                  fs=125,
                  input_seq_len_s=5,
                  ecg=False,
                  resp=False,
                  sig2sig=False,
-                 ppg_derivatives=False,
-                 ppg_emd=False,
-                 ppg_freqs=False,
                  min_subject_sample_number=0,
                  plot=False,
                  savepath='./figs',
-                 masking_ratio=0.15, 
+                 masking_strategy='physiological',
+                 masking_ratio=0.08, 
                  augmentation_types=['jitter', 'scaling', 'magnitude_warp', 'flip'],
                  aug_prob=0.2 
                  ):
@@ -51,69 +47,49 @@ class PhysioDatasetSSL(Dataset):
         self.lmdbtxn = self.lmdbenv.begin(buffers=True) # Use buffers=True for faster direct access to byte arrays
 
         # Subject/Sample lists/dicts
-        self.subject_list:list = pickle.loads(self.lmdbtxn.get("subject_list".encode()))
+        self.subjects_for_pretraining:list = pickle.loads(self.lmdbtxn.get("subject_list".encode()))
         self.index_by_subject_id:dict = pickle.loads(self.lmdbtxn.get("index_by_subject_id".encode()))
         self.index_by_sample_id = pickle.loads(self.lmdbtxn.get("index_by_sample_id".encode())) # This should now be a list of tuples (subject_id, segment_idx)
         self.check_subjects_list(min_subject_sample_number=min_subject_sample_number)
 
-        # Which input data to load (PPG + VPG + APG, PPG + ECG, etc.), PPG is always loaded
+        # Which input data to load (PPG, PPG + ECG, PPG + ECG + RESP), PPG is always loaded
         self.ecg = ecg
         self.resp = resp
-        self.sig2sig = sig2sig # Predict annotation over the whole analysis window or not
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
+        self.sig2sig = sig2sig
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
-        self.sample_len = self.fs * self.input_seq_len_s # Consistent way to get 625
+        self.sample_len = self.fs * self.input_seq_len_s 
 
         # Plot arguments
         self.plot = plot
         self.savepath = savepath
 
         # Dataset split
-        self.total_subject_n = len(self.subject_list)
-        # self.total_sample_n = len(self.index_by_sample_id) # This was for the old structure. We'll use len(self.index_by_sample_id) directly if it's the valid samples.
-        self.pretraining_ratio = pretraining_ratio # Percentage of pretraining subjects of the whole dataset
+        self.total_subject_n = len(self.subjects_for_pretraining)
         self.pretraining_split_ratio = pretraining_split_ratio # To divide pretraining from personalization, and then to divide the pretraining dataset
         self.mix_pretraining_subject_samples = mix_pretraining_subject_samples # Whether to split train/val/test during pretraining subjectwise or not
-        self.personalization_sample_number = personalization_sample_number # To split subject data during the personalization stage
-
-        # Split pretraining and personalization subjects
-        # Ensure subject_list is a list of actual subject IDs, not (subject_id, segment_idx) tuples if that's what index_by_sample_id implies
-        # Assuming self.subject_list contains unique subject IDs (e.g., 's001', 's002')
-        pretraining_subjects, personalization_subjects = train_test_split(self.subject_list, test_size=(1.0-self.pretraining_ratio), random_state=seed)
-
-        self.subjects_for_pretraining = pretraining_subjects
-        self.subjects_for_personalization = personalization_subjects
-
+        
         if self.plot:
-            plot_pretraining_personalization_subjects_distribution(self.subjects_for_pretraining, self.subjects_for_personalization, title=f'Pretraining vs Personalization Subjects Split (Total {len(self.subject_list)} subjects)', savepath=os.path.join(savepath, 'pretraining_vs_personalization_subjects_distribution.jpg'))
             plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, 'pretraining_subject_sample_distribution.jpg'))
-            plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_personalization, savepath=os.path.join(savepath, 'personalization_subject_sample_distribution.jpg'))
-
+            
         print("{:s} initialized with following configuration:".format(self.__class__.__name__))
         pprint.pprint(
             {
-                "Subjects":
-                {
-                    "Total": len(self.subject_list),
-                    "Pretraining": len(self.subjects_for_pretraining),
-                    "Personalization": len(self.subjects_for_personalization)
-                },
-                "Samples": len(self.index_by_sample_id), # Corrected to reflect actual number of storable samples
-                "Pretraining Ratio": self.pretraining_ratio
+                "Total Subjects": len(self.subjects_for_pretraining),
+                "Total Samples": len(self.index_by_sample_id)
             }
         )
 
-        # Self-Supervised augmentations and pretext mask task
+        # Self-Supervised pretext mask task
+        self.masking_ratio = masking_ratio
+        self.masking_strategy = masking_strategy
+        
         # Initialize augmentors for SimCLR. Each channel augmented independently.
         # For simplicity, using same set of augmentations for both, but could be different
-        self.masking_ratio = masking_ratio
-        self.augmentor_ppg = self._create_augmentor(augmentation_types, aug_prob)
-        self.augmentor_ecg = self._create_augmentor(augmentation_types, aug_prob) 
+        #self.augmentor_ppg = self._create_augmentor(augmentation_types, aug_prob)
+        #self.augmentor_ecg = self._create_augmentor(augmentation_types, aug_prob) 
         
-
+        
     def _create_augmentor(self, augmentation_types, aug_prob):
         r"""Helper to create RandomAugmentor based on types."""
         augmentations = []
@@ -137,14 +113,14 @@ class PhysioDatasetSSL(Dataset):
         # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
         # with lmdbenv.begin(write=True) as txn: deos not make this check
         invalid_subjects = list()
-        for subject in self.subject_list:
+        for subject in self.subjects_for_pretraining:
             if len(self.index_by_subject_id[subject]) <= min_subject_sample_number:
                 invalid_subjects.append(subject)
         
         if len(invalid_subjects) > 0:
             print("Invalid subjects found in the dataset, removing them ...")
             for subject in invalid_subjects:
-                self.subject_list.remove(subject)
+                self.subjects_for_pretraining.remove(subject)
                 del self.index_by_subject_id[subject]
                 
     
@@ -156,6 +132,7 @@ class PhysioDatasetSSL(Dataset):
             # Assuming all signals are float32 and SIGNAL_LENGTH is consistent
             return np.frombuffer(value, dtype=np.float32)
         return None
+    
 
     def _get_multi_channel_signal(self, sample_id, ppg_key_prefix, ecg_key_prefix):
         r"""Helper to get stacked PPG and ECG for a specific window type (prev/curr/next)."""
@@ -168,7 +145,7 @@ class PhysioDatasetSSL(Dataset):
         return None # Return None if either is missing
 
 
-    def _mask_signal(self, signal_tensor, masking_ratio, masking_strategy='adaptive_spans', min_span_length=None, max_span_length=None, num_spans=None):
+    def _mask_signal(self, signal_tensor, masking_ratio, masking_strategy='physiological', min_span_length=None, max_span_length=None, num_spans=None):
         r"""
         Masks portions of physiological signals (ECG, PPG, etc.) using span-based masking
         optimized for masked modeling learning (MML).
@@ -181,10 +158,7 @@ class PhysioDatasetSSL(Dataset):
                 The ratio of the signal to mask (e.g., 0.15 = 15%).
             masking_strategy (str): 
                 Strategy for span masking:
-                - 'adaptive_spans': Variable span lengths based on signal characteristics
-                - 'fixed_spans': Fixed number of spans with variable lengths
                 - 'physiological': Spans mimicking real physiological artifacts
-                - 'block': Large contiguous blocks (good for long sequences)
             min_span_length (int, optional): 
                 Minimum span length. Defaults based on strategy.
             max_span_length (int, optional): 
@@ -205,35 +179,12 @@ class PhysioDatasetSSL(Dataset):
         if num_mask_tokens == 0:
             return signal_tensor.clone(), torch.zeros(length, dtype=torch.bool)
         
-        # Set strategy-specific defaults
-        if masking_strategy == 'adaptive_spans':
-            if min_span_length is None:
-                min_span_length = max(1, length // 200)  # ~0.5% of signal
-            if max_span_length is None:
-                max_span_length = max(min_span_length, length // 20)  # ~5% of signal
-                
-        elif masking_strategy == 'physiological':
+        if masking_strategy == 'physiological':
             # Mimic real physiological artifacts
             if min_span_length is None:
                 min_span_length = max(1, length // 100)  # Short artifacts
             if max_span_length is None:
                 max_span_length = max(min_span_length, length // 10)  # Long artifacts
-                
-        elif masking_strategy == 'block':
-            # Larger contiguous blocks
-            if min_span_length is None:
-                min_span_length = max(1, length // 50)
-            if max_span_length is None:
-                max_span_length = max(min_span_length, length // 5)
-                
-        elif masking_strategy == 'fixed_spans':
-            if num_spans is None:
-                num_spans = max(1, int(length * masking_ratio / 10))  # ~10 tokens per span avg
-            avg_span_length = max(1, num_mask_tokens // num_spans)
-            if min_span_length is None:
-                min_span_length = max(1, avg_span_length // 2)
-            if max_span_length is None:
-                max_span_length = max(min_span_length, avg_span_length * 2)
         
         # Default fallback
         if min_span_length is None:
@@ -247,13 +198,10 @@ class PhysioDatasetSSL(Dataset):
 
 
     def _generate_span_mask(self, signal_tensor, num_mask_tokens, min_span_length, max_span_length, strategy, num_spans=None):
-        """Generate span mask based on strategy."""
+        """Generate mask based on strategy."""
         length = signal_tensor.shape[0]
         mask_indices = torch.zeros(length, dtype=torch.bool)
         masked_tokens = 0
-        
-        if strategy == 'fixed_spans' and num_spans:
-            return self._fixed_spans_masking(signal_tensor, num_mask_tokens, num_spans, min_span_length, max_span_length)
         
         # Adaptive span generation
         max_attempts = min(1000, length * 2)
@@ -266,11 +214,8 @@ class PhysioDatasetSSL(Dataset):
             # Determine span length based on strategy
             if strategy == 'physiological':
                 span_length = self._physiological_span_length(min_span_length, max_span_length)
-            elif strategy == 'block':
-                # Favor larger spans for block strategy
-                span_length = self._block_span_length(min_span_length, max_span_length, num_mask_tokens - masked_tokens)
-            else:  # adaptive_spans
-                span_length = self._adaptive_span_length(min_span_length, max_span_length, length, masked_tokens, num_mask_tokens)
+            else:
+                raise ValueError(f"Unknown masking strategy: {strategy}")
             
             span_length = min(span_length, num_mask_tokens - masked_tokens)
             
@@ -325,68 +270,7 @@ class PhysioDatasetSSL(Dataset):
             return random.randint(min_len, min(max_len, min_len * 3))
         else:  # 30% longer artifacts
             return random.randint(min_len * 2, max_len)
-
-
-    def _block_span_length(self, min_len, max_len, remaining_tokens):
-        """Generate larger block spans."""
-        # Favor larger spans for block masking
-        target_len = random.randint(max(min_len, max_len // 2), max_len)
-        return min(target_len, remaining_tokens)
-
-
-    def _adaptive_span_length(self, min_len, max_len, total_length, masked_so_far, target_masked):
-        """Adaptive span length based on progress."""
-        progress = masked_so_far / target_masked if target_masked > 0 else 0
         
-        if progress < 0.3:  # Early phase: varied lengths
-            return random.randint(min_len, max_len)
-        elif progress < 0.8:  # Middle phase: moderate lengths
-            mid_len = (min_len + max_len) // 2
-            return random.randint(min_len, mid_len)
-        else:  # Late phase: smaller lengths to fine-tune
-            return random.randint(min_len, min(max_len, min_len * 2))
-
-
-    def _fixed_spans_masking(self, signal_tensor, num_mask_tokens, num_spans, min_len, max_len):
-        """Generate exactly num_spans spans."""
-        length = signal_tensor.shape[0]
-        mask_indices = torch.zeros(length, dtype=torch.bool)
-        
-        # Calculate span lengths
-        base_span_length = num_mask_tokens // num_spans
-        extra_tokens = num_mask_tokens % num_spans
-        
-        spans_placed = 0
-        max_attempts = num_spans * 10
-        
-        for attempt in range(max_attempts):
-            if spans_placed >= num_spans:
-                break
-                
-            # Determine span length for this span
-            span_length = base_span_length
-            if spans_placed < extra_tokens:
-                span_length += 1
-                
-            span_length = max(min_len, min(max_len, span_length))
-            
-            # Find position
-            max_start = length - span_length
-            if max_start < 0:
-                continue
-                
-            start_idx = random.randint(0, max_start)
-            end_idx = start_idx + span_length
-            
-            if not mask_indices[start_idx:end_idx].any():
-                mask_indices[start_idx:end_idx] = True
-                spans_placed += 1
-        
-        masked_signal = signal_tensor.clone()
-        masked_signal[mask_indices, :] = 0.0
-        
-        return masked_signal, mask_indices
-
 
     def _find_span_extensions(self, mask_indices, remaining_positions, needed):
         """Find positions that extend existing spans (for more natural masking)."""
@@ -419,31 +303,6 @@ class PhysioDatasetSSL(Dataset):
                 additional = random.sample(remaining_pool, min(additional_needed, len(remaining_pool)))
                 selected.extend(additional)
             return torch.tensor(selected)
-
-
-    # Utility function for common use cases
-    def mask_ecg_signal(self, signal_tensor, masking_ratio=0.15):
-        """Convenience function for ECG signal masking."""
-        # ECG-specific parameters (assuming ~250-500 Hz sampling)
-        length = signal_tensor.shape[0]
-        return self._mask_signal(None, 
-                                 signal_tensor, 
-                                 masking_ratio, 
-                                 masking_strategy='physiological', 
-                                 min_span_length=max(1, length // 250),  # ~4ms at 250Hz
-                                 max_span_length=max(1, length // 25))   # ~40ms at 250Hz
-
-
-    def mask_ppg_signal(self, signal_tensor, masking_ratio=0.15):
-        """Convenience function for PPG signal masking."""
-        # PPG-specific parameters (assuming ~100-125 Hz sampling)
-        length = signal_tensor.shape[0]
-        return self._mask_signal(None, 
-                                 signal_tensor, 
-                                 masking_ratio,
-                                 masking_strategy='physiological',
-                                 min_span_length=max(1, length // 125),  # ~8ms at 125Hz
-                                 max_span_length=max(1, length // 12))   # ~80ms at 125Hz
     
 
     def get_pretraining_samplers(self):
@@ -547,58 +406,59 @@ class PhysioDatasetSSL(Dataset):
     def __getitem__(self, index_in_lmdb):
         # `index_in_lmdb` here refers to the actual `sample_id` (integer) stored in LMDB,
         # The sampler will provide these actual LMDB sample_ids.
+        
+        current_ppg = self._get_signal_from_lmdb(index_in_lmdb, "ppg")
+        if current_ppg is None:
+            raise ValueError(f"Missing current PPG for sample_id {index_in_lmdb}. Data corruption or preprocessing error.")
 
-        # --- Load Current Window Signals (PPG and ECG are always needed for self-supervised) ---
-        current_ppg = self._get_signal_from_lmdb(index_in_lmdb, "curr_ppg")
-        current_ecg = self._get_signal_from_lmdb(index_in_lmdb, "curr_ecg")
+        input_signal_np = None
 
-        if current_ppg is None or current_ecg is None:
-            # This should ideally not happen 
-            raise ValueError(f"Missing current PPG or ECG for sample_id {index_in_lmdb}. Data corruption or preprocessing error.")
+        # Conditional loading of ECG
+        if self.ecg:
+            current_ecg = self._get_signal_from_lmdb(index_in_lmdb, "ecg")
+            if current_ecg is None:
+                # If ECG is explicitly requested (self.ecg = True) but not found, raise an error
+                raise ValueError(f"ECG requested (self.ecg=True) but 'ecg' key not found for sample_id {index_in_lmdb}. Cannot proceed.")
+            
+            # Stack both PPG and ECG if ECG is loaded
+            input_signal_np = np.stack([current_ppg, current_ecg], axis=-1)
+        else:
+            # Only PPG, reshape to [LENGTH, 1] to maintain consistency with multi-channel format [length, channels]
+            input_signal_np = current_ppg.reshape(-1, 1)
+
+        # Ensure that the input signals are numpy arrays with writeable flags
+        input_signal_np = np.require(input_signal_np, requirements=['O', 'W'])
+        input_signal_np.setflags(write=1)
         
-        current_ppg_ecg_stacked = np.stack([current_ppg, current_ecg], axis=-1) # Shape [LENGTH, 2]
+        input_signal_tensor = torch.from_numpy(input_signal_np)
         
-        # --- Self-supervised Mode Logic ---
-       
-        # 1. Load Triplet for cross-windows reconstruction
-        # prev_ppg_ecg_pair and next_ppg_ecg_pair are stored as (ppg_array, ecg_array) or (None, None)
-        # They were saved in the LMDB directly using `f"{sample_id}-prev_ppg"` etc.
-        
-        prev_ppg_ecg = self._get_multi_channel_signal(index_in_lmdb, "prev_ppg", "prev_ecg")
-        next_ppg_ecg = self._get_multi_channel_signal(index_in_lmdb, "next_ppg", "next_ecg")
-        
-        # 2. Masked Signal for MSR
-        # Apply masking to the current_ppg_ecg_stacked
-        current_ppg_ecg_tensor = torch.from_numpy(current_ppg_ecg_stacked)
-        masked_current_ppg_ecg, mask_indices = self._mask_signal(
-            current_ppg_ecg_tensor, 
-            self.masking_ratio, 
-            masking_strategy='physiological', 
+        # Apply masking (indices are important rather than values)
+        _, mask_indices = self._mask_signal(
+            input_signal_tensor,
+            self.masking_ratio,
+            masking_strategy=self.masking_strategy,
             min_span_length=5,
             max_span_length=25
-            )
-
-        # 3. Augmented Signals for SimCLR
-        # Apply two different augmentations to the current_ppg_ecg_stacked
-        aug1_ppg = self.augmentor_ppg(torch.from_numpy(current_ppg_ecg_stacked[:, 0])) # PPG channel
-        aug1_ecg = self.augmentor_ecg(torch.from_numpy(current_ppg_ecg_stacked[:, 1])) # ECG channel
-        aug1_ppg_ecg = torch.stack([aug1_ppg, aug1_ecg], dim=-1).squeeze()
-
-        aug2_ppg = self.augmentor_ppg(torch.from_numpy(current_ppg_ecg_stacked[:, 0]))
-        aug2_ecg = self.augmentor_ecg(torch.from_numpy(current_ppg_ecg_stacked[:, 1]))
-        aug2_ppg_ecg = torch.stack([aug2_ppg, aug2_ecg], dim=-1).squeeze()
-
-        # Return a dictionary suitable for self-supervised training
+        )
+        
         return {
-            'current_signal': current_ppg_ecg_tensor,          # For Jigsaw, base for MSR/SimCLR
-            'masked_signal': masked_current_ppg_ecg,           # For MSR input
+            'input_signal': input_signal_tensor,          # For MSR input
             'mask_indices': mask_indices,                      # For MSR loss (to compute loss only on masked parts)
-            'aug1_signal': aug1_ppg_ecg,                       # For SimCLR view 1
-            'aug2_signal': aug2_ppg_ecg,                       # For SimCLR view 2
-            'prev_signal': torch.from_numpy(prev_ppg_ecg) if prev_ppg_ecg is not None else None, # For CWG (input or context)
-            'next_signal': torch.from_numpy(next_ppg_ecg) if next_ppg_ecg is not None else None, # For CWG (target)
             'sample_id': index_in_lmdb, # Useful for debugging or associating with original data
         }
+        
+
+def create_masked_signal(signal, mask_indices):
+    """
+    Applies masking to a signal tensor based on boolean mask_indices.
+    Assumes signal is [B, L, C] and mask_indices is [B, L] bool.
+    Masked positions are set to 0.0.
+    """
+    masked_s = torch.from_numpy(signal).clone()
+    # Expand mask_indices to match the channel dimension of the signal
+    mask_expanded = mask_indices.unsqueeze(-1).expand_as(masked_s)
+    masked_s[mask_expanded] = 0.0
+    return masked_s.numpy()
 
         
 def parseargs():
@@ -610,7 +470,6 @@ def parseargs():
     parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--pretraining_ratio', default=0.8, type=float, help='pretraining ratio of the whole dataset')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
     parser.add_argument('--personalization_sample_number', default=50, type=int, help='number of samples to take for personalization')
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
@@ -618,14 +477,12 @@ def parseargs():
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     # New arguments for self-supervised learning
     parser.add_argument('--masking_ratio', default=0.08, type=float, help='Ratio of signal length to mask for MSR task')
+    parser.add_argument('--masking_strategy', default='physiological', type=str, help='which type of masking to apply for self-supervision')
     parser.add_argument('--augmentation_types', default='jitter,scaling,magnitude_warp,flip', type=str, help='Comma-separated list of augmentation types for SimCLR')
     parser.add_argument('--aug_prob', default=0.5, type=float, help='Probability for each individual augmentation in RandomAugmentor')
 
@@ -635,17 +492,12 @@ def parseargs():
 if __name__ == "__main__":
     global args
     args = parseargs()
-
-    assert args.ecg, "ECG data must be enabled for this script to run."
     
     # RESP is loaded only if ECG is also loaded
     if args.resp and not args.ecg:
         raise ValueError('RESP can be loaded only along with ECG')
-
-    # PPG derivatives/PPG EMD/PPG freqs are loaded only if ecg (and optionally resp) are not present
-    if (args.ppg_derivatives or args.ppg_emd or args.ppg_freqs) and args.ecg:
-        raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')
-
+    
+    # Create save path if it does not exist
     root_figs_folder = os.path.join(args.save_path, args.name)
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
@@ -654,21 +506,17 @@ if __name__ == "__main__":
     dataset = PhysioDatasetSSL(
         seed=args.seed,
         lmdb_folder=os.path.join(args.dataset_folder, args.name),
-        pretraining_ratio=args.pretraining_ratio,
         pretraining_split_ratio=list(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
-        personalization_sample_number=args.personalization_sample_number,
         mix_pretraining_subject_samples=args.mix_pretraining_subject_samples,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
         plot=args.plot,
         savepath=root_figs_folder,
         masking_ratio=args.masking_ratio,
+        masking_strategy=args.masking_strategy,
         augmentation_types=args.augmentation_types.split(','),
         aug_prob=args.aug_prob
     )
@@ -691,22 +539,26 @@ if __name__ == "__main__":
         elif isinstance(value, torch.Tensor):
             print(f"Key: {key}, Shape: {value.shape}, Dtype: {value.dtype}")
         elif isinstance(value, list):
-            print(f"Key: {key}, Type: List of Tensors/None")
-            for i, item in enumerate(value):
-                if item is None:
-                    print(f"  Item {i}: None")
-                elif isinstance(item, torch.Tensor):
-                    print(f"  Item {i}: Shape: {item.shape}, Dtype: {item.dtype}")
+            # Check if it's the 'signal_labels' list for specific printing
+            if key == 'signal_labels':
+                print(f"Key: {key}, Type: List of Strings: {value}")
+            else: # For other lists
+                print(f"Key: {key}, Type: List of Tensors/None")
+                for i, item in enumerate(value):
+                    if item is None:
+                        print(f"  Item {i}: None")
+                    elif isinstance(item, torch.Tensor):
+                        print(f"  Item {i}: Shape: {item.shape}, Dtype: {item.dtype}")
         else:
             print(f"Key: {key}, Type: {type(value)}")
 
     # Example plotting for self-supervised mode
-    idx = np.random.randint(0, input_batch['current_signal'].shape[0])
+    idx = np.random.randint(0, input_batch['input_signal'].shape[0])
     print(f"\nPlotting sample {idx} from batch for self-supervised mode...")
 
     # Original signal (for reference)
     plot_signals(
-        input_batch['current_signal'][idx].numpy().T,
+        input_batch['input_signal'][idx].numpy().T,
         fs=args.fs,
         labels=['PPG', 'ECG'],
         title=f'Original Signal (Sample {idx})',
@@ -715,7 +567,8 @@ if __name__ == "__main__":
     )
 
     # Masked signal () the list is required by plot_signals
-    masked_sig_to_plot = input_batch['masked_signal'][idx].numpy().T
+    masked_sig_to_plot = create_masked_signal(input_batch['input_signal'][idx].numpy(), input_batch['mask_indices'][idx]).T
+    
     plot_signals(
         masked_sig_to_plot,
         fs=args.fs,
@@ -724,45 +577,3 @@ if __name__ == "__main__":
         savepath=root_figs_folder,
         ylabels=['a.u.', 'mV']
     )
-
-    # Augmented signal 1
-    aug1_sig_to_plot = input_batch['aug1_signal'][idx].numpy().T
-    plot_signals(
-        aug1_sig_to_plot,
-        fs=args.fs,
-        labels=['PPG (Aug 1)', 'ECG (Aug 1)'],
-        title=f'Augmented Signal 1 (Sample {idx})',
-        savepath=root_figs_folder,
-        ylabels=['a.u.', 'mV']
-    )
-
-    # Augmented signal 2
-    aug2_sig_to_plot = input_batch['aug2_signal'][idx].numpy().T
-    plot_signals(
-        aug2_sig_to_plot,
-        fs=args.fs,
-        labels=['PPG (Aug 2)', 'ECG (Aug 2)'],
-        title=f'Augmented Signal 2 (Sample {idx})',
-        savepath=root_figs_folder,
-        ylabels=['a.u.', 'mV']
-    )
-    
-    # You might want to plot prev/next if they are not None as well
-    plot_signals(
-        input_batch['next_signal'][idx].numpy().T,
-        fs=args.fs,
-        labels=['PPG (Next)', 'ECG (Next)'],
-        title=f'Next Window Signal (Sample {idx})',
-        savepath=root_figs_folder,
-        ylabels=['a.u.', 'mV']
-    )
-    plot_signals(
-        input_batch['prev_signal'][idx].numpy().T,
-        fs=args.fs,
-        labels=['PPG (Prev)', 'ECG (Prev)'],
-        title=f'Previous Window Signal (Sample {idx})',
-        savepath=root_figs_folder,
-        ylabels=['a.u.', 'mV']
-    )
-
-    

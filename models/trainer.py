@@ -71,7 +71,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
     else:
         early_stopping = None
 
-    if not config['ssl']: # Original supervised path
+    if not config['ssl']:
         return supervised_pretraining_training_validation_testing(
             save_name=save_name,
             checkpoint_path=checkpoint_path,
@@ -87,7 +87,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
             config=config,
             device=device
             )
-    else: # New self-supervised path
+    else: 
         return self_supervised_pretraining_training_validation_testing(
             save_name=save_name,
             checkpoint_path=checkpoint_path,
@@ -505,6 +505,7 @@ def supcon_loss(features, config, labels=None, mask=None):
 
     return loss, cos_sim, pos_mask
 
+
 def create_masked_signal(signal, mask_indices):
     """
     Applies masking to a signal tensor based on boolean mask_indices.
@@ -540,111 +541,39 @@ def self_supervised_pretraining_training_validation_testing(
     for epoch in range(config['max_training_epochs']):
 
         # Training loop
-        model.train() # Set model to training mode
-        set_trainable_parameters(model=model, tune='all', config=config) # Parameters to train (e.g., all encoder and SSL heads)
+        model.train() 
+        set_trainable_parameters(model=model, tune='all', config=config) 
         
         train_losses = AverageMeter(name='train/loss')
         train_msr_losses = AverageMeter(name='train/msr_loss')
-        train_cwg_losses = AverageMeter(name='train/cwg_loss')
-        train_contrastive_losses = AverageMeter(name='train/contrastive_loss')
         
         for batch_idx, batch in enumerate(train_dataloader):
             
             # Move data to device
-            original_current_signal = batch['current_signal'].to(device) # Original signal
-            mask_indices = batch['mask_indices'].to(device)             # Mask indices for MSR
-            aug1_signal = batch['aug1_signal'].to(device)               # Augmented view 1
-            aug2_signal = batch['aug2_signal'].to(device)               # Augmented view 2
-            
-            # Original prev/next signals for CWG targets (assuming these are unaugmented targets)
-            original_prev_signal = batch['prev_signal'].to(device)
-            original_next_signal = batch['next_signal'].to(device)
+            original_input_signal = batch['input_signal'].to(device) 
+            mask_indices = batch['mask_indices'].to(device)             
 
-            optimizer.zero_grad() # Zero gradients for a new batch
-
-            # Data Augmentation Assignment for MSR and CWG in Training
-            # Randomly assign aug1 and aug2 to MSR and CWG tasks
-            if config.get('data_aug', False):
-                if random.random() < 0.5: # 50% chance
-                    msr_signal_input = aug1_signal
-                    cwg_signal_input = aug2_signal
-                else:
-                    msr_signal_input = aug2_signal
-                    cwg_signal_input = aug1_signal
-                
-                # For MSR, the target is the *original* augmented signal from which the masked input is derived.
-                # So if msr_signal_input is aug1, the target is aug1.
-                msr_target_signal = msr_signal_input
-
-                # For CWG, the current signal input is chosen, but the targets (prev/next) are assumed to be
-                # the *original* prev/next signals provided by the dataset. Possible expansion: augment also prev/next signals
-                cwg_prev_signal_target = original_prev_signal
-                cwg_next_signal_target = original_next_signal
-
-            else:
-                # If data_aug is false, use original signals for MSR and CWG
-                msr_signal_input = original_current_signal
-                msr_target_signal = original_current_signal # Target for MSR is the original signal
-                cwg_signal_input = original_current_signal
-                cwg_prev_signal_target = original_prev_signal
-                cwg_next_signal_target = original_next_signal
-
-            # --- Forward Passes and Loss Calculations for Each Task ---
+            optimizer.zero_grad() 
 
             # 1. Masked Signal Reconstruction (MSR)
             msr_loss = torch.tensor(0.0, device=device)
             if config['lambda_msr'] != 0.:
                 # MSR input now uses assigned augmented signal
                 # Create the masked input from the chosen augmented signal
-                masked_input_for_msr = create_masked_signal(msr_signal_input, mask_indices)
+                masked_input_for_msr = create_masked_signal(original_input_signal, mask_indices)
                 masked_embedding = model.encode(masked_input_for_msr)
                 reconstructed_signal = model.reconstruct(masked_embedding)
 
                 # Calculate loss only on masked positions against the chosen augmented target
                 if config['criterion'] == 'MSELoss':
-                    msr_loss = F.mse_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], msr_target_signal[mask_indices.unsqueeze(-1).expand_as(msr_target_signal)])
+                    msr_loss = F.mse_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], original_input_signal[mask_indices.unsqueeze(-1).expand_as(original_input_signal)])
                 elif config['criterion'] == 'SmoothL1Loss':
-                    msr_loss = F.smooth_l1_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], msr_target_signal[mask_indices.unsqueeze(-1).expand_as(msr_target_signal)])
+                    msr_loss = F.smooth_l1_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], original_input_signal[mask_indices.unsqueeze(-1).expand_as(original_input_signal)])
                 else:
                     raise ValueError("Invalid criterion ...")
 
-            # 2. Cross-Window Generation (CWG)
-            cwg_loss = torch.tensor(0.0, device=device)
-            if config['lambda_cwg'] != 0.:
-                # CWG input now uses assigned augmented signal
-                current_embedding_for_cwg = model.encode(cwg_signal_input)
-                generated_prev_signal = model.generate_prev_window(current_embedding_for_cwg)
-                generated_next_signal = model.generate_next_window(current_embedding_for_cwg)
-
-                # Calculate loss against original prev/next signals (as per current design)
-                if config['criterion'] == 'MSELoss':
-                    cwg_loss = F.mse_loss(generated_prev_signal, cwg_prev_signal_target) + F.mse_loss(generated_next_signal, cwg_next_signal_target)
-                elif config['criterion'] == 'SmoothL1Loss':
-                    cwg_loss = F.smooth_l1_loss(generated_prev_signal, cwg_prev_signal_target) + F.smooth_l1_loss(generated_next_signal, cwg_next_signal_target)
-                else:
-                    raise ValueError("Invalid criterion ...")                
-
-            # 3. Contrastive Learning (SimCLR)
-            contrastive_loss = torch.tensor(0.0, device=device)
-            if config['lambda_contrastive'] != 0. and config['temperature'] != 0.:
-                
-                # Get embeddings for augmented views (aug1_signal and aug2_signal are directly from dataset for contrastive task)
-                aug1_embedding = model.encode(aug1_signal)
-                aug2_embedding = model.encode(aug2_signal)
-
-                # Pass through projection head
-                z1 = model.project(aug1_embedding)
-                z2 = model.project(aug2_embedding)
-
-                # Stack for supcon_loss: [Batch_Size, N_Views, Embedding_Dim]
-                features_for_supcon = torch.stack([z1, z2], dim=1) # n_views = 2
-
-                contrastive_loss, _, _ = supcon_loss(features_for_supcon, config)
-
             # --- Total Loss ---
-            loss = (config.get('lambda_msr', 0.) * msr_loss +
-                    config.get('lambda_cwg', 0.) * cwg_loss +
-                    config.get('lambda_contrastive', 0.) * contrastive_loss)
+            loss = config['lambda_msr'] * msr_loss
 
             # Backpropagation and optimization
             loss.backward()
@@ -656,117 +585,54 @@ def self_supervised_pretraining_training_validation_testing(
                 scheduler.step()
 
             # Log training losses
-            train_losses.update(loss.item(), original_current_signal.size(0))
-            train_msr_losses.update(msr_loss.item(), original_current_signal.size(0))
-            train_cwg_losses.update(cwg_loss.item(), original_current_signal.size(0))
-            train_contrastive_losses.update(contrastive_loss.item(), original_current_signal.size(0))
+            train_losses.update(loss.item(), original_input_signal.size(0))
+            train_msr_losses.update(msr_loss.item(), original_input_signal.size(0))
             
             writer.add_scalar('train/loss', loss.item(), epoch * len(train_dataloader) + batch_idx)
             writer.add_scalar('train/msr_loss', msr_loss.item(), epoch * len(train_dataloader) + batch_idx)
-            writer.add_scalar('train/cwg_loss', cwg_loss.item(), epoch * len(train_dataloader) + batch_idx)
-            writer.add_scalar('train/contrastive_loss', contrastive_loss.item(), epoch * len(train_dataloader) + batch_idx)
-
+           
         # Log epoch average training losses
         writer.add_scalar('train/loss_epoch', train_losses.avg, epoch)
         writer.add_scalar('train/msr_loss_epoch', train_msr_losses.avg, epoch)
-        writer.add_scalar('train/cwg_loss_epoch', train_cwg_losses.avg, epoch)
-        writer.add_scalar('train/contrastive_loss_epoch', train_contrastive_losses.avg, epoch)
-
+        
         # Validation loop
         model.eval() # Set model to evaluation mode (siwtch off batch norm/dropout etc.)
         set_trainable_parameters(model=model, tune='none', config=config) # Ensure all params are non-trainable during eval
 
         val_losses = AverageMeter(name='val/loss')
         val_msr_losses = AverageMeter(name='val/msr_loss')
-        val_cwg_losses = AverageMeter(name='val/cwg_loss')
-        val_contrastive_losses = AverageMeter(name='val/contrastive_loss')
 
         with torch.no_grad(): # No gradient calculation during validation
             for batch_idx, batch in enumerate(val_dataloader):
                 
-                original_current_signal = batch['current_signal'].to(device)
-                original_masked_signal = batch['masked_signal'].to(device)
+                original_input_signal = batch['input_signal'].to(device)
                 mask_indices = batch['mask_indices'].to(device)
-                aug1_signal = batch['aug1_signal'].to(device)
-                aug2_signal = batch['aug2_signal'].to(device)
-                original_prev_signal = batch['prev_signal'].to(device)
-                original_next_signal = batch['next_signal'].to(device)
 
-                # Data Augmentation Assignment for MSR and CWG in Validation
-                # Apply the same random assignment logic for validation
-                if config.get('data_aug', False):
-                    if random.random() < 0.5: # 50% chance
-                        val_msr_signal_input = aug1_signal
-                        val_cwg_signal_input = aug2_signal
-                    else:
-                        val_msr_signal_input = aug2_signal
-                        val_cwg_signal_input = aug1_signal
-                    
-                    val_msr_target_signal = val_msr_signal_input
-                    val_cwg_prev_signal_target = original_prev_signal # Still using original targets for CWG
-                    val_cwg_next_signal_target = original_next_signal # Same for next
-                else:
-                    # If data_aug is false, use original signals for MSR and CWG
-                    val_msr_signal_input = original_current_signal
-                    val_msr_target_signal = original_current_signal
-                    val_cwg_signal_input = original_current_signal
-                    val_cwg_prev_signal_target = original_prev_signal
-                    val_cwg_next_signal_target = original_next_signal
-                
                 # --- Forward Passes and Loss Calculations for Each Task (Validation) ---
                 val_msr_loss = torch.tensor(0.0, device=device)
                 if config['lambda_msr'] != 0.:
                     # MSR input now uses assigned augmented signal in validation
-                    val_masked_input_for_msr = create_masked_signal(val_msr_signal_input, mask_indices)
+                    val_masked_input_for_msr = create_masked_signal(original_input_signal, mask_indices)
                     masked_embedding = model.encode(val_masked_input_for_msr)
                     reconstructed_signal = model.reconstruct(masked_embedding)
                     
                     if config['criterion'] == 'MSELoss':
-                        val_msr_loss = F.mse_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], val_msr_target_signal[mask_indices.unsqueeze(-1).expand_as(val_msr_target_signal)])
+                        val_msr_loss = F.mse_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], original_input_signal[mask_indices.unsqueeze(-1).expand_as(original_input_signal)])
                     elif config['criterion'] == 'SmoothL1Loss':
-                        val_msr_loss = F.smooth_l1_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], val_msr_target_signal[mask_indices.unsqueeze(-1).expand_as(val_msr_target_signal)])
+                        val_msr_loss = F.smooth_l1_loss(reconstructed_signal[mask_indices.unsqueeze(-1).expand_as(reconstructed_signal)], original_input_signal[mask_indices.unsqueeze(-1).expand_as(original_input_signal)])
                     else:
                         raise ValueError("Invalid criterion ...")
-                    
-                val_cwg_loss = torch.tensor(0.0, device=device)
-                if config['lambda_cwg'] != 0. and val_cwg_next_signal_target is not None:
-                    current_embedding_for_cwg = model.encode(val_cwg_signal_input)
-                    generated_prev_signal = model.generate_prev_window(current_embedding_for_cwg)
-                    generated_next_signal = model.generate_next_window(current_embedding_for_cwg)
-                    
-                    if config['criterion'] == 'MSELoss':
-                        val_cwg_loss = F.mse_loss(generated_prev_signal, val_cwg_prev_signal_target) + F.mse_loss(generated_next_signal, val_cwg_next_signal_target) 
-                    elif config['criterion'] == 'SmoothL1Loss':
-                        val_cwg_loss = F.smooth_l1_loss(generated_prev_signal, val_cwg_prev_signal_target) + F.smooth_l1_loss(generated_next_signal, val_cwg_next_signal_target) 
-                    else:
-                        raise ValueError("Invalid criterion ...")
-
-                val_contrastive_loss = torch.tensor(0.0, device=device)
-                if config['lambda_contrastive'] != 0. and config['temperature'] != 0.:
-                    aug1_embedding = model.encode(aug1_signal)
-                    aug2_embedding = model.encode(aug2_signal)
-                    z1 = model.project(aug1_embedding)
-                    z2 = model.project(aug2_embedding)
-                    features_for_supcon = torch.stack([z1, z2], dim=1)
-                    val_contrastive_loss, _, _ = supcon_loss(features_for_supcon, config)
-
+                
                 # Total validation loss
-                val_loss = (config.get('lambda_msr', 0.) * val_msr_loss +
-                            config.get('lambda_cwg', 0.) * val_cwg_loss +
-                            config.get('lambda_contrastive', 0.) * val_contrastive_loss)
-
+                val_loss = config['lambda_msr'] * val_msr_loss
 
                 # Update validation meters
-                val_losses.update(val_loss.item(), original_current_signal.size(0))
-                val_msr_losses.update(val_msr_loss.item(), original_current_signal.size(0))
-                val_cwg_losses.update(val_cwg_loss.item(), original_current_signal.size(0))
-                val_contrastive_losses.update(val_contrastive_loss.item(), original_current_signal.size(0))
+                val_losses.update(val_loss.item(), original_input_signal.size(0))
+                val_msr_losses.update(val_msr_loss.item(), original_input_signal.size(0))
 
         # Log epoch validation losses to TensorBoard
         writer.add_scalar('val/loss_epoch', val_losses.avg, epoch)
         writer.add_scalar('val/msr_loss_epoch', val_msr_losses.avg, epoch)
-        writer.add_scalar('val/cwg_loss_epoch', val_cwg_losses.avg, epoch)
-        writer.add_scalar('val/contrastive_loss_epoch', val_contrastive_losses.avg, epoch)
 
         # N.B. schedulers are usually called at the end of the epoch, except for cosine-warmup
         if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'ExponentialLR':
@@ -808,7 +674,6 @@ def self_supervised_pretraining_training_validation_testing(
     lp_dataset = PhysioDataset(
             seed=config['seed'],
             lmdb_folder=os.path.join(config['dataset_folder'], config['lp_dataset_name']), # Linear probing dataset name
-            pretraining_ratio=config['pretraining_ratio'],
             pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
             personalization_sample_number=config['personalization_sample_number'],
             mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
@@ -816,10 +681,7 @@ def self_supervised_pretraining_training_validation_testing(
             input_seq_len_s=config['input_seq_len_s'],
             ecg=config['ecg'],
             resp=config['resp'],
-            sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs']
+            sig2sig=config['sig2sig']
         )
 
     # Get train/val/test samplers and build the dataloaders for linear probing
@@ -858,6 +720,8 @@ def self_supervised_pretraining_training_validation_testing(
         set_trainable_parameters(model=model, tune='last_layer', config=config) # Only train last linear layer
         train_lp_losses = AverageMeter(name='lp_train/loss')
         for batch_idx, batch in enumerate(lp_train_dataloader):
+            
+            # Move data to device
             signals, targets = batch
             signals = signals.to(device)
             if len(signals.shape) == 2:

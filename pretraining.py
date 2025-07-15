@@ -115,34 +115,24 @@ if __name__ == "__main__":
     if config['resp'] and not config['ecg']:
         raise ValueError('RESP can be loaded only along with ECG')
     
-    # PPG derivatives/PPG EMD/PPG freqs are loaded only if ecg (and optionally resp) are not present
-    if (config['ppg_derivatives'] or config['ppg_emd'] or config['ppg_freqs']) and config['ecg']: 
-        raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')  
-    
     if not config['ssl']:
         # Load data and annotation
         dataset = PhysioDataset(
             seed=config['seed'],
             lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-            pretraining_ratio=config['pretraining_ratio'],
             pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-            personalization_sample_number=config['personalization_sample_number'],
             mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             ecg=config['ecg'],
             resp=config['resp'],
-            sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs']
+            sig2sig=config['sig2sig']
         )
     else:
         # Load data
         dataset = PhysioDatasetSSL(
             seed=config['seed'],
             lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-            pretraining_ratio=config['pretraining_ratio'],
             pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
             personalization_sample_number=config['personalization_sample_number'],
             mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
@@ -151,9 +141,6 @@ if __name__ == "__main__":
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
-            ppg_derivatives=config['ppg_derivatives'],
-            ppg_emd=config['ppg_emd'],
-            ppg_freqs=config['ppg_freqs'],
             masking_ratio=config['masking_ratio'],
             augmentation_types=config['augmentation_types'].split(','),
             aug_prob=config['aug_prob']

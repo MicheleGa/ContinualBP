@@ -102,9 +102,6 @@ class ResGRUNet(nn.Module):
     def __init__(self, 
                  ecg=False, 
                  resp=False, 
-                 ppg_derivatives=False,
-                 ppg_emd=False, 
-                 ppg_freqs=False, 
                  channels='1, 32, 64, 128', 
                  kernel_size=7, 
                  act='leaky_relu', 
@@ -119,9 +116,6 @@ class ResGRUNet(nn.Module):
         self.input_seq_len = input_seq_len
         self.ecg = ecg
         self.resp = resp
-        self.ppg_derivatives = ppg_derivatives
-        self.ppg_emd = ppg_emd
-        self.ppg_freqs = ppg_freqs
         self.return_embedding = return_embedding
                 
         # Feature Extractor        
@@ -234,14 +228,8 @@ class ResGRUNet(nn.Module):
         else:
             resp_in_channels = 0
         
-        if self.ppg_derivatives:
-            ppg_in_channels = 3  # PPG + PPG' + PPG''
-        elif self.ppg_emd:
-            ppg_in_channels = 4  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3
-        elif self.ppg_freqs:
-            ppg_in_channels = 16  # PPG_IMF0 + PPG_IMF1 + PPG_IMF2 + PPG_IMF3  
-        else:
-            ppg_in_channels = 1  # PPG
+        # PPG must be always present
+        ppg_in_channels = 1 
             
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
@@ -290,9 +278,6 @@ def parseargs():
 
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     parser.add_argument('--channels', default='1, 32, 64, 128', type=str, help='channels produced by the convolutional blocks')
@@ -322,9 +307,6 @@ if __name__ == "__main__":
     net = ResGRUNet(
         ecg=args.ecg,
         resp=args.resp,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
         channels=args.channels,
         kernel_size=args.kernel_size,
         act=args.act,
