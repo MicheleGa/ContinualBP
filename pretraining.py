@@ -64,7 +64,6 @@ def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_pat
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()
 
     ## Setup configuration

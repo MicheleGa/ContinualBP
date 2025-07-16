@@ -332,7 +332,6 @@ def personalization(save_name, model_name, dataset, checkpoint_path, tensorboard
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()
 
     ## Setup config

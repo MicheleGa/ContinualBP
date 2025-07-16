@@ -10,7 +10,7 @@ import yaml
 import numpy as np
 import random
 import torch
-from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer, EUNet, SSLEUNet
+from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer, EUNet, SSLEUNet, BIOT, SSLBIOT
 from models.UNet import AttentionGate1D, SelfAttentionBlock1D
 
 
@@ -113,7 +113,7 @@ def parseargs():
     # Efficient UNet Setup
     parser.add_argument('--attention_type', default='self_attention', type=str, choices=['self_attention', 'nystrom_attention', 'gru'], help='Type of final processing layer: "self_attention", "nystrom_attention", or "gru"')
     
-    # SSL UNet additional Setup
+    # SSL UNet Setup
     parser.add_argument('--proj_hidden_dim', default=512, type=int, help='Dimension of the projection head hidden dim for SimCLR')
     
     # GRU Setup
@@ -121,11 +121,16 @@ def parseargs():
     parser.add_argument('--num_layers', default=2, type=int, help='number of GRU layers')
     parser.add_argument('--bidirectional', default=True, type=lambda x: bool(strtobool(x)), help='whether to use bidirectional GRU or not')
         
-    # Transformer Setup
+    # Transformer-based models Setup
     parser.add_argument('--embed_dim', default=32, type=int, help='transformer embedding dimension size')
     parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
     parser.add_argument('--num_encoder_layers', default=2, type=int, help='number of trasnformer layers')
     parser.add_argument('--dim_feedforward', default=128, type=int, help='feedforward dimension size in the transformer encoder') 
+    
+    # BIOT Setup
+    parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
+    parser.add_argument('--n_fft', default=256, type=int, help='STFT n_fft parameter')
+    parser.add_argument('--hop_length', default=128, type=int, help='STFT hop length parameter')\
         
     args = parser.parse_args()
     return args
@@ -389,6 +394,61 @@ def configure_optimizer_and_scheduler(model, config):
         return {"optimizer": optimizer}
 
 
+class EarlyStopping:
+    r"""
+    Early stops the training if validation loss doesn't improve after a given patience.
+    """
+    def __init__(self, patience=7, verbose=False, delta=0, trace_func=print, mode='min'):
+        r"""
+        Parameters
+        ------------
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 7
+            verbose (bool): If True, prints a message for each validation loss improvement.
+                            Default: False
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                            Default: 0
+            trace_func (function): trace print function.
+                            Default: print
+            mode (str): One of {min, max}. In min mode, training will stop when the quantity
+                        monitored has stopped decreasing. In max mode it will stop when the quantity
+                        monitored has stopped increasing. Default: min
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_val = None
+        self.early_stop = False
+        self.mode = mode
+        if mode not in ['min', 'max']:
+            raise ValueError(f"mode {mode} is unknown!")
+        if self.mode == 'min':
+            self.val_loss_min = np.inf
+        else:
+            self.val_loss_max = -np.inf
+        self.delta = delta
+        self.trace_func = trace_func
+
+    def __call__(self, val):
+        # Check if validation loss is nan
+        if np.isnan(val):
+            self.trace_func("Validation loss is NaN. Ignoring this epoch.")
+            return
+
+        if self.best_val is None:
+            self.best_val = val
+        elif (val < self.best_val - self.delta and self.mode == 'min') or (val > self.best_val + self.delta and self.mode == 'max'):
+            # Significant improvement detected
+            self.best_val = val
+            self.counter = 0  # Reset counter since improvement occurred
+        else:
+            # No significant improvement
+            self.counter += 1
+            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+                
+
 def set_trainable_parameters(model, tune, config):
     r""" 
     Set the parameters of the model to be trainable or not based on the tuning strategy.
@@ -419,10 +479,14 @@ def set_trainable_parameters(model, tune, config):
         _handle_unet_tuning(model, tune, config)
     elif config['model_name'] == 'EUNet':
         _handle_eunet_tuning(model, tune, config)
+    elif config['model_name'] == 'BIOT':
+        _handle_biot_tuning(model, tune, config)
     elif config['model_name'] == 'SSLUNet':
         _handle_sslunet_tuning(model, tune, config)
     elif config['model_name'] == 'SSLEUNet':
         _handle_ssl_eunet_tuning(model, tune, config)
+    elif config['model_name'] == 'SSLBIOT':
+        _handle_ssl_biot_tuning(model, tune, config)
     else:
         raise ValueError(f"Invalid model name: {config['model_name']}")
 
@@ -701,7 +765,75 @@ def _handle_eunet_tuning(model, tune, config):
             p.requires_grad = True
     else:
         raise ValueError(f"Invalid tuning strategy for EUNet: {tune}")
-        
+
+
+def _handle_biot_tuning(model, tune, config):
+    """Handle tuning strategy for BIOT model."""
+    
+    if tune == 'all': 
+        # Train all parameters
+        for p in model.parameters():
+            if p.dtype in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+                p.requires_grad = True
+            else:
+                # Ensure non-trainable parameters (like indices) remain frozen
+                p.requires_grad = False
+    elif tune == 'none':
+        # Train no parameters
+        for p in model.parameters():
+            p.requires_grad = False
+    elif tune == 'last_layer':
+        # Freeze everything and only leave the final BP projection with require_grads True
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.decode.projection.parameters(): # Corrected to model.decode.projection
+            p.requires_grad = True
+    elif tune == 'decoder':
+        # Freeze encoder components and unfreeze the entire decoder
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.decode.parameters():
+            p.requires_grad = True
+    elif tune == 'encoder':
+        # Freeze decoder components and unfreeze encoder components
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.patch_embedding.parameters():
+            p.requires_grad = True
+        for p in model.encoder_transformer.parameters():
+            p.requires_grad = True
+        for p in model.positional_encoding.parameters():
+            p.requires_grad = True
+        for p in model.channel_tokens.parameters():
+            p.requires_grad = True
+        # Note: self.index is a buffer, not a parameter, so it doesn't need to be handled.
+    elif tune == 'cross_attention':
+        # Freeze everything except the cross-attention layers in the decoder and the final projection
+        for p in model.parameters():
+            p.requires_grad = False
+        for module in model.decode.cross_attention_layers:
+            for p in module.parameters():
+                p.requires_grad = True
+        for module in model.decode.cross_attn_layer_norms:
+            for p in module.parameters():
+                p.requires_grad = True
+        for p in model.decode.projection.parameters(): # Corrected to model.decode.projection
+            p.requires_grad = True
+    elif tune == 'feed_forward_decoder':
+        # Freeze everything except the feed-forward networks in the decoder and the final projection
+        for p in model.parameters():
+            p.requires_grad = False
+        for module in model.decode.feed_forwards:
+            for p in module.parameters():
+                p.requires_grad = True
+        for module in model.decode.ffn_layer_norms:
+            for p in module.parameters():
+                p.requires_grad = True
+        for p in model.decode.projection.parameters(): # Corrected to model.decode.projection
+            p.requires_grad = True
+    else:
+        raise ValueError(f"Invalid tuning strategy for BIOT: {tune}")
+         
 
 def _handle_sslunet_tuning(model, tune, config):
     """Handle tuning strategy for SSLUNet model."""
@@ -867,60 +999,51 @@ def _handle_ssl_eunet_tuning(model, tune, config):
         raise ValueError(f"Invalid tuning strategy for SSLEUNet: {tune}")
 
 
-class EarlyStopping:
-    r"""
-    Early stops the training if validation loss doesn't improve after a given patience.
-    """
-    def __init__(self, patience=7, verbose=False, delta=0, trace_func=print, mode='min'):
-        r"""
-        Parameters
-        ------------
-            patience (int): How long to wait after last time validation loss improved.
-                            Default: 7
-            verbose (bool): If True, prints a message for each validation loss improvement.
-                            Default: False
-            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
-                            Default: 0
-            trace_func (function): trace print function.
-                            Default: print
-            mode (str): One of {min, max}. In min mode, training will stop when the quantity
-                        monitored has stopped decreasing. In max mode it will stop when the quantity
-                        monitored has stopped increasing. Default: min
-        """
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_val = None
-        self.early_stop = False
-        self.mode = mode
-        if mode not in ['min', 'max']:
-            raise ValueError(f"mode {mode} is unknown!")
-        if self.mode == 'min':
-            self.val_loss_min = np.inf
-        else:
-            self.val_loss_max = -np.inf
-        self.delta = delta
-        self.trace_func = trace_func
+def _handle_ssl_biot_tuning(model, tune, config):
+    """Handle tuning strategy for SSLBIOT model."""
 
-    def __call__(self, val):
-        # Check if validation loss is nan
-        if np.isnan(val):
-            self.trace_func("Validation loss is NaN. Ignoring this epoch.")
-            return
+    if tune == 'all':
+        # Train all parameters
+        for p in model.parameters():
+            if p.dtype in [torch.float32, torch.float64, torch.complex64, torch.complex128]:
+                p.requires_grad = True
+            else:
+                # Ensure non-trainable parameters (like indices) remain frozen
+                p.requires_grad = False
+    elif tune == 'none':
+        # Train no parameters
+        for p in model.parameters():
+            p.requires_grad = False
+    elif tune == 'last_layer':
+        # Freeze everything and only leave the final projection of the supervised decoder head
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.supervised_decoder_head.projection.parameters():
+            p.requires_grad = True
+    elif tune == 'encoder':
+        # Freeze decoder components and unfreeze encoder components
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.patch_embedding.parameters():
+            p.requires_grad = True
+        for p in model.encoder_transformer.parameters():
+            p.requires_grad = True
+        for p in model.positional_encoding.parameters():
+            p.requires_grad = True
+        for p in model.channel_tokens.parameters():
+            p.requires_grad = True
+        # model.index is a buffer, not a parameter, so it doesn't need requires_grad
+    elif tune == 'decoder':
+        # Freeze encoder, unfreeze both supervised and reconstruction decoder heads
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.supervised_decoder_head.parameters():
+            p.requires_grad = True
+        for p in model.reconstruction_decoder_head.parameters():
+            p.requires_grad = True
+    else:
+        raise ValueError(f"Invalid tuning strategy for SSLBIOT: {tune}")
 
-        if self.best_val is None:
-            self.best_val = val
-        elif (val < self.best_val - self.delta and self.mode == 'min') or (val > self.best_val + self.delta and self.mode == 'max'):
-            # Significant improvement detected
-            self.best_val = val
-            self.counter = 0  # Reset counter since improvement occurred
-        else:
-            # No significant improvement
-            self.counter += 1
-            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-                
                 
 def get_model_architecture(config):
     r"""
@@ -1010,6 +1133,20 @@ def get_model_architecture(config):
             dim_feedforward_attention=config['dim_feedforward_attention'],
             attention_type=config['attention_type'] 
         ) 
+    elif config['model_name'] == 'BIOT':
+        model = BIOT.BIOT(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            embed_dim=config['embed_dim'],
+            num_heads=config['num_heads'],
+            num_encoder_layers=config['num_encoder_layers'],
+            num_decoder_layers=config['num_decoder_layers'],
+            n_fft=config['n_fft'],
+            hop_length=config['hop_length']
+        )
     elif config['model_name'] == 'SSLUNet':
         model = SSLUNet.SSLUNet(
             ecg=config['ecg'],
@@ -1034,6 +1171,20 @@ def get_model_architecture(config):
             num_heads_attention=config['num_heads_attention'],
             dim_feedforward_attention=config['dim_feedforward_attention'],
             attention_type=config['attention_type'] 
+        )
+    elif config['model_name'] == 'SSLBIOT':
+        model = SSLBIOT.SSLBIOT(
+            ecg=config['ecg'],
+            resp=config['resp'],
+            sig2sig=config['sig2sig'],
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            embed_dim=config['embed_dim'],
+            num_heads=config['num_heads'],
+            num_encoder_layers=config['num_encoder_layers'],
+            num_decoder_layers=config['num_decoder_layers'],
+            n_fft=config['n_fft'],
+            hop_length=config['hop_length']
         )
     else:
         raise ValueError("Invalid model name ...")

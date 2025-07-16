@@ -71,19 +71,10 @@ class GRU(nn.Module):
         return output.squeeze(-1)
     
     def get_input_channels(self):
-        if self.ecg:
-            ecg_in_channels = 1
-        else:
-            ecg_in_channels = 0
-        
-        if self.resp:
-            resp_in_channels = 1
-        else:
-            resp_in_channels = 0
-        
-        # PPG mustm always be present
-        ppg_in_channels = 1 
-            
+        # PPG must always be present
+        ppg_in_channels = 1  
+        ecg_in_channels = 1 if self.ecg else 0
+        resp_in_channels = 1 if self.resp else 0
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):

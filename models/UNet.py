@@ -292,9 +292,7 @@ class UNet(nn.Module):
         output = self.final_conv(sa_output)
 
         # Permute back to [batch_size, length, channels] for consistency with input
-        output = output.permute(0, 2, 1)
-
-        return output.squeeze(-1)
+        return output.permute(0, 2, 1).squeeze(-1)
     
     def init_params(self):
         # Fan-out focuses on the gradient distribution, and is commonly used in ResNets
@@ -306,24 +304,10 @@ class UNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def get_input_channels(self):
-        
-        ppg_in_channels = 0
-        ecg_in_channels = 0
-        resp_in_channels = 0
-        
-        # PPG must be always present
-        ppg_in_channels = 1 
-        
-        if self.ecg:
-            ecg_in_channels = 1
-        else:
-            ecg_in_channels = 0
-        
-        if self.resp:
-            resp_in_channels = 1
-        else:
-            resp_in_channels = 0
-            
+        # PPG must always be present
+        ppg_in_channels = 1  
+        ecg_in_channels = 1 if self.ecg else 0
+        resp_in_channels = 1 if self.resp else 0
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):

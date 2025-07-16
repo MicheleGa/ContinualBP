@@ -605,10 +605,11 @@ class EUNet(nn.Module):
 
         # Output Layer
         output = self.final_conv(sa_output)
-
-        output = output.permute(0, 2, 1)
-
-        return output.squeeze(-1)
+        
+        # Permute back to [batch_size, length, channels] for consistency with input
+        print(output.shape)
+        print(output.permute(0, 2, 1).squeeze(-1).shape)
+        return output.permute(0, 2, 1).squeeze(-1)
     
     def init_params(self):
         for m in self.modules():
@@ -627,19 +628,10 @@ class EUNet(nn.Module):
                         param.data.fill_(0)
 
     def get_input_channels(self):
-        
-        ppg_in_channels = 0
-        ecg_in_channels = 0
-        resp_in_channels = 0
-
-        # PPG must always  be present
-        ppg_in_channels = 1
-
-        if self.ecg:
-            ecg_in_channels = 1
-        if self.resp:
-            resp_in_channels = 1
-            
+        # PPG must always be present
+        ppg_in_channels = 1  
+        ecg_in_channels = 1 if self.ecg else 0
+        resp_in_channels = 1 if self.resp else 0
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):

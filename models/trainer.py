@@ -675,7 +675,6 @@ def self_supervised_pretraining_training_validation_testing(
             seed=config['seed'],
             lmdb_folder=os.path.join(config['dataset_folder'], config['lp_dataset_name']), # Linear probing dataset name
             pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-            personalization_sample_number=config['personalization_sample_number'],
             mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
@@ -691,8 +690,15 @@ def self_supervised_pretraining_training_validation_testing(
     lp_val_dataloader = DataLoader(lp_dataset, sampler=lp_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     lp_test_dataloader = DataLoader(lp_dataset, sampler=lp_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
 
-    # Freeze encoder, unfreeze last linear layer
-    set_trainable_parameters(model=model, tune='last_layer', config=config)
+    # Freeze encoder, train remaining parameters (depending on the config['tune'] setting)
+    set_trainable_parameters(model=model, tune=config['tune'], config=config)
+    
+    # Print trainable and non-trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+
+    print(f"Trainable parameters: {trainable_params} / {trainable_params + non_trainable_params} ({trainable_params / (trainable_params + non_trainable_params) * 100:.2f}%)")
+    print(f"Non-trainable parameters: {non_trainable_params} / {trainable_params + non_trainable_params} ({non_trainable_params / (trainable_params + non_trainable_params) * 100:.2f}%)")
 
     # Optimizer and scheduler for linear probing
     if config['lr_scheduler_enable'] and config['lr_scheduler_type'] == 'CosineAnnealingWarmupScheduler':
@@ -716,8 +722,8 @@ def self_supervised_pretraining_training_validation_testing(
     for epoch in range(config['max_lp_training_epochs']): # Use a separate LP epoch count if desired
         
         # Training loop
-        model.train() # Set model to training mode for LP
-        set_trainable_parameters(model=model, tune='last_layer', config=config) # Only train last linear layer
+        model.train() 
+        set_trainable_parameters(model=model, tune=config['tune'], config=config)
         train_lp_losses = AverageMeter(name='lp_train/loss')
         for batch_idx, batch in enumerate(lp_train_dataloader):
             
@@ -758,8 +764,8 @@ def self_supervised_pretraining_training_validation_testing(
         writer.add_scalar('train/lp_loss_epoch', train_lp_losses.avg, epoch)
 
         # Validation loop for LP
-        model.eval() # Set model to evaluation mode (siwtch off batch norm/dropout etc.)
-        set_trainable_parameters(model=model, tune='none', config=config) # Freeze all params during validation
+        model.eval() 
+        set_trainable_parameters(model=model, tune='none', config=config) 
         
         lp_val_losses = AverageMeter(name='lp_val/loss')
         lp_val_sbp_maes = AverageMeter(name='lp_val/sbp_mae')

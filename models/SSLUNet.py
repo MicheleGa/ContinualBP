@@ -316,9 +316,7 @@ class SSLUNet(nn.Module):
                  channels='32, 64, 128, 256, 512',
                  kernel_size=3,
                  num_heads_attention=1,
-                 dim_feedforward_attention=128,
-                 num_groups_gn=8 # Added num_groups_gn argument for GroupNorm
-                ):
+                 dim_feedforward_attention=128):
         super(SSLUNet, self).__init__()
         
         # Input Data Setup
@@ -331,7 +329,6 @@ class SSLUNet(nn.Module):
         self.kernel_size = kernel_size
         self.num_heads_attention = num_heads_attention
         self.dim_feedforward_attention = dim_feedforward_attention
-        self.num_groups_gn = num_groups_gn # Store the number of groups for GroupNorm
         
         # For supervised tasks, use the full channel calculation
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
@@ -342,20 +339,20 @@ class SSLUNet(nn.Module):
         
         # --- Shared Encoder Path ---
         self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(self.in_channels, filters[0], stride=1, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[0], filters[1], stride=2, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[1], filters[2], stride=2, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[2], filters[3], stride=2, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[3], filters[4], stride=2, num_groups=self.num_groups_gn)
+            ResidualBlock1D(self.in_channels, filters[0], stride=1),
+            ResidualBlock1D(filters[0], filters[1], stride=2),
+            ResidualBlock1D(filters[1], filters[2], stride=2),
+            ResidualBlock1D(filters[2], filters[3], stride=2),
+            ResidualBlock1D(filters[3], filters[4], stride=2)
         ])
         self.bottleneck = BottleneckBlock1D(filters[4], stride=1, num_groups=self.num_groups_gn)
 
         # --- Shared Decoder Path (U-Net style, leading to `sa_output`) ---
         self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(filters[4] + filters[3], filters[3], stride=1, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[3] + filters[2], filters[2], stride=1, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[2] + filters[1], filters[1], stride=1, num_groups=self.num_groups_gn),
-            ResidualBlock1D(filters[1] + filters[0], filters[0], stride=1, num_groups=self.num_groups_gn)
+            ResidualBlock1D(filters[4] + filters[3], filters[3], stride=1),
+            ResidualBlock1D(filters[3] + filters[2], filters[2], stride=1),
+            ResidualBlock1D(filters[2] + filters[1], filters[1], stride=1),
+            ResidualBlock1D(filters[1] + filters[0], filters[0], stride=1)
         ])
 
         self.att_gate4 = AttentionGate1D(filters[4], filters[3], filters[3])
@@ -501,20 +498,10 @@ class SSLUNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def get_input_channels(self):
-        
-        ppg_in_channels = 0
-        ecg_in_channels = 0
-        resp_in_channels = 0
-
         # PPG must always be present
-        ppg_in_channels = 1
-
-        # Determine ECG and RESP channels
-        if self.ecg:
-            ecg_in_channels = 1
-        if self.resp:
-            resp_in_channels = 1
-            
+        ppg_in_channels = 1  
+        ecg_in_channels = 1 if self.ecg else 0
+        resp_in_channels = 1 if self.resp else 0
         return ppg_in_channels, ecg_in_channels, resp_in_channels
     
     def print_summary(self, batch_size=256):
@@ -544,32 +531,6 @@ class SSLUNet(nn.Module):
         print("\n--- Reconstruction Head Summary (MSR) ---")
         dummy_sa_output_recon = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
         summary(self.reconstruction_head, input_data=dummy_sa_output_recon)
-
-    
-    def set_tunable_layers(self, tune):
-        # First set all parameters to be trainable
-        for p in self.parameters():
-            p.requires_grad = True
-        
-        if tune == "all":
-            return
-        elif tune == "last_linear":
-            # Freeze all layers except the supervised final_conv_supervised
-            for name, param in self.named_parameters():
-                if "final_conv_supervised" not in name:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
-        elif tune == "encoder_only":
-            # Example: Freeze all heads, train only encoder blocks and bottleneck
-            for name, param in self.named_parameters():
-                if any(head_name in name for head_name in ["reconstruction_head", "final_conv_supervised", "decoder_blocks", "att_gate", "self_attention_stack"]):
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
-        else:
-            raise ValueError(f"Undefined tune option: {tune}")
-        
         
 def parseargs():
     parser = argparse.ArgumentParser(description="SSLUNet summary, # params and MACS")
@@ -584,7 +545,6 @@ def parseargs():
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer')
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer')
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
-    parser.add_argument('--num_groups_gn', default=8, type=int, help='number of groups for GroupNorm layers') # Added num_groups_gn argument
     
     args = parser.parse_args()
     return args
@@ -602,7 +562,6 @@ if __name__ == "__main__":
         channels=args.channels,
         kernel_size=args.kernel_size,
         num_heads_attention=args.num_heads_attention,
-        dim_feedforward_attention=args.dim_feedforward_attention,
-        num_groups_gn=args.num_groups_gn # Pass the new argument
+        dim_feedforward_attention=args.dim_feedforward_attention
     )
     net.print_summary(batch_size=args.batch_size)
