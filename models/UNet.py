@@ -9,23 +9,29 @@ from thop import profile, clever_format
 
 
 class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1, num_groups=8): # Added num_groups
         super(ResidualBlock1D, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        
+        # Changed from BatchNorm1d to GroupNorm with conditional groups
+        groups_gn1 = num_groups if out_channels >= num_groups else 1
+        self.gn1 = nn.GroupNorm(groups_gn1, out_channels)
+        
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=1) # Stride 1 for second conv
 
+        # Changed from BatchNorm1d to GroupNorm in shortcut with conditional groups
+        groups_shortcut = num_groups if out_channels >= num_groups else 1
         self.shortcut = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
-            nn.BatchNorm1d(out_channels)
+            nn.GroupNorm(groups_shortcut, out_channels)
         )
         
     def forward(self, x):
         identity = self.shortcut(x)
 
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.gn1(out) # Changed from bn1 to gn1
         out = self.relu(out)
         out = self.conv2(out)
         
@@ -34,23 +40,30 @@ class ResidualBlock1D(nn.Module):
         return out
     
 class BottleneckBlock1D(nn.Module):
-    def __init__(self, channels, stride=1):
+    def __init__(self, channels, stride=1, num_groups=8): # Added num_groups
         super(BottleneckBlock1D, self).__init__()
-        self.bn1 = nn.BatchNorm1d(channels)
+        
+        # Changed from BatchNorm1d to GroupNorm with conditional groups
+        groups_gn1 = num_groups if channels >= num_groups else 1
+        self.gn1 = nn.GroupNorm(groups_gn1, channels)
+        
         self.relu1 = nn.ReLU(inplace=True)
         self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
 
-        self.bn2 = nn.BatchNorm1d(channels)
+        # Changed from BatchNorm1d to GroupNorm with conditional groups
+        groups_gn2 = num_groups if channels >= num_groups else 1
+        self.gn2 = nn.GroupNorm(groups_gn2, channels)
+        
         self.relu2 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
         
     def forward(self, x):
         
-        out = self.bn1(x)
+        out = self.gn1(x) # Changed from bn1 to gn1
         out = self.relu1(out)
         out = self.conv1(out)
         
-        out = self.bn2(out)
+        out = self.gn2(out) # Changed from bn2 to gn2
         out = self.relu2(out)
         out = self.conv2(out)
         
@@ -171,7 +184,8 @@ class UNet(nn.Module):
                  channels='32, 64, 128, 256, 512',
                  kernel_size=3,
                  num_heads_attention=1,
-                 dim_feedforward_attention=128):
+                 dim_feedforward_attention=128
+                 ):
         super(UNet, self).__init__()
         
         # Input Data Setup
@@ -287,7 +301,7 @@ class UNet(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-            elif isinstance(m, nn.BatchNorm1d):
+            elif isinstance(m, nn.GroupNorm): # Changed from BatchNorm1d to GroupNorm
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
@@ -324,7 +338,7 @@ class UNet(nn.Module):
         
         
 def parseargs():
-    parser = argparse.ArgumentParser(description="PhysioFormer summary, # params and MACS")
+    parser = argparse.ArgumentParser(description="UNet summary, # params and MACS")
 
     parser.add_argument('--batch_size', default=128, type=int, help='batch size for the dummy input')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
@@ -336,13 +350,13 @@ def parseargs():
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer') 
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer') 
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
+    parser.add_argument('--num_groups_gn', default=8, type=int, help='number of groups for GroupNorm layers') # Added num_groups_gn
     
     args = parser.parse_args()
     return args
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()    
     
     net = UNet(

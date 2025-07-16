@@ -385,7 +385,6 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()    
     
     net = Transformer(

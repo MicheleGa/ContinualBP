@@ -211,23 +211,27 @@ class AttentionBlock(nn.Module):
 
 
 class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1, num_groups=8):
         super(ResidualBlock1D, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        
+        groups_bn1 = num_groups if out_channels >= num_groups else 1
+        self.gn1 = nn.GroupNorm(groups_bn1, out_channels)
+        
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=1) # Stride 1 for second conv
 
+        groups_shortcut = num_groups if out_channels >= num_groups else 1
         self.shortcut = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
-            nn.BatchNorm1d(out_channels)
+            nn.GroupNorm(groups_shortcut, out_channels)
         )
         
     def forward(self, x):
         identity = self.shortcut(x)
 
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.gn1(out)
         out = self.relu(out)
         out = self.conv2(out)
         
@@ -236,23 +240,28 @@ class ResidualBlock1D(nn.Module):
         return out
     
 class BottleneckBlock1D(nn.Module):
-    def __init__(self, channels, stride=1):
+    def __init__(self, channels, stride=1, num_groups=8):
         super(BottleneckBlock1D, self).__init__()
-        self.bn1 = nn.BatchNorm1d(channels)
+        
+        groups_bn1 = num_groups if channels >= num_groups else 1
+        self.gn1 = nn.GroupNorm(groups_bn1, channels)
+        
         self.relu1 = nn.ReLU(inplace=True)
         self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
 
-        self.bn2 = nn.BatchNorm1d(channels)
+        groups_bn2 = num_groups if channels >= num_groups else 1
+        self.gn2 = nn.GroupNorm(groups_bn2, channels)
+        
         self.relu2 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
         
     def forward(self, x):
         
-        out = self.bn1(x)
+        out = self.gn1(x)
         out = self.relu1(out)
         out = self.conv1(out)
         
-        out = self.bn2(out)
+        out = self.gn2(out)
         out = self.relu2(out)
         out = self.conv2(out)
         
@@ -363,12 +372,11 @@ class SSLEUNet(nn.Module):
                  sig2sig=False,
                  fs=125,
                  input_seq_len_s=5,
-                 channels='16, 32, 64, 128', # Updated channels to match EUNet's example
+                 channels='16, 32, 64, 128', 
                  kernel_size=3,
                  num_heads_attention=1,
                  dim_feedforward_attention=128,
-                 attention_type='self_attention' # Added attention_type
-                ):
+                 attention_type='self_attention'):
         super(SSLEUNet, self).__init__()
         
         # Input Data Setup
@@ -381,13 +389,13 @@ class SSLEUNet(nn.Module):
         self.kernel_size = kernel_size
         self.num_heads_attention = num_heads_attention
         self.dim_feedforward_attention = dim_feedforward_attention
-        self.attention_type = attention_type # Store the choice
+        self.attention_type = attention_type 
         
         # For supervised tasks, use the full channel calculation
         self.ppg_in_channels, self.ecg_in_channels, self.resp_in_channels = self.get_input_channels()
         self.in_channels = self.ppg_in_channels + self.ecg_in_channels + self.resp_in_channels
             
-        self.encoder_filters = [int(ch) for ch in channels.split(',')] # Store for use in other heads
+        self.encoder_filters = [int(ch) for ch in channels.split(',')] 
         
         # --- Modality-specific Encoders (from EUNet) ---
         self.ppg_encoder_blocks = nn.ModuleList()
@@ -648,7 +656,7 @@ class SSLEUNet(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm1d):
+            elif isinstance(m, nn.GroupNorm): # Changed from BatchNorm1d to GroupNorm
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.GRU): # Added GRU initialization from EUNet
@@ -727,7 +735,6 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()
 
     net = SSLEUNet(

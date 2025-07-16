@@ -272,12 +272,7 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()  
-    
-    # RESP is loaded only if ECG is also loaded
-    if args.resp and not args.ecg:
-        raise ValueError('RESP can be loaded only along with ECG')
     
     root_figs_folder = os.path.join(args.save_path, args.name) 
     if not os.path.exists(root_figs_folder):

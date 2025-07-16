@@ -134,7 +134,6 @@ if __name__ == "__main__":
             seed=config['seed'],
             lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
             pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-            personalization_sample_number=config['personalization_sample_number'],
             mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],

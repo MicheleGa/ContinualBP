@@ -259,7 +259,7 @@ def save_status(subject_id, epoch, model_name, save_name, model, optimizer, sche
     with open(os.path.join(out_path, 'config.yaml'), 'w') as f:
         yaml.dump(config, f, sort_keys=True, default_flow_style=False)
     
-    print(f"Epoch {epoch} - checkpoint saved in {out_path}")
+    print(f"Epoch {epoch + 1} - checkpoint saved in {out_path}")
         
     
 def load_status(subject_id, model_name, save_name, model, optimizer, scheduler, checkpoint_path, config):
@@ -308,7 +308,7 @@ def load_status(subject_id, model_name, save_name, model, optimizer, scheduler, 
     if scheduler is not None:
         scheduler.load_state_dict(checkpoint['lr_scheduler'])
     
-    print(f"Loaded checkpoint from validation on epoch {epoch}: {checkpoint['val_loss']}")
+    print(f"Loaded checkpoint from validation on epoch {epoch + 1}: {checkpoint['val_loss']}")
     
 
 def configure_optimizer_and_scheduler(model, config):

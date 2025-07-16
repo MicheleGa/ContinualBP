@@ -152,23 +152,27 @@ class NystromAttention(nn.Module):
 
 
 class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1, num_groups=8):
         super(ResidualBlock1D, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        
+        groups_gn1 = num_groups if out_channels >= num_groups else 1
+        self.gn1 = nn.GroupNorm(groups_gn1, out_channels)
+        
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=1) # Stride 1 for second conv
 
+        groups_shortcut = num_groups if out_channels >= num_groups else 1
         self.shortcut = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
-            nn.BatchNorm1d(out_channels)
+            nn.GroupNorm(groups_shortcut, out_channels)
         )
         
     def forward(self, x):
         identity = self.shortcut(x)
 
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.gn1(out)
         out = self.relu(out)
         out = self.conv2(out)
         
@@ -177,23 +181,28 @@ class ResidualBlock1D(nn.Module):
         return out
     
 class BottleneckBlock1D(nn.Module):
-    def __init__(self, channels, stride=1):
+    def __init__(self, channels, stride=1, num_groups=8):
         super(BottleneckBlock1D, self).__init__()
-        self.bn1 = nn.BatchNorm1d(channels)
+        
+        groups_gn1 = num_groups if channels >= num_groups else 1
+        self.gn1 = nn.GroupNorm(groups_gn1, channels)
+        
         self.relu1 = nn.ReLU(inplace=True)
         self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
 
-        self.bn2 = nn.BatchNorm1d(channels)
+        groups_gn2 = num_groups if channels >= num_groups else 1
+        self.gn2 = nn.GroupNorm(groups_gn2, channels)
+        
         self.relu2 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
         
     def forward(self, x):
         
-        out = self.bn1(x)
+        out = self.gn1(x)
         out = self.relu1(out)
         out = self.conv1(out)
         
-        out = self.bn2(out)
+        out = self.gn2(out)
         out = self.relu2(out)
         out = self.conv2(out)
         
@@ -308,6 +317,7 @@ class SSLUNet(nn.Module):
                  kernel_size=3,
                  num_heads_attention=1,
                  dim_feedforward_attention=128,
+                 num_groups_gn=8 # Added num_groups_gn argument for GroupNorm
                 ):
         super(SSLUNet, self).__init__()
         
@@ -321,6 +331,7 @@ class SSLUNet(nn.Module):
         self.kernel_size = kernel_size
         self.num_heads_attention = num_heads_attention
         self.dim_feedforward_attention = dim_feedforward_attention
+        self.num_groups_gn = num_groups_gn # Store the number of groups for GroupNorm
         
         # For supervised tasks, use the full channel calculation
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
@@ -331,20 +342,20 @@ class SSLUNet(nn.Module):
         
         # --- Shared Encoder Path ---
         self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(self.in_channels, filters[0], stride=1),
-            ResidualBlock1D(filters[0], filters[1], stride=2),
-            ResidualBlock1D(filters[1], filters[2], stride=2),
-            ResidualBlock1D(filters[2], filters[3], stride=2),
-            ResidualBlock1D(filters[3], filters[4], stride=2)
+            ResidualBlock1D(self.in_channels, filters[0], stride=1, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[0], filters[1], stride=2, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[1], filters[2], stride=2, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[2], filters[3], stride=2, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[3], filters[4], stride=2, num_groups=self.num_groups_gn)
         ])
-        self.bottleneck = BottleneckBlock1D(filters[4], stride=1)
+        self.bottleneck = BottleneckBlock1D(filters[4], stride=1, num_groups=self.num_groups_gn)
 
         # --- Shared Decoder Path (U-Net style, leading to `sa_output`) ---
         self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(filters[4] + filters[3], filters[3], stride=1),
-            ResidualBlock1D(filters[3] + filters[2], filters[2], stride=1),
-            ResidualBlock1D(filters[2] + filters[1], filters[1], stride=1),
-            ResidualBlock1D(filters[1] + filters[0], filters[0], stride=1)
+            ResidualBlock1D(filters[4] + filters[3], filters[3], stride=1, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[3] + filters[2], filters[2], stride=1, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[2] + filters[1], filters[1], stride=1, num_groups=self.num_groups_gn),
+            ResidualBlock1D(filters[1] + filters[0], filters[0], stride=1, num_groups=self.num_groups_gn)
         ])
 
         self.att_gate4 = AttentionGate1D(filters[4], filters[3], filters[3])
@@ -485,7 +496,7 @@ class SSLUNet(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm1d):
+            elif isinstance(m, nn.GroupNorm): # Changed from BatchNorm1d to GroupNorm
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
@@ -530,21 +541,9 @@ class SSLUNet(nn.Module):
         sa_output_dummy, _ = self._run_full_unet_path(dummy_input)
         print(f"  Encoder/U-Net output (SA block) shape: {sa_output_dummy.shape}")
 
-        print("\n--- Projection Head Summary (SimCLR) ---")
-        dummy_embedding_proj = torch.rand((batch_size, self.ssl_embedding_dim))
-        summary(self.projection_head, input_data=dummy_embedding_proj)
-
         print("\n--- Reconstruction Head Summary (MSR) ---")
         dummy_sa_output_recon = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
         summary(self.reconstruction_head, input_data=dummy_sa_output_recon)
-
-        print("\n--- Generation Head Summary (CWG - Prev) ---")
-        dummy_sa_output_gen = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
-        summary(self.generation_prev_head, input_data=dummy_sa_output_gen)
-        
-        print("\n--- Generation Head Summary (CWG - Next) ---")
-        dummy_sa_output_gen = torch.rand((batch_size, self.encoder_filters[0], self.input_seq_len))
-        summary(self.generation_next_head, input_data=dummy_sa_output_gen)
 
     
     def set_tunable_layers(self, tune):
@@ -564,7 +563,7 @@ class SSLUNet(nn.Module):
         elif tune == "encoder_only":
             # Example: Freeze all heads, train only encoder blocks and bottleneck
             for name, param in self.named_parameters():
-                if any(head_name in name for head_name in ["projection_head", "reconstruction_head", "permutation_head", "generation_head", "final_conv_supervised", "decoder_blocks", "att_gate", "self_attention_stack"]):
+                if any(head_name in name for head_name in ["reconstruction_head", "final_conv_supervised", "decoder_blocks", "att_gate", "self_attention_stack"]):
                     param.requires_grad = False
                 else:
                     param.requires_grad = True
@@ -585,13 +584,13 @@ def parseargs():
     parser.add_argument('--num_heads_attention', default=1, type=int, help='heads number of the final self-attention layer')
     parser.add_argument('--dim_feedforward_attention', default=128, type=int, help='dimension of the final self-attention layer')
     parser.add_argument('--kernel_size', default=3, type=int, help='convolutional layer kernel size')
+    parser.add_argument('--num_groups_gn', default=8, type=int, help='number of groups for GroupNorm layers') # Added num_groups_gn argument
     
     args = parser.parse_args()
     return args
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()
 
     net = SSLUNet(
@@ -604,5 +603,6 @@ if __name__ == "__main__":
         kernel_size=args.kernel_size,
         num_heads_attention=args.num_heads_attention,
         dim_feedforward_attention=args.dim_feedforward_attention,
+        num_groups_gn=args.num_groups_gn # Pass the new argument
     )
     net.print_summary(batch_size=args.batch_size)

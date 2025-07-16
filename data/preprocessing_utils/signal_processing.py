@@ -776,6 +776,60 @@ def standardize(signal, plot=False, title='Z-Score', savepath='./figs'):
     return standardized_signal
 
 
+def ema_normalization(signal, alpha=0.00796, plot=False, title='EMA Normalization', savepath='./figs'):
+    r"""
+    Applies Exponential Moving Average (EMA) normalization to a signal.
+
+    Parameters
+    ------------
+    signal (np.ndarray): 
+        The input signal as a NumPy array.
+    alpha (float, optional): 
+        The EMA smoothing factor. Default is 0.00796 (corresponding to ~2s of effective history for 125 Hz signals).
+    plot (bool, optional): 
+        If True, plots the original and EMA-normalized signals. Defaults to False.
+    title (str, optional): 
+        Title of the plot. Defaults to 'EMA Normalization'.
+    savepath (str, optional): 
+        Path to save the plot. Defaults to './figs'.
+
+    Returns
+    ------------
+    np.ndarray: 
+        The EMA-normalized signal. Returns zeros if the signal has zero variance (handled safely).
+    """
+
+    eps = np.finfo(np.float32).eps  # To avoid division by zero
+
+    mu = 0.0
+    sigma = 0.0
+    norm_signal = np.zeros_like(signal, dtype=np.float32)
+
+    for t in range(len(signal)):
+        x = signal[t]
+        mu = alpha * x + (1 - alpha) * mu
+        sigma = alpha * abs(x - mu) + (1 - alpha) * sigma
+        norm_signal[t] = (x - mu) / (sigma + eps)
+
+    if plot:
+        plt.figure(figsize=(12, 6))
+        plt.subplot(2, 1, 1)
+        plt.plot(signal, label='Original Signal')
+        plt.title('Original Signal')
+        plt.legend()
+
+        plt.subplot(2, 1, 2)
+        plt.plot(norm_signal, label='EMA Normalized Signal', color='orange')
+        plt.title('EMA Normalized Signal')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(savepath, f'{title}.jpg'))
+        plt.close()
+
+    return norm_signal
+
+
 def average_smoothing(signal, window_size=3, plot=False, title='AVGSmoothing', savepath='./figs'):
     r"""
     Average smoothing of a signal.

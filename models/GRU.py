@@ -41,6 +41,9 @@ class GRU(nn.Module):
             batch_first=True,
             bidirectional=bidirectional
         )
+        
+        # Layer Normalization
+        self.layer_norm = nn.LayerNorm(hidden_dim * (2 if bidirectional else 1))
 
         # Fully connected layer to map hidden states to output
         self.fc = nn.Linear(hidden_dim * (2 if bidirectional else 1), 1)
@@ -58,6 +61,9 @@ class GRU(nn.Module):
 
         # Pass through GRU
         gru_out, _ = self.gru(x, h0)  # gru_out: [batch, sequence length, hidden_dim * num_directions]
+        
+        # Normalize hidden states
+        gru_out = self.layer_norm(gru_out) 
 
         # Pass through the fully connected layer
         output = self.fc(gru_out)  # output: [batch, sequence length, 1]
@@ -92,7 +98,7 @@ class GRU(nn.Module):
         
         
 def parseargs():
-    parser = argparse.ArgumentParser(description="PhysioFormer summary, # params and MACS")
+    parser = argparse.ArgumentParser(description="GRU summary, # params and MACS")
 
     parser.add_argument('--batch_size', default=128, type=int, help='batch size for the dummy input')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
@@ -109,7 +115,6 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()    
     
     net = GRU(

@@ -459,6 +459,7 @@ def parseargs():
     parser.add_argument('--resample', default='False', type=lambda x: bool(strtobool(x)), help='whether to resample the PPG or not')
     parser.add_argument('--target_resample_fs', default=50, type=float, help='target resampling frequency')
     parser.add_argument('--butterworth_filter', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth PPG with the Butterworth Filter or not')
+    parser.add_argument('--ema_std', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth PPG/ECG with EMA standardization or with z-score')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot intermediate preprocessing steps or not')
     
@@ -467,7 +468,6 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()
     
     print("Parsed Arguments:")

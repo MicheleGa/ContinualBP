@@ -13,6 +13,7 @@ from thop import profile, clever_format
 def exists(val):
     return val is not None
 
+
 def moore_penrose_iter_pinv(x, iters = 6):
     device = x.device
 
@@ -30,7 +31,6 @@ def moore_penrose_iter_pinv(x, iters = 6):
 
     return z
 
-# main attention class
 
 class NystromAttention(nn.Module):
     def __init__(
@@ -151,6 +151,7 @@ class NystromAttention(nn.Module):
             return out, attn
 
         return out
+    
 
 class AttentionBlock(nn.Module):
     
@@ -211,52 +212,57 @@ class AttentionBlock(nn.Module):
 
 
 class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1, num_groups=8):
         super(ResidualBlock1D, self).__init__()
+        groups = num_groups if out_channels >= num_groups else 1
+        
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.gn1 = nn.GroupNorm(groups, out_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=1) # Stride 1 for second conv
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=1)
 
         self.shortcut = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
-            nn.BatchNorm1d(out_channels)
+            nn.GroupNorm(groups, out_channels)
         )
         
     def forward(self, x):
         identity = self.shortcut(x)
 
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.gn1(out)
         out = self.relu(out)
         out = self.conv2(out)
         
         out += identity 
         
         return out
+
     
 class BottleneckBlock1D(nn.Module):
-    def __init__(self, channels, stride=1):
+    def __init__(self, channels, stride=1, num_groups=8):
         super(BottleneckBlock1D, self).__init__()
-        self.bn1 = nn.BatchNorm1d(channels)
+        groups = num_groups if channels >= num_groups else 1
+
+        self.gn1 = nn.GroupNorm(groups, channels)
         self.relu1 = nn.ReLU(inplace=True)
         self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
 
-        self.bn2 = nn.BatchNorm1d(channels)
+        self.gn2 = nn.GroupNorm(groups, channels)
         self.relu2 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1, stride=1)
         
     def forward(self, x):
-        
-        out = self.bn1(x)
+        out = self.gn1(x)
         out = self.relu1(out)
         out = self.conv1(out)
         
-        out = self.bn2(out)
+        out = self.gn2(out)
         out = self.relu2(out)
         out = self.conv2(out)
         
         return out
+
 
 class AttentionGate1D(nn.Module):
     def __init__(self, g_channels, x_channels, inter_channels):
@@ -651,7 +657,7 @@ class EUNet(nn.Module):
         
         
 def parseargs():
-    parser = argparse.ArgumentParser(description="PhysioFormer summary, # params and MACS")
+    parser = argparse.ArgumentParser(description="EUNet summary, # params and MACS")
 
     parser.add_argument('--batch_size', default=128, type=int, help='batch size for the dummy input')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
@@ -672,7 +678,6 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
     args = parseargs()    
 
     net = EUNet(
