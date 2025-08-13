@@ -75,7 +75,7 @@ if __name__ == "__main__":
     # Select the gpu to be usesd
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = torch._C.device("cuda:0")
-
+    torch.set_default_dtype(torch.float32)
     # Setup paths
     run_name = generate_runname(model_name=target_model.__name__, exp_name=args.expname)
     checkpoint_path = os.path.join("./checkpoints/", args.expname, run_name)
@@ -125,7 +125,8 @@ if __name__ == "__main__":
             input_seq_len_s=config['input_seq_len_s'],
             ecg=config['ecg'],
             resp=config['resp'],
-            sig2sig=config['sig2sig']
+            sig2sig=config['sig2sig'],
+            min_subject_sample_number=config['min_subject_sample_number']
         )
     else:
         # Load data
@@ -139,6 +140,7 @@ if __name__ == "__main__":
             ecg=config['ecg'],
             resp=config['resp'],
             sig2sig=config['sig2sig'],
+            min_subject_sample_number=config['min_subject_sample_number'],
             masking_ratio=config['masking_ratio'],
             augmentation_types=config['augmentation_types'].split(','),
             aug_prob=config['aug_prob']

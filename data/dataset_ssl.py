@@ -107,7 +107,6 @@ class PhysioDatasetSSL(Dataset):
             
         return RandomAugmentor(augmentations)
 
-
     def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
         # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
@@ -122,8 +121,13 @@ class PhysioDatasetSSL(Dataset):
             for subject in invalid_subjects:
                 self.subjects_for_pretraining.remove(subject)
                 del self.index_by_subject_id[subject]
+
+        # Shorten each subject list to min_subject_sample_number
+        if min_subject_sample_number > 0:
+            for subject in self.subjects_for_pretraining:
+                if len(self.index_by_subject_id[subject]) > min_subject_sample_number:
+                    self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
                 
-    
     def _get_signal_from_lmdb(self, sample_id, key_prefix):
         r"""Helper to get a signal from LMDB, handles missing keys."""
         key = f"{sample_id}-{key_prefix}".encode()
@@ -472,6 +476,7 @@ def parseargs():
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
     parser.add_argument('--personalization_sample_number', default=50, type=int, help='number of samples to take for personalization')
+    parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit')
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
@@ -508,6 +513,7 @@ if __name__ == "__main__":
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
+        min_subject_sample_number=args.min_subject_sample_number, 
         plot=args.plot,
         savepath=root_figs_folder,
         masking_ratio=args.masking_ratio,

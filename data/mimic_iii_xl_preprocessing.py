@@ -51,6 +51,12 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, trial_folder,
         
         # Define filtering criteria based on https://www.nature.com/articles/s41597-024-04041-1
         if window_abp.max() <= 200 and window_abp.min() >= 30:  
+            
+            # Process annotation before calculating the peaks/valleys
+            if args.fir_bp_filtering:
+                # Apply bandpass FIR filter to ABP
+                window_abp = high_freq_butterworth(signal=window_abp, fs=fs, cutoff_freq=35, plot=args.plot, title='ABP-LP', savepath=savepath)
+            
             temp_sbp, temp_dbp, peaks, valleys = compute_sp_dp(sig=window_abp, fs=fs)
             if temp_sbp > 0 and temp_dbp > 0 and len(peaks) > 0 and len(valleys) > 0:
                 # Calculate pulse pressure
@@ -109,15 +115,19 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, trial_folder,
             
             # Preprocess PPG window before saving it in the subject data
             if args.butterworth_filter:
-                # 4-th order butterworth filtering
-                window_ppg = butterworth_filtering(window_ppg, plot=args.plot, title='PPG-Butter', savepath=savepath)
+                window_ppg = butterworth_filtering(signal=window_ppg, fs=fs, level=4, low_freq=0.5, high_freq=12.5, plot=args.plot, title='PPG-FIR', savepath=savepath)
            
             if args.resample:
                 # Resampling to target fs: note that for PPG at least 25 Hz are required
                 window_ppg = resample_signal(window_ppg, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='PPG-Resampling', savepath=savepath)
                 
-            # Zero-mean standardization (Z-score)
-            window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
+            # Normalization: Rescale to unit, Zero-mean standardization (Z-score) or EMA Z-score 
+            if args.ema_std:
+                window_ppg = ema_normalization(window_ppg, plot=args.plot, title='PPG-EMA-Z-Score', savepath=savepath)
+            elif args.rescale_to_unit:
+                window_ppg = rescale_to_unit(window_ppg, plot=args.plot, title='PPG-Rescale', savepath=savepath)
+            else:
+                window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
 
             # Ensure FP32 type for PPG
             window_ppg = window_ppg.astype(np.float32)
@@ -153,8 +163,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, trial_folder,
             
             # Preprocess PPG/ECG windows before saving it in the subject data
             if args.butterworth_filter:
-                # 4-th order butterworth filtering
-                window_ppg = butterworth_filtering(window_ppg, plot=args.plot, title='PPG-Butter', savepath=savepath)
+                window_ppg = butterworth_filtering(signal=window_ppg, fs=fs, level=4, low_freq=0.5, high_freq=12.5, plot=args.plot, title='PPG-FIR', savepath=savepath)
             
             # TO-DO: ECG filtering (DWT maybe)
             
@@ -163,10 +172,17 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, trial_folder,
                 window_ppg = resample_signal(window_ppg, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='PPG-Resampling', savepath=savepath)
                 window_ecg = resample_signal(window_ecg, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='ECG-Resampling', savepath=savepath)
             
-            # Zero-mean standardization (Z-score)
-            window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
-            window_ecg = standardize(window_ecg, plot=args.plot, title='ECG-Z-Score', savepath=savepath)
-            
+            # Normalization: Rescale to unit, Zero-mean standardization (Z-score) or EMA Z-score 
+            if args.ema_std:
+                window_ppg = ema_normalization(window_ppg, plot=args.plot, title='PPG-EMA-Z-Score', savepath=savepath)
+                window_ecg = ema_normalization(window_ecg, plot=args.plot, title='ECG-EMA-Z-Score', savepath=savepath)
+            elif args.rescale_to_unit:
+                window_ppg = rescale_to_unit(window_ppg, plot=args.plot, title='PPG-Rescale', savepath=savepath)
+                window_ecg = rescale_to_unit(window_ecg, plot=args.plot, title='ECG-Rescale', savepath=savepath)
+            else:
+                window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
+                window_ecg = standardize(window_ecg, plot=args.plot, title='ECG-Z-Score', savepath=savepath)
+                
             # Ensure FP32 type for PPG
             window_ppg = window_ppg.astype(np.float32)
             window_ecg = window_ecg.astype(np.float32)
@@ -201,8 +217,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, trial_folder,
             
             # Preprocess PPG/ECG/RESP windows before saving it in the subject data
             if args.butterworth_filter:
-                # 4-th order butterworth filtering
-                window_ppg = butterworth_filtering(window_ppg, plot=args.plot, title='PPG-Butter', savepath=savepath)
+                window_ppg = butterworth_filtering(signal=window_ppg, fs=fs, level=4, low_freq=0.5, high_freq=12.5, plot=args.plot, title='PPG-FIR', savepath=savepath)
             
             # TO-DO: ECG/RESP filtering (DWT maybe)
             
@@ -212,10 +227,19 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, trial_folder,
                 window_ecg = resample_signal(window_ecg, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='ECG-Resampling', savepath=savepath)
                 window_resp = resample_signal(window_resp, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='RESP-Resampling', savepath=savepath)
         
-            # Zero-mean standardization (Z-score)
-            window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
-            window_ecg = standardize(window_ecg, plot=args.plot, title='ECG-Z-Score', savepath=savepath)
-            window_resp = standardize(window_resp, plot=args.plot, title='RESP-Z-Score', savepath=savepath)
+            # Normalization: Rescale to unit, Zero-mean standardization (Z-score) or EMA Z-score 
+            if args.ema_std:
+                window_ppg = ema_normalization(window_ppg, plot=args.plot, title='PPG-EMA-Z-Score', savepath=savepath)
+                window_ecg = ema_normalization(window_ecg, plot=args.plot, title='ECG-EMA-Z-Score', savepath=savepath)
+                window_resp = ema_normalization(window_resp, plot=args.plot, title='RESP-EMA-Z-Score', savepath=savepath)
+            elif args.rescale_to_unit:
+                window_ppg = rescale_to_unit(window_ppg, plot=args.plot, title='PPG-Rescale', savepath=savepath)
+                window_ecg = rescale_to_unit(window_ecg, plot=args.plot, title='ECG-Rescale', savepath=savepath)
+                window_resp = rescale_to_unit(window_resp, plot=args.plot, title='RESP-Rescale', savepath=savepath)
+            else:
+                window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
+                window_ecg = standardize(window_ecg, plot=args.plot, title='ECG-Z-Score', savepath=savepath)
+                window_resp = standardize(window_resp, plot=args.plot, title='RESP-Z-Score', savepath=savepath)
         
             # Ensure FP32 type for PPG
             window_ppg = window_ppg.astype(np.float32)
@@ -456,9 +480,11 @@ def parseargs():
     parser.add_argument('--window_overlap', default=3.0, type=float, help='window overlapping in seconds')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ecg or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load resp or not')
+    parser.add_argument('--rescale_to_unit', default='False', type=lambda x: bool(strtobool(x)), help='whether to rescale the input signals to the range [0,1] or not')
     parser.add_argument('--resample', default='False', type=lambda x: bool(strtobool(x)), help='whether to resample the PPG or not')
     parser.add_argument('--target_resample_fs', default=50, type=float, help='target resampling frequency')
     parser.add_argument('--butterworth_filter', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth PPG with the Butterworth Filter or not')
+    parser.add_argument('--fir_bp_filtering', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth BP with a bandpass FIR filter or not')
     parser.add_argument('--ema_std', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth PPG/ECG with EMA standardization or with z-score')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot intermediate preprocessing steps or not')

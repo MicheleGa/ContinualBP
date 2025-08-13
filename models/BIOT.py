@@ -11,26 +11,25 @@ from thop import profile, clever_format
 
 
 class PatchFrequencyEmbedding(nn.Module):
-    def __init__(self, embed_dim=256, n_freq=101):
+    def __init__(self, emb_size=256, n_freq=101):
         super().__init__()
-        self.projection = nn.Linear(n_freq, embed_dim)
+        self.projection = nn.Linear(n_freq, emb_size)
 
     def forward(self, x):
         """
         x: (batch, freq, time)
-        out: (batch, time, embed_dim)
+        out: (batch, time, emb_size)
         """
         x = x.permute(0, 2, 1)
         x = self.projection(x)
         return x
-    
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
-        # Compute the positional encodings once in log space.
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1).float()
         div_term = torch.exp(
@@ -42,66 +41,100 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        """
-        Args:
-            x: `embeddings`, shape (batch, max_len, d_model)
-        Returns:
-            `encoder input`, shape (batch, max_len, d_model)
-        """
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
 
 
-
-
-class DecoderExpansion(nn.Module):
-    """Expands global representation to sequence length"""
-    def __init__(self, embed_dim, output_seq_len):
+class BIOTEncoder(nn.Module):
+    def __init__(
+        self,
+        emb_size=256,
+        heads=8,
+        depth=4,
+        n_channels=16,
+        n_fft=200,
+        hop_length=100,
+        **kwargs
+    ):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.output_seq_len = output_seq_len
-        
-        # Learnable expansion using a linear layer
-        self.expansion = nn.Linear(embed_dim, embed_dim * output_seq_len)
-        
-    def forward(self, x):
-        """
-        Args:
-            x: (batch_size, embed_dim)
-        Returns:
-            x: (batch_size, output_seq_len, embed_dim)
-        """
-        batch_size = x.shape[0]
-        
-        # Expand to sequence length
-        x = self.expansion(x)  # (batch_size, embed_dim * output_seq_len)
-        x = x.view(batch_size, self.output_seq_len, self.embed_dim)
-        
-        return x
+        self.n_fft = n_fft
+        self.hop_length = hop_length
 
-
-class DecoderTransformer(nn.Module):
-    """Decoder transformer using LinearAttentionTransformer"""
-    def __init__(self, embed_dim, num_heads, num_layers, max_seq_len):
-        super().__init__()
-        
+        self.patch_embedding = PatchFrequencyEmbedding(
+            emb_size=emb_size, n_freq=self.n_fft // 2 + 1
+        )
         self.transformer = LinearAttentionTransformer(
-            dim=embed_dim,
-            heads=num_heads,
-            depth=num_layers,
-            max_seq_len=max_seq_len,
+            dim=emb_size,
+            heads=heads,
+            depth=depth,
+            max_seq_len=1024,
             attn_layer_dropout=0.2,
             attn_dropout=0.2,
         )
-        
+        self.positional_encoding = PositionalEncoding(emb_size)
+        self.channel_tokens = nn.Embedding(n_channels, 256)
+        self.index = nn.Parameter(
+            torch.LongTensor(range(n_channels)), requires_grad=False
+        )
+
+    def stft(self, sample):
+        spectral = torch.stft(
+            input=sample.squeeze(1),
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            center=False,
+            onesided=True,
+            return_complex=True,
+        )
+        return torch.abs(spectral)
+
+    def forward(self, x, n_channel_offset=0, perturb=False):
+        emb_seq = []
+        for i in range(x.shape[1]):
+            channel_spec_emb = self.stft(x[:, i : i + 1, :])
+            channel_spec_emb = self.patch_embedding(channel_spec_emb)
+            batch_size, ts, _ = channel_spec_emb.shape
+
+            channel_token_emb = (
+                self.channel_tokens(self.index[i + n_channel_offset])
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(batch_size, ts, 1)
+            )
+            channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb)
+
+            if perturb:
+                ts = channel_emb.shape[1]
+                ts_new = np.random.randint(ts // 2, ts)
+                selected_ts = np.random.choice(range(ts), ts_new, replace=False)
+                channel_emb = channel_emb[:, selected_ts]
+            emb_seq.append(channel_emb)
+
+        emb = torch.cat(emb_seq, dim=1)
+        emb = self.transformer(emb).mean(dim=1)
+        return emb
+
+
+class BPWaveformDecoder(nn.Module):
+    """Decoder that maps sequence embeddings directly to waveform samples."""
+    def __init__(self, emb_size, output_len, depth=4, heads=8):
+        super().__init__()
+        self.transformer = LinearAttentionTransformer(
+            dim=emb_size,
+            depth=depth,
+            heads=heads,
+            max_seq_len=1024,
+            attn_layer_dropout=0.2,
+            attn_dropout=0.2,
+        )
+        self.linear_out = nn.Linear(emb_size, output_len)
+
     def forward(self, x):
-        """
-        Args:
-            x: (batch_size, seq_len, embed_dim)
-        Returns:
-            x: (batch_size, seq_len, embed_dim)
-        """
-        return self.transformer(x)
+        # x: (batch, seq_len, emb_size)
+        x = self.transformer(x)          # (batch, seq_len, emb_size)
+        x = x.mean(dim=1)                 # pool sequence → (batch, emb_size)
+        x = self.linear_out(x)            # (batch, output_len)
+        return x
 
 
 class BIOT(nn.Module):
@@ -109,201 +142,134 @@ class BIOT(nn.Module):
                  ecg=False,
                  resp=False,
                  sig2sig=False,
-                 fs=125,
-                 input_seq_len_s=5,
+                 fs=200,
+                 input_seq_len_s=10,
                  embed_dim=256,
                  num_heads=8,
                  num_encoder_layers=4,
                  num_decoder_layers=4,
-                 n_fft=256,
-                 hop_length=128,
-                 output_seq_len=625):
+                 n_fft=200,
+                 hop_length=100,
+                 pretrained_path=None):
         super().__init__()
-        
-        # Input Data Setup
+
         self.input_seq_len = input_seq_len_s * fs
         self.ecg = ecg
         self.resp = resp
         self.sig2sig = sig2sig
         self.n_fft = n_fft
         self.hop_length = hop_length
-        self.register_buffer("hann_window", torch.hann_window(self.n_fft), persistent=False)
-        if sig2sig:
-            self.output_seq_len = self.input_seq_len
-        else:
-            self.output_seq_len = output_seq_len
-        
-        # Get input channels for each modality
+
         self.ppg_in_channels, self.ecg_in_channels, self.resp_in_channels = self.get_input_channels()
         self.in_channels = self.ppg_in_channels + self.ecg_in_channels + self.resp_in_channels
 
-        # Architecture Setup
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
         
-        # Encoder components (from original BIOT)
-        self.patch_embedding = PatchFrequencyEmbedding(
-            embed_dim=self.embed_dim, n_freq=self.n_fft // 2 + 1
-        )
-        
-        self.encoder_transformer = LinearAttentionTransformer(
-            dim=self.embed_dim,
-            heads=self.num_heads,
-            depth=self.num_encoder_layers,
-            max_seq_len=self.input_seq_len,
-            attn_layer_dropout=0.2,
-            attn_dropout=0.2,
-        )
-        
-        self.positional_encoding = PositionalEncoding(self.embed_dim)
-
-        # Channel token embedding
-        self.channel_tokens = nn.Embedding(self.in_channels, self.embed_dim)
-        self.index = nn.Parameter(
-            torch.LongTensor(range(self.in_channels)), requires_grad=False
-        )
-        
-        # Decoder components
-        self.decode = self._build_decoder()
-
-    def _build_decoder(self):
-        """Build the decoder architecture"""
-        return nn.Sequential(
-            # First expand the global representation to sequence length
-            DecoderExpansion(self.embed_dim, self.output_seq_len),
-            
-            # Apply positional encoding to the expanded sequence
-            PositionalEncoding(self.embed_dim, dropout=0.1, max_len=self.output_seq_len),
-            
-            # Decoder transformer layers
-            DecoderTransformer(
-                embed_dim=self.embed_dim,
-                num_heads=self.num_heads,
-                num_layers=self.num_decoder_layers,
-                max_seq_len=self.output_seq_len
-            ),
-            
-            # Final projection to blood pressure (1 channel)
-            nn.Linear(self.embed_dim, 1)
+        # Project 2 → pretrained's 18 channels
+        self.pretrained_channels = 18 if pretrained_path else self.in_channels
+        self.channel_proj = nn.Conv1d(
+            in_channels=self.in_channels,
+            out_channels=self.pretrained_channels,
+            kernel_size=1
         )
 
-    def stft(self, sample):
-        spectral = torch.stft( 
-            input=sample.squeeze(1),
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            window=self.hann_window,
-            center=False,
-            onesided=True,
-            return_complex=True,
+        self.encoder = BIOTEncoder(
+            emb_size=embed_dim,
+            heads=num_heads,
+            depth=num_encoder_layers,
+            n_channels=self.pretrained_channels,
+            n_fft=n_fft,
+            hop_length=hop_length
         )
-        return torch.abs(spectral)
 
-    def encode(self, x, n_channel_offset=0, perturb=False):
-        """Encoder forward pass - extracts features from input signals"""
-        x = x.unsqueeze(-1) if len(x.shape) == 2 else x 
+        if pretrained_path:
+            ckpt = torch.load(pretrained_path, map_location='cpu')
+            if 'encoder' in ckpt:
+                ckpt = ckpt['encoder']
+            self.encoder.load_state_dict(ckpt, strict=False)
+            print(f"Loaded pretrained encoder from {pretrained_path}")
+
+        self.decoder = BPWaveformDecoder(
+            emb_size=embed_dim,
+            output_len=self.input_seq_len,
+            depth=num_decoder_layers,
+            heads=num_heads
+        )
+
+    def forward(self, x, n_channel_offset=0):
+        # Accept both (B, T, C) and (B, C, T)
+        if x.dim() == 3 and x.shape[1] == self.input_seq_len and x.shape[2] == self.in_channels:
+            x = x.permute(0, 2, 1)
+        elif x.dim() == 3 and x.shape[1] == self.in_channels:
+            pass
+        else:
+            x = x.permute(0, 2, 1)
         
-        # x -> (batch_size, channel, ts)
-        x = x.permute(0, 2, 1) 
-        
+        if self.pretrained_channels != self.in_channels:
+            # Project input channels to match pretrained model's expected channels
+            x = self.channel_proj(x)  # (B, 18, T)
+       
+        # Build token sequence for each channel
         emb_seq = []
         for i in range(x.shape[1]):
-            # Get spectral representation
-            channel_spec_emb = self.stft(x[:, i : i + 1, :])
-            channel_spec_emb = self.patch_embedding(channel_spec_emb)
+            channel_spec_emb = self.encoder.stft(x[:, i:i+1, :])
+            channel_spec_emb = self.encoder.patch_embedding(channel_spec_emb)
             batch_size, ts, _ = channel_spec_emb.shape
-            
-            # Add channel token embedding
-            channel_token_emb = (
-                self.channel_tokens(self.index[i + n_channel_offset])
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .repeat(batch_size, ts, 1)
-            )
-            
-            # Add positional encoding
-            channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb)
 
-            # Optional perturbation for data augmentation
-            if perturb:
-                ts = channel_emb.shape[1]
-                ts_new = np.random.randint(ts // 2, ts)
-                selected_ts = np.random.choice(range(ts), ts_new, replace=False)
-                channel_emb = channel_emb[:, selected_ts]
-            
+            channel_token_emb = (
+                self.encoder.channel_tokens(self.encoder.index[i + n_channel_offset])
+                .unsqueeze(0).unsqueeze(0).repeat(batch_size, ts, 1)
+            )
+            channel_emb = self.encoder.positional_encoding(channel_spec_emb + channel_token_emb)
             emb_seq.append(channel_emb)
 
-        # Concatenate all channel embeddings
-        emb = torch.cat(emb_seq, dim=1)
-        
-        # Pass through encoder transformer and get global representation
-        emb = self.encoder_transformer(emb).mean(dim=1)  # (batch_size, embed_dim)
-        
-        return emb
+        emb = torch.cat(emb_seq, dim=1)        # (B, total_ts, emb_dim)
+        emb = self.encoder.transformer(emb)    # (B, total_ts, emb_dim)
 
-    def forward(self, x, n_channel_offset=0, perturb=False):
-        """
-        Full forward pass: encode input signals and decode blood pressure
+        bp_waveform = self.decoder(emb)        # (B, output_len)
         
-        Args:
-            x: Input tensor (batch_size, seq_len, channels)
-        Returns:
-            output: Reconstructed blood pressure (batch_size, output_seq_len)
-        """
-        # Encode input signals to get global representation
-        encoder_features = self.encode(x, n_channel_offset, perturb)
-        
-        # Decode blood pressure in time domain
-        output = self.decode(encoder_features)
-        
-        # Output shape: (batch_size, output_seq_len, 1) -> (batch_size, output_seq_len)
-        return output.squeeze(-1)
+        return bp_waveform
 
     def get_input_channels(self):
-        ppg_in_channels = 1  # PPG must always be present
+        ppg_in_channels = 1
         ecg_in_channels = 1 if self.ecg else 0
         resp_in_channels = 1 if self.resp else 0
         return ppg_in_channels, ecg_in_channels, resp_in_channels
-    
+
     def print_summary(self, batch_size=128):
-        ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
-        total_input_channels = ppg_in_channels + ecg_in_channels + resp_in_channels
+        total_input_channels = self.in_channels
         input_data = torch.rand((batch_size, self.input_seq_len, total_input_channels))
-
-        print("\n--- Model Summary (Full Forward/Backward) ---")
-        summary(self, input_data=[input_data], col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
-
-        print("\n--- MACs and Parameters (Full Forward/Backward) ---")
+        print("\n--- Model Summary ---")
+        summary(self, input_data=[input_data], 
+                col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
         macs, num_params = profile(self, inputs=(input_data,))
         macs, num_params = clever_format([macs, num_params], "%.7f")
         print(f'BIOT has {num_params} params and {macs} MACs.')
 
 
 def parseargs():
-    parser = argparse.ArgumentParser(description="BIOT summary, # params and MACS")
-
-    parser.add_argument('--batch_size', default=128, type=int, help='batch size for the dummy input')
-    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to include ECG')
-    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to include respiratory signal')
-    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='signal-to-signal mode')
-    parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
-    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--embed_dim', default=256, type=int, help='transformer embedding dimension')
-    parser.add_argument('--num_heads', default=8, type=int, help='number of attention heads')
-    parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of encoder layers')
-    parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
-    parser.add_argument('--n_fft', default=256, type=int, help='STFT n_fft parameter')
-    parser.add_argument('--hop_length', default=128, type=int, help='STFT hop length parameter')
-    
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="BIOT summary")
+    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)))
+    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)))
+    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)))
+    parser.add_argument('--fs', default=125, type=int)
+    parser.add_argument('--input_seq_len_s', default=5, type=int)
+    parser.add_argument('--embed_dim', default=256, type=int)
+    parser.add_argument('--num_heads', default=8, type=int)
+    parser.add_argument('--num_encoder_layers', default=4, type=int)
+    parser.add_argument('--num_decoder_layers', default=4, type=int)
+    parser.add_argument('--n_fft', default=200, type=int)
+    parser.add_argument('--hop_length', default=100, type=int)
+    parser.add_argument('--pretrained_path', default='', type=str)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parseargs()    
-
+    args = parseargs()
     net = BIOT(
         ecg=args.ecg,
         resp=args.resp,
@@ -315,7 +281,7 @@ if __name__ == "__main__":
         num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
         n_fft=args.n_fft,
-        hop_length=args.hop_length
+        hop_length=args.hop_length,
+        pretrained_path=args.pretrained_path
     )
-    
     net.print_summary(batch_size=args.batch_size)

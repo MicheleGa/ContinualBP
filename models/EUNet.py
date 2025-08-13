@@ -607,8 +607,6 @@ class EUNet(nn.Module):
         output = self.final_conv(sa_output)
         
         # Permute back to [batch_size, length, channels] for consistency with input
-        print(output.shape)
-        print(output.permute(0, 2, 1).squeeze(-1).shape)
         return output.permute(0, 2, 1).squeeze(-1)
     
     def init_params(self):

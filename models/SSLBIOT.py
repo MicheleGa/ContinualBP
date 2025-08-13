@@ -50,39 +50,25 @@ class PositionalEncoding(nn.Module):
         """
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
+    
 
-
-class DecoderExpansion(nn.Module):
-    """Expands global representation to sequence length"""
-    def __init__(self, embed_dim, output_seq_len):
+class EncoderToDecoderProjector(nn.Module):
+    def __init__(self, input_len, output_len, embed_dim):
         super().__init__()
+        self.input_len = input_len
+        self.output_len = output_len
         self.embed_dim = embed_dim
-        self.output_seq_len = output_seq_len
-        
-        # Learnable expansion using a linear layer
-        self.expansion = nn.Linear(embed_dim, embed_dim * output_seq_len)
-        
+
     def forward(self, x):
-        """
-        Args:
-            x: (batch_size, embed_dim)
-        Returns:
-            x: (batch_size, output_seq_len, embed_dim)
-        """
-        batch_size = x.shape[0]
-        
-        # Expand to sequence length
-        x = self.expansion(x)  # (batch_size, embed_dim * output_seq_len)
-        x = x.view(batch_size, self.output_seq_len, self.embed_dim)
-        
+        x = x.permute(0, 2, 1)
+        x = F.interpolate(x, size=self.output_len, mode='linear', align_corners=True)
+        x = x.permute(0, 2, 1)
         return x
 
 
 class DecoderTransformer(nn.Module):
-    """Decoder transformer using LinearAttentionTransformer"""
     def __init__(self, embed_dim, num_heads, num_layers, max_seq_len):
         super().__init__()
-        
         self.transformer = LinearAttentionTransformer(
             dim=embed_dim,
             heads=num_heads,
@@ -91,76 +77,38 @@ class DecoderTransformer(nn.Module):
             attn_layer_dropout=0.2,
             attn_dropout=0.2,
         )
-        
+
     def forward(self, x):
-        """
-        Args:
-            x: (batch_size, seq_len, embed_dim)
-        Returns:
-            x: (batch_size, seq_len, embed_dim)
-        """
         return self.transformer(x)
 
 
 class BIOTDecoder(nn.Module):
-    """
-    Improved decoder architecture using LinearAttentionTransformer
-    for both supervised (BP prediction) and self-supervised (signal reconstruction) tasks
-    """
     def __init__(self, 
                  embed_dim=256,
                  num_heads=8,
                  num_decoder_layers=4,
+                 input_seq_len=625,
                  output_seq_len=625,
                  dropout=0.1,
                  output_channels=1):
         super().__init__()
-        
-        self.embed_dim = embed_dim
-        self.output_seq_len = output_seq_len
-        self.num_decoder_layers = num_decoder_layers
-        self.output_channels = output_channels
-        
-        # Build decoder components
-        self.decoder = self._build_decoder()
-        
-    def _build_decoder(self):
-        """Build the decoder architecture using LinearAttentionTransformer"""
-        return nn.Sequential(
-            # First expand the global representation to sequence length
-            DecoderExpansion(self.embed_dim, self.output_seq_len),
-            
-            # Apply positional encoding to the expanded sequence
-            PositionalEncoding(self.embed_dim, dropout=0.1, max_len=self.output_seq_len),
-            
-            # Decoder transformer layers
-            DecoderTransformer(
-                embed_dim=self.embed_dim,
-                num_heads=8,  # Fixed to 8 heads to match encoder
-                num_layers=self.num_decoder_layers,
-                max_seq_len=self.output_seq_len
-            ),
-            
-            # Final projection to desired output channels
+        self.decoder = nn.Sequential(
+            EncoderToDecoderProjector(input_seq_len, output_seq_len, embed_dim),
+            PositionalEncoding(embed_dim, dropout=dropout, max_len=output_seq_len),
+            DecoderTransformer(embed_dim, num_heads, num_decoder_layers, output_seq_len),
             nn.Sequential(
-                nn.Linear(self.embed_dim, self.embed_dim // 2),
+                nn.Linear(embed_dim, embed_dim // 2),
                 nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.embed_dim // 2, self.embed_dim // 4),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim // 2, embed_dim // 4),
                 nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.embed_dim // 4, self.output_channels)
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim // 4, output_channels)
             )
         )
-        
-    def forward(self, encoder_features):
-        """
-        Args:
-            encoder_features: (batch_size, embed_dim) - encoded features from BIOT encoder
-        Returns:
-            output_signal: (batch_size, output_seq_len, output_channels) - reconstructed signal(s)
-        """
-        return self.decoder(encoder_features)
+
+    def forward(self, encoder_sequence):
+        return self.decoder(encoder_sequence)
 
 
 class SSLBIOT(nn.Module):
@@ -176,80 +124,64 @@ class SSLBIOT(nn.Module):
                  num_decoder_layers=4,
                  n_fft=256,
                  hop_length=128,
-                 output_seq_len=625):
+                 output_seq_len=625,
+                 use_stft=True):
         super().__init__()
-        
-        # Input Data Setup
+
         self.input_seq_len = input_seq_len_s * fs
-        self.ecg = ecg
-        self.resp = resp
-        self.sig2sig = sig2sig 
+        self.output_seq_len = self.input_seq_len if sig2sig else output_seq_len
+        self.use_stft = use_stft
         self.n_fft = n_fft
         self.hop_length = hop_length
+
         self.register_buffer("hann_window", torch.hann_window(self.n_fft), persistent=False)
-        if sig2sig:
-            self.output_seq_len = self.input_seq_len
-        else:
-            self.output_seq_len = output_seq_len
-        
-        # Get input channels for each modality
+
+        self.ecg = ecg
+        self.resp = resp
+        self.sig2sig = sig2sig
+
         self.ppg_in_channels, self.ecg_in_channels, self.resp_in_channels = self.get_input_channels()
         self.in_channels = self.ppg_in_channels + self.ecg_in_channels + self.resp_in_channels
 
-        # Architecture Setup
         self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.num_encoder_layers = num_encoder_layers
-        self.num_decoder_layers = num_decoder_layers
-        
-        # Encoder components (from original BIOT)
-        self.patch_embedding = PatchFrequencyEmbedding(
-            embed_dim=self.embed_dim, n_freq=self.n_fft // 2 + 1
-        )
-        
         self.encoder_transformer = LinearAttentionTransformer(
-            dim=self.embed_dim,
-            heads=self.num_heads,
-            depth=self.num_encoder_layers,
-            max_seq_len=self.input_seq_len, # Max sequence length for transformer
+            dim=embed_dim,
+            heads=num_heads,
+            depth=num_encoder_layers,
+            max_seq_len=self.input_seq_len,
             attn_layer_dropout=0.2,
             attn_dropout=0.2,
         )
-        
-        self.positional_encoding = PositionalEncoding(self.embed_dim)
 
-        # Channel token embedding
-        self.channel_tokens = nn.Embedding(self.in_channels, self.embed_dim)
-        self.index = nn.Parameter(
-            torch.LongTensor(range(self.in_channels)), requires_grad=False
-        )
-        
-        # --- Supervised Decoder Head ---
-        # This is the decoder for BP reconstruction (supervised task)
-        # Outputs single channel (blood pressure)
+        if use_stft:
+            self.patch_embedding = PatchFrequencyEmbedding(embed_dim=embed_dim, n_freq=n_fft // 2 + 1)
+        else:
+            self.time_domain_projection = nn.Linear(1, embed_dim)
+
+        self.positional_encoding = PositionalEncoding(embed_dim)
+        self.channel_tokens = nn.Embedding(self.in_channels, embed_dim)
+        self.index = nn.Parameter(torch.LongTensor(range(self.in_channels)), requires_grad=False)
+
         self.supervised_decoder_head = BIOTDecoder(
             embed_dim=embed_dim,
             num_heads=num_heads,
             num_decoder_layers=num_decoder_layers,
+            input_seq_len=self.input_seq_len * self.in_channels,  # Approx upper bound
             output_seq_len=self.output_seq_len,
-            dropout=0.1,
-            output_channels=1  # BP reconstruction, always 1 channel
+            output_channels=1
         )
 
-        # --- Self-Supervision: Reconstruction Head for MSR ---
-        # Reconstructs all input signals (PPG, ECG, Resp)
-        # Outputs same number of channels as input
         self.reconstruction_decoder_head = BIOTDecoder(
             embed_dim=embed_dim,
             num_heads=num_heads,
             num_decoder_layers=num_decoder_layers,
-            output_seq_len=self.input_seq_len, # Reconstruct to original input sequence length
-            dropout=0.1,
-            output_channels=self.in_channels # Reconstruct all input channels
+            input_seq_len=self.input_seq_len * self.in_channels,
+            output_seq_len=self.input_seq_len,
+            output_channels=self.in_channels
         )
 
     def stft(self, sample):
-        spectral = torch.stft( 
+        spectral = torch.stft(
             input=sample.squeeze(1),
             n_fft=self.n_fft,
             hop_length=self.hop_length,
@@ -261,95 +193,56 @@ class SSLBIOT(nn.Module):
         return torch.abs(spectral)
 
     def encode(self, x, n_channel_offset=0, perturb=False):
-        """
-        Encoder forward pass - extracts features from input signals.
-        This serves as the shared feature extractor for SSL tasks.
-        
-        Args:
-            x: Input tensor (batch_size, seq_len, channels)
-        Returns:
-            emb: Encoded features (batch_size, embed_dim)
-        """
-        x = x.unsqueeze(-1) if len(x.shape) == 2 else x 
-        
-        # x -> (batch_size, channel, ts)
-        x = x.permute(0, 2, 1) 
-        
+        x = x.unsqueeze(-1) if len(x.shape) == 2 else x
+        x = x.permute(0, 2, 1)
+
         emb_seq = []
         for i in range(x.shape[1]):
-            # Get spectral representation
-            channel_spec_emb = self.stft(x[:, i : i + 1, :])
-            channel_spec_emb = self.patch_embedding(channel_spec_emb)
-            batch_size, ts, _ = channel_spec_emb.shape
-            
-            # Add channel token embedding
+            channel_input = x[:, i : i + 1, :]
+
+            if self.use_stft:
+                channel_emb = self.stft(channel_input)
+                channel_emb = self.patch_embedding(channel_emb)
+            else:
+                channel_input = channel_input.squeeze(1).unsqueeze(-1)
+                channel_emb = self.time_domain_projection(channel_input)
+
+            batch_size, ts, _ = channel_emb.shape
+
             channel_token_emb = (
                 self.channel_tokens(self.index[i + n_channel_offset])
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .repeat(batch_size, ts, 1)
+                .unsqueeze(0).unsqueeze(0).repeat(batch_size, ts, 1)
             )
-            
-            # Add positional encoding
-            channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb)
+            channel_emb = self.positional_encoding(channel_emb + channel_token_emb)
 
-            # Optional perturbation for data augmentation
             if perturb:
                 ts_orig = channel_emb.shape[1]
-                ts_new = np.random.randint(ts_orig // 2, ts_orig + 1) # Ensure ts_new is at least ts_orig // 2
-                # Ensure selected_ts does not exceed ts_orig
-                selected_ts_indices = np.random.choice(range(ts_orig), ts_new, replace=False)
-                # Sort indices to maintain temporal order, which might be important for positional encoding
-                selected_ts_indices.sort()
-                channel_emb = channel_emb[:, selected_ts_indices]
-            
+                ts_new = np.random.randint(ts_orig // 2, ts_orig + 1)
+                selected_ts = np.random.choice(range(ts_orig), ts_new, replace=False)
+                selected_ts.sort()
+                channel_emb = channel_emb[:, selected_ts]
+
             emb_seq.append(channel_emb)
 
-        # Concatenate all channel embeddings
         emb = torch.cat(emb_seq, dim=1)
-        
-        # Pass through encoder transformer and get global representation
-        emb = self.encoder_transformer(emb).mean(dim=1)  # (batch_size, embed_dim)
-        
+        emb = self.encoder_transformer(emb)
         return emb
 
-    def reconstruct(self, encoder_features):
-        """
-        Reconstruction head for MSR (Multi-Signal Reconstruction).
-        This method will reconstruct the original input signals from the encoder features.
-        
-        Args:
-            encoder_features (torch.Tensor): Output from the encoder (batch_size, embed_dim)
-        Returns:
-            reconstructed_signal (torch.Tensor): Reconstructed input signals (batch_size, input_seq_len, in_channels)
-        """
-        reconstructed_signal = self.reconstruction_decoder_head(encoder_features)
-        return reconstructed_signal.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
-
     def forward(self, x, n_channel_offset=0, perturb=False):
-        """
-        Full forward pass for supervised training: encode input signals and decode blood pressure.
-        
-        Args:
-            x: Input tensor (batch_size, seq_len, channels)
-        Returns:
-            output: Reconstructed blood pressure (batch_size, output_seq_len)
-        """
-        # Encode input signals to get global representation
-        encoder_features = self.encode(x, n_channel_offset, perturb)
-        
-        # Decode blood pressure in time domain using the supervised head
-        output = self.supervised_decoder_head(encoder_features)
-        
-        # Output shape: (batch_size, output_seq_len, 1) -> (batch_size, output_seq_len)
+        encoder_seq = self.encode(x, n_channel_offset, perturb)
+        output = self.supervised_decoder_head(encoder_seq)
         return output.squeeze(-1)
 
+    def reconstruct(self, encoder_seq):
+        reconstructed = self.reconstruction_decoder_head(encoder_seq)
+        return reconstructed.permute(0, 2, 1)
+
     def get_input_channels(self):
-        # PPG must always be present
-        ppg_in_channels = 1  
+        ppg_in_channels = 1
         ecg_in_channels = 1 if self.ecg else 0
         resp_in_channels = 1 if self.resp else 0
         return ppg_in_channels, ecg_in_channels, resp_in_channels
+    
     
     def print_summary(self, batch_size=128):
         ppg_in_channels, ecg_in_channels, resp_in_channels = self.get_input_channels()
@@ -381,33 +274,30 @@ class SSLBIOT(nn.Module):
         
         print("\n--- Supervised Decoder Head Summary (for BP prediction) ---")
         summary(self.supervised_decoder_head, input_data=dummy_encoder_output)
-
+        
 
 def parseargs():
-    parser = argparse.ArgumentParser(description="SSLBIOT summary, # params and MACS")
-
-    parser.add_argument('--batch_size', default=128, type=int, help='batch size for the dummy input')
-    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to include ECG')
-    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to include respiratory signal')
-    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='signal-to-signal mode (supervised output shape)')
-    parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
-    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--embed_dim', default=256, type=int, help='transformer embedding dimension')
-    parser.add_argument('--num_heads', default=8, type=int, help='number of attention heads')
-    parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of encoder layers')
-    parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
+    parser = argparse.ArgumentParser(description="SSLBIOT summary, # params and MACs")
+    parser.add_argument('--batch_size', default=128, type=int, help='Batch size for dummy input')
+    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='Include ECG')
+    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='Include respiration')
+    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='Signal-to-signal mode')
+    parser.add_argument('--fs', default=125, type=int, help='Sampling frequency')
+    parser.add_argument('--input_seq_len_s', default=5, type=int, help='Input sequence length in seconds')
+    parser.add_argument('--embed_dim', default=256, type=int, help='Transformer embedding dimension')
+    parser.add_argument('--num_heads', default=8, type=int, help='Number of attention heads')
+    parser.add_argument('--num_encoder_layers', default=4, type=int, help='Number of encoder layers')
+    parser.add_argument('--num_decoder_layers', default=4, type=int, help='Number of decoder layers')
     parser.add_argument('--n_fft', default=256, type=int, help='STFT n_fft parameter')
     parser.add_argument('--hop_length', default=128, type=int, help='STFT hop length parameter')
-    
-    args = parser.parse_args()
-    return args
+    parser.add_argument('--use_stft', default='False', type=lambda x: bool(strtobool(x)), help='Use STFT or raw time-domain input')
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parseargs()    
+    args = parseargs()
 
-    # Create SSL BIOT model
-    net = SSLBIOT(
+    model = SSLBIOT(
         ecg=args.ecg,
         resp=args.resp,
         sig2sig=args.sig2sig,
@@ -418,7 +308,8 @@ if __name__ == "__main__":
         num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
         n_fft=args.n_fft,
-        hop_length=args.hop_length
+        hop_length=args.hop_length,
+        use_stft=args.use_stft
     )
-    
-    net.print_summary(batch_size=args.batch_size)
+
+    model.print_summary(batch_size=args.batch_size)

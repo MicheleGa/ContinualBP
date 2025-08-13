@@ -60,6 +60,7 @@ def parseargs():
     parser.add_argument('--lp_dataset_name', default='test', type=str, help='name of the dataset for linear probing')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
+    parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit')
     parser.add_argument('--fold', default=0, type=int, help='fold number')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of data loader workers')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
@@ -83,6 +84,19 @@ def parseargs():
     parser.add_argument('--aug_prob', default=0.5, type=float, help='Probability for each individual augmentation in RandomAugmentor')
     parser.add_argument('--data_aug', default='False', type=lambda x: bool(strtobool(x)), help='whether to use data augmentations also for the MSR and CWG SSL tasks or not')
     parser.add_argument('--ssl', default='False', type=lambda x: bool(strtobool(x)), help='whether to do self-supervised pretraining or not')
+    
+    # Fine-tuning with pretrained backbone Setup
+    parser.add_argument('--pretrained_path', default=None, type=str)
+    parser.add_argument('--ft_stage1_epochs', default=10, type=int, help='epochs training head only')
+    parser.add_argument('--ft_stage2_epochs', default=50, type=int, help='epochs for full/unfrozen fine-tuning')
+    parser.add_argument('--warmup_epochs_stage1', default=3, type=int, help='warmup epochs for stage1')
+    parser.add_argument('--warmup_epochs_stage2', default=5, type=int, help='warmup epochs for stage2')
+    parser.add_argument('--base_lr', default=3e-4, type=float, help='learning rate for new heads')
+    parser.add_argument('--backbone_lr_multiplier', default=0.05, type=float, help='multiplier for backbone lr')
+    parser.add_argument('--weight_decay', default=1e-2, type=float, help='weight decay for optimizer')
+    parser.add_argument('--grad_clip', default=1.0, type=float, help='weight decay for optimizer')
+    parser.add_argument('--freeze_backbone_first', default=True, type=lambda x: bool(strtobool(x)), help='if True start with backbone frozen')
+    parser.add_argument('--unfreeze_last_k_layers', default=0, type=int, help='if >0, only unfreeze last k transformer blocks in stage2')
         
     # Model Setup
     parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
@@ -122,15 +136,15 @@ def parseargs():
     parser.add_argument('--bidirectional', default=True, type=lambda x: bool(strtobool(x)), help='whether to use bidirectional GRU or not')
         
     # Transformer-based models Setup
-    parser.add_argument('--embed_dim', default=32, type=int, help='transformer embedding dimension size')
+    parser.add_argument('--embed_dim', default=256, type=int, help='transformer embedding dimension size')
     parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
-    parser.add_argument('--num_encoder_layers', default=2, type=int, help='number of trasnformer layers')
+    parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of trasnformer layers')
     parser.add_argument('--dim_feedforward', default=128, type=int, help='feedforward dimension size in the transformer encoder') 
     
     # BIOT Setup
     parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
-    parser.add_argument('--n_fft', default=256, type=int, help='STFT n_fft parameter')
-    parser.add_argument('--hop_length', default=128, type=int, help='STFT hop length parameter')\
+    parser.add_argument('--n_fft', default=200, type=int, help='STFT n_fft parameter')
+    parser.add_argument('--hop_length', default=100, type=int, help='STFT hop length parameter')
         
     args = parser.parse_args()
     return args
@@ -1145,7 +1159,8 @@ def get_model_architecture(config):
             num_encoder_layers=config['num_encoder_layers'],
             num_decoder_layers=config['num_decoder_layers'],
             n_fft=config['n_fft'],
-            hop_length=config['hop_length']
+            hop_length=config['hop_length'],
+            pretrained_path=config['pretrained_path'],
         )
     elif config['model_name'] == 'SSLUNet':
         model = SSLUNet.SSLUNet(

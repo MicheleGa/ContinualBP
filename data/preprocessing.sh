@@ -1,14 +1,16 @@
 # MIMIC III Preprocessing
-python mimic_iii_preprocessing.py --name mimic_iii --num_threads 10 --ecg True --sig2sig True --window_length 5 --window_overlap 3 --ema_std False > ./data_logs/mimic_iii.log
-python mimic_iii_preprocessing.py --name mimic_iii --num_threads 1 --ecg True --sig2sig True --window_length 5 --window_overlap 3 --ema_std False --plot True
-python dataset.py --name mimic_iii --fs 125 --sig2sig True --input_seq_len_s 5 --ecg True --plot True
-python dataset.py --name mimic_iii --fs 125 --sig2sig True --input_seq_len_s 5 --ecg True --mix_pretraining_subject_samples False --plot True
-python dataset_ssl.py --name mimic_iii --fs 125 --sig2sig True --input_seq_len_s 5 --ecg True --mix_pretraining_subject_samples False --plot True
+#python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 10 --sig2sig True --ecg True --window_length 10 --window_overlap 5 --percentile True --resample True --target_resample_fs 200 > ./data_logs/mimic_iii_biot_preprocessing.log
+#python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 1 --sig2sig True --ecg True --window_length 10 --window_overlap 5 --percentile True --resample True --target_resample_fs 200 --plot True
+python dataset.py --name mimic_iii_biot --fs 200 --input_seq_len_s 10 --ecg True --sig2sig True --plot True
 
 
+#python mimic_iii_xl_preprocessing.py --name mimic_iii_xl_filtered --num_threads 1 --sig2sig True --rescale_to_unit True --window_length 10 --window_overlap 5 --butterworth_filter True --fir_bp_filtering True --plot True
 
-#python mimic_iii_xl_preprocessing.py --name mimic_iii_xl --num_threads 10 --sig2sig True --window_length 5 --window_overlap 2.5 --ecg True > ./data_logs/mimic_iii_xl.log
-#python dataset.py --name mimic_iii_xl --fs 125 --sig2sig True --input_seq_len_s 5 --ecg True --resp True --plot True
+#python biot_mimic_iii_preprocessing.py --name biot_mimic_iii --num_threads 10 --fs 125 --target_fs 200 --token_size 200 --hop_length 100 --window_length 10 --ecg True --sig2sig True > ./data_logs/biot_mimic_iii_preprocessing.log
+#python biot_mimic_iii_preprocessing.py --name biot_mimic_iii --num_threads 1 --fs 125 --target_fs 200 --token_size 200 --hop_length 100 --window_length 10 --ecg True --sig2sig True --plot True
+
+#python biot_mimic_iii_preprocessing_2.py --name biot_mimic_iii --num_threads 10 --fs 125 --target_fs 200 --token_size 200 --hop_length 100 --window_length 10 --ecg True --sig2sig True > ./data_logs/biot_mimic_iii_preprocessing.log
+#python biot_mimic_iii_preprocessing_2.py --name biot_mimic_iii --num_threads 1 --fs 125 --target_fs 200 --token_size 200 --window_length 10 --window_overlap 5 --ecg True --sig2sig True --plot True
 
 
 # Vital DB Preprocessing

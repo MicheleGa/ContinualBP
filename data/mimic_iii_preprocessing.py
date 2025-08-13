@@ -28,12 +28,20 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
         # Process and check annotation first
         window_abp = abp[idx_start: idx_stop + 1]
         
+        if args.fir_bp_filtering:
+            # Apply bandpass FIR filter to ABP
+            window_abp = high_freq_butterworth(signal=window_abp, fs=fs, cutoff_freq=35, plot=args.plot, title='ABP-LP', savepath=savepath)
+            
         # Compute SBP, DBP, peaks and valleys# SBP/DBP calculation
         sbp, dbp, peaks, valleys = compute_sp_dp(sig=window_abp, fs=fs) 
                     
         if sbp < 0 or dbp < 0 or len(peaks) == 0 or len(valleys) == 0:
             print(f"\t{subject_id}|{j + 1} of {n_win} - Peaks/Valleys not found for {subject_id}, in segment {segment}, window {j} [{idx_start}:{idx_stop}]")
         else:
+            
+            # Plot BP before resampling, otherwise displayed peaks/valleys will be inconsistent
+            if args.plot:
+                plot_abp(window_abp, fs=fs, peaks=peaks, valleys=valleys, title=f'ABP [SBP {sbp:.2f} - DBP {dbp:.2f}]', save_path=savepath)
             
             # Process also input signals        
             window_ppg = ppg[idx_start: idx_stop + 1]
@@ -45,8 +53,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                 window_resp = resp[idx_start: idx_stop + 1]
             
             if args.butterworth_filter:
-                # 4-th order butterworth filtering for PPG
-                window_ppg = butterworth_filtering(window_ppg, plot=args.plot, title='PPG-Butter', savepath=savepath)
+                window_ppg = butterworth_filtering(signal=window_ppg, fs=fs, level=4, low_freq=0.5, high_freq=12.5, plot=args.plot, title='PPG-FIR', savepath=savepath)
                 
             if args.resample:
                 # Resampling to target fs: note that for ECG at least 50 Hz are required; TODO look for references on the target fs for RESP
@@ -55,14 +62,27 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                     window_ecg = resample_signal(window_ecg, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='ECG-Resampling', savepath=savepath)
                 if args.resp:
                     window_resp = resample_signal(window_resp, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='RESP-Resampling', savepath=savepath)
-            
-            # Normalization: Zero-mean standardization (Z-score) or EMA Z-score
+                window_abp = resample_signal(window_abp, original_fs=fs, target_fs=args.target_resample_fs, plot=args.plot, title='ABP-Resampling', savepath=savepath)
+                
+            # Normalization: Rescale to unit, Zero-mean standardization (Z-score) or EMA Z-score 
             if args.ema_std:
                 window_ppg = ema_normalization(window_ppg, plot=args.plot, title='PPG-EMA-Z-Score', savepath=savepath)
                 if args.ecg:
                     window_ecg = ema_normalization(window_ecg, plot=args.plot, title='ECG-EMA-Z-Score', savepath=savepath)
                 if args.resp:
                     window_resp = ema_normalization(window_resp, plot=args.plot, title='RESP-EMA-Z-Score', savepath=savepath)
+            elif args.rescale_to_unit:
+                window_ppg = rescale_to_unit(window_ppg, plot=args.plot, title='PPG-Rescale', savepath=savepath)
+                if args.ecg:
+                    window_ecg = rescale_to_unit(window_ecg, plot=args.plot, title='ECG-Rescale', savepath=savepath)
+                if args.resp:
+                    window_resp = rescale_to_unit(window_resp, plot=args.plot, title='RESP-Rescale', savepath=savepath)
+            elif args.percentile:
+                window_ppg = percentile_normalize(window_ppg, plot=args.plot, title='PPG-Percentile', savepath=savepath)
+                if args.ecg:
+                    window_ecg = percentile_normalize(window_ecg, plot=args.plot, title='ECG-Percentile', savepath=savepath)
+                if args.resp:
+                    window_resp = percentile_normalize(window_resp, plot=args.plot, title='RESP-Percentile', savepath=savepath)
             else:
                 window_ppg = standardize(window_ppg, plot=args.plot, title='PPG-Z-Score', savepath=savepath)
                 if args.ecg:
@@ -105,12 +125,12 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         subject_data.append((window_ppg, None, None, sbp, dbp))
                     
             if args.plot:
-                plot_abp(window_abp, fs=fs, peaks=peaks, valleys=valleys, title=f'ABP [SBP {sbp:.2f} - DBP {dbp:.2f}]', save_path=savepath)
                 if args.ecg:
                     if args.resp:
                         if args.sig2sig:
                             plot_signals(
                                 [window_ppg, window_ecg, window_resp, window_abp], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'ECG', 'RESP', 'ABP'], 
                                 title=f'Sample Input Signals', 
                                 savepath=savepath, 
@@ -119,6 +139,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         else:
                             plot_signals(
                                 [window_ppg, window_ecg, window_resp], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'ECG', 'RESP'], 
                                 title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
                                 savepath=savepath, 
@@ -128,6 +149,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         if args.sig2sig:
                             plot_signals(
                                 [window_ppg, window_ecg, window_abp], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'ECG', 'ABP'], 
                                 title=f'Sample Input Signals', 
                                 savepath=savepath, 
@@ -136,6 +158,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         else:
                             plot_signals(
                                 [window_ppg, window_ecg], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'ECG'], 
                                 title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
                                 savepath=savepath, 
@@ -146,6 +169,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         if args.sig2sig:
                             plot_signals(
                                 [window_ppg, window_resp, window_abp], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'RESP', 'ABP'], 
                                 title=f'Sample Input Signals', 
                                 savepath=savepath, 
@@ -154,6 +178,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         else:
                             plot_signals(
                                 [window_ppg, window_resp], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'RESP'], 
                                 title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
                                 savepath=savepath, 
@@ -163,6 +188,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         if args.sig2sig:
                             plot_signals(
                                 [window_ppg, window_abp], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG', 'ABP'], 
                                 title=f'Sample Input Signals', 
                                 savepath=savepath, 
@@ -171,6 +197,7 @@ def process_windows(abp, ppg, ecg, resp, subject_id, subject_data, segment, fs, 
                         else:
                             plot_signals(
                                 [window_ppg], 
+                                fs=fs if not args.resample else args.target_resample_fs,
                                 labels=['PPG'], 
                                 title=f'Sample Input Signals ~ SBP {sbp} - DBP {dbp}', 
                                 savepath=savepath, 
@@ -249,8 +276,10 @@ def preprocess_dataset(args):
     if args.plot:
         # Choose a random subject to plot
         subject_id = np.random.choice(subjects_ids)
+        # p056287
         print(f"Plotting subject {subject_id}")
-        process_subject(subject_id, args, savepath)
+        #process_subject(subject_id, args, savepath)
+        process_subject("p056287", args, savepath)
         
     # Dataset preprocessing
     LMDB_MAP_SIZE = 1000 * 1000 * 1000 * 1000  # 1T
@@ -319,48 +348,6 @@ def preprocess_dataset(args):
     print('Preprocessing completed successfully')
 
 
-def check_invalid_window_abp(args):
-    LMDB_MAP_SIZE = 1000 * 1000 * 1000 * 1000 # 1T
-    lmdb_folder = os.path.join(args.output_folder, args.name) 
-    lmdbenv = lmdb.open(lmdb_folder, map_size=LMDB_MAP_SIZE)
-    with lmdbenv.begin(write=True) as txn:    
-        subject_list:list = pickle.loads(txn.get("subject_list".encode()))
-        index_by_subject_id:dict = pickle.loads(txn.get("index_by_subject_id".encode()))
-        index_by_sample_id = pickle.loads(txn.get("index_by_sample_id".encode()))
-        
-        print(len(subject_list), "subjects in the dataset")
-        
-        for subject_id in subject_list:
-            sample_list = index_by_subject_id[subject_id]
-            invalid_sample_ids = []
-            valid_sample_ids = []
-            for sample_id in sample_list:
-                window_abp = np.squeeze(np.frombuffer(txn.get("{}-abp".format(sample_id).encode()), dtype="float32"))
-                sbp, dbp, peaks, valleys = compute_sp_dp(window_abp, fs=args.fs)
-                if sbp < 0 or dbp < 0 or len(peaks) == 0 or len(valleys) == 0:
-                    print(f'Error during peaks/valleys processing: no peaks or valleys found in the signal {sample_id} of subject {subject_id}.')
-                    invalid_sample_ids.append(sample_id)
-                else:
-                    valid_sample_ids.append(sample_id)
-            if len(invalid_sample_ids) > 0:
-                print(f'Invalid samples for subject {subject_id}: {invalid_sample_ids}')
-
-                # Update index_by_subject_id
-                index_by_subject_id[subject_id] = valid_sample_ids
-
-                # Remove invalid samples from index_by_sample_id
-                for invalid_sample_id in invalid_sample_ids:
-                    if invalid_sample_id in index_by_sample_id:
-                        del index_by_sample_id[invalid_sample_id]
-
-                print(f'Removed the following samples from the dataset: {invalid_sample_ids}')
-
-        # Write updated indices back to LMDB
-        txn.put("index_by_subject_id".encode(), pickle.dumps(index_by_subject_id))
-        txn.put("index_by_sample_id".encode(), pickle.dumps(index_by_sample_id))
-        print("LMDB dataset updated successfully.")
-
- 
 def parseargs():
     parser = argparse.ArgumentParser(description="MIMIC III Preprocessing Pipeline")
     parser.add_argument('--input_folder', default='./raw_mimic_iii', type=str, help='path to raw dataset')
@@ -373,10 +360,13 @@ def parseargs():
     parser.add_argument('--window_overlap', default=3.0, type=float, help='window overlapping in seconds')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load resp or not')
     parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load resp or not')
-    parser.add_argument('--ema_std', default='False', type=lambda x: bool(strtobool(x)), help='whether to filter input signals with an EMA Z-score or Z-score')
+    parser.add_argument('--ema_std', default='False', type=lambda x: bool(strtobool(x)), help='whether to filter input signals with an EMA Z-score')
+    parser.add_argument('--percentile', default='False', type=lambda x: bool(strtobool(x)), help='whether to normalize the signals with percentile normalization')
+    parser.add_argument('--rescale_to_unit', default='False', type=lambda x: bool(strtobool(x)), help='whether to rescale the input signals to the range [0,1] or not')
     parser.add_argument('--resample', default='False', type=lambda x: bool(strtobool(x)), help='whether to resample the PPG or not')
     parser.add_argument('--target_resample_fs', default=50, type=float, help='target resampling frequency')
     parser.add_argument('--butterworth_filter', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth PPG with the Butterworth Filter or not')
+    parser.add_argument('--fir_bp_filtering', default='False', type=lambda x: bool(strtobool(x)), help='whether to smooth BP with a bandpass FIR filter or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot intermediate preprocessing steps or not')
     

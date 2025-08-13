@@ -345,7 +345,7 @@ class SSLUNet(nn.Module):
             ResidualBlock1D(filters[2], filters[3], stride=2),
             ResidualBlock1D(filters[3], filters[4], stride=2)
         ])
-        self.bottleneck = BottleneckBlock1D(filters[4], stride=1, num_groups=self.num_groups_gn)
+        self.bottleneck = BottleneckBlock1D(filters[4], stride=1)
 
         # --- Shared Decoder Path (U-Net style, leading to `sa_output`) ---
         self.decoder_blocks = nn.ModuleList([
@@ -381,8 +381,8 @@ class SSLUNet(nn.Module):
         # --- NEW SSL HEADS (attached to `sa_output`) ---
         # 1.  Reconstruction Head (for MSR)
         # This head takes the `sa_output` (which is already [Batch, Filters[0], Length])
-        # and directly maps it to [Batch, 2, Length] for PPG/ECG reconstruction.
-        self.reconstruction_head = nn.Conv1d(filters[0], 2, kernel_size=1) # Output 2 channels (PPG, ECG)
+        # and directly maps it to [Batch, self.in_channels, Length] for PPG/ECG reconstruction.
+        self.reconstruction_head = nn.Conv1d(filters[0], self.in_channels, kernel_size=1)
 
         # --- Final Output Layer (for supervised training's direct output) ---
         # This is the original final_conv, which maps to 1 channel (ABP)
@@ -445,14 +445,10 @@ class SSLUNet(nn.Module):
         Shared feature extractor for SSL tasks.
         It runs the full U-Net encoder-decoder-SA path.
         Args:
-            signal (torch.Tensor): Input signal [Batch, Length, 2] (PPG, ECG)
+            signal (torch.Tensor): Input signal [Batch, Length, self.in_channels]
         Returns:
             torch.Tensor: Feature map from last SA block [Batch, filters[0], Length]
         """
-        # Ensure the input to encode is always [Batch, Length, 2]
-        if signal.shape[-1] != 2:
-            raise ValueError(f"Expected signal with 2 modalities for encode, got {signal.shape[-1]}.")
-        
         sa_output, _ = self._run_full_unet_path(signal)
         return sa_output
 

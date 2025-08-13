@@ -72,21 +72,38 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
         early_stopping = None
 
     if not config['ssl']:
-        return supervised_pretraining_training_validation_testing(
-            save_name=save_name,
-            checkpoint_path=checkpoint_path,
-            writer=writer,
-            model_name=model_name,
-            model=model,
-            train_dataloader=train_dataloader,
-            val_dataloader=val_dataloader,
-            test_dataloader=test_dataloader,
-            early_stopping=early_stopping,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            config=config,
-            device=device
+        if config['model_name'] == 'BIOT' and config['pretrained_path'] is not None:
+            return supervised_finetune_with_pretrained_backbone(
+                save_name=save_name,
+                checkpoint_path=checkpoint_path,
+                writer=writer,
+                model_name=model_name,
+                model=model,
+                train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                test_dataloader=test_dataloader,
+                early_stopping=early_stopping,
+                optimizer=optimizer,  # not used; we create our own optimizers inside
+                scheduler=scheduler,  # not used; created per stage below if requested
+                config=config,
+                device=device
             )
+        else:
+            return supervised_pretraining_training_validation_testing(
+                save_name=save_name,
+                checkpoint_path=checkpoint_path,
+                writer=writer,
+                model_name=model_name,
+                model=model,
+                train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                test_dataloader=test_dataloader,
+                early_stopping=early_stopping,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                config=config,
+                device=device
+                )
     else: 
         return self_supervised_pretraining_training_validation_testing(
             save_name=save_name,
@@ -351,6 +368,301 @@ def supervised_pretraining_training_validation_testing(
 
     return all_test_targets, all_test_outputs
 
+
+def supervised_finetune_with_pretrained_backbone(
+    save_name,
+    checkpoint_path,
+    writer,
+    model_name,
+    model,
+    train_dataloader,
+    val_dataloader,
+    test_dataloader,
+    early_stopping,
+    optimizer,            # unused, new optimizers per stage
+    scheduler,            # unused, new schedulers per stage
+    config,
+    device
+):
+    """
+    Two-stage supervised fine-tuning with:
+      - Stage 1: head-only training (backbone frozen)
+      - Stage 2: backbone + head with param-group LRs
+      - Cosine LR schedule per stage with linear warmup
+      - Original trainable mask to avoid unfreezing fixed params (e.g., encoder.index)
+    """
+
+    # ===== Store original trainable mask =====
+    original_trainable = {n: p.requires_grad for n, p in model.named_parameters()}
+
+    def set_requires_grad_safe(module, req, name_prefix=""):
+        """Toggle requires_grad but respect original_trainable mask when unfreezing."""
+        for n, p in module.named_parameters():
+            full_name = f"{name_prefix}.{n}" if name_prefix else n
+            if not req:  # freezing
+                p.requires_grad = False
+            else:        # unfreezing
+                if original_trainable.get(full_name, True):
+                    p.requires_grad = True
+
+    def get_backbone_and_head_params(model):
+        backbone_params, head_params = [], []
+        for name, p in model.named_parameters():
+            if name.startswith("encoder"):
+                backbone_params.append(p)
+            else:
+                head_params.append(p)
+        return backbone_params, head_params
+
+    def linear_warmup(current_epoch, warmup_epochs, base_lr):
+        if current_epoch >= warmup_epochs:
+            return base_lr
+        return base_lr * (0.1 + 0.9 * (current_epoch / warmup_epochs))
+
+    # ===== Common config =====
+    base_lr = config.get('base_lr', 3e-4)
+    backbone_lr_mul = config.get('backbone_lr_multiplier', 0.05)
+    weight_decay = config.get('weight_decay', 1e-2)
+    grad_clip = config.get('grad_clip', 1.0)
+
+    stage1_epochs = config.get('ft_stage1_epochs', 10)
+    stage2_epochs = config.get('ft_stage2_epochs', 50)
+    warmup_stage1 = config.get('warmup_epochs_stage1', 3)
+    warmup_stage2 = config.get('warmup_epochs_stage2', 5)
+
+    best_val = float("+inf")
+
+    # ===== Stage 1: Head-only =====
+    if config.get('freeze_backbone_first', True):
+        if hasattr(model, 'encoder'):
+            set_requires_grad_safe(model.encoder, False, name_prefix="encoder")
+    if hasattr(model, 'channel_proj'):
+        set_requires_grad_safe(model.channel_proj, True, name_prefix="channel_proj")
+    if hasattr(model, 'decoder'):
+        set_requires_grad_safe(model.decoder, True, name_prefix="decoder")
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_stage1 = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=weight_decay)
+    scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=stage1_epochs)
+
+    print(f"=== Stage 1: head-only, {stage1_epochs} epochs, base_lr={base_lr} ===")
+    for epoch in range(stage1_epochs):
+        model.train()
+        # Warmup LR
+        for pg in optimizer_stage1.param_groups:
+            pg['lr'] = linear_warmup(epoch, warmup_stage1, base_lr)
+
+        train_losses = AverageMeter(name='train/loss')
+        for batch_idx, batch in enumerate(train_dataloader):
+            signals, targets = batch
+            signals = signals.to(device)
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            targets = targets.to(device) if config['sig2sig'] else torch.cat(
+                (batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+
+            optimizer_stage1.zero_grad()
+            outputs = model(signals)
+
+            if config['criterion'] == 'MSELoss':
+                loss = F.mse_loss(outputs, targets)
+            elif config['criterion'] == 'SmoothL1Loss':
+                loss = F.smooth_l1_loss(outputs, targets)
+            else:
+                raise ValueError("Invalid criterion")
+
+            loss *= config.get('lambda_supervised', 1.0)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer_stage1.step()
+
+            train_losses.update(loss.item(), signals.size(0))
+            writer.add_scalar('train/stage1_loss', loss.item(), epoch * len(train_dataloader) + batch_idx)
+
+        scheduler_stage1.step()
+
+        # Validation
+        model.eval()
+        val_losses = AverageMeter(name='val/loss')
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_dataloader):
+                signals, targets = batch
+                signals = signals.to(device)
+                if len(signals.shape) == 2:
+                    signals = signals.unsqueeze(-1)
+                targets = targets.to(device) if config['sig2sig'] else torch.cat(
+                    (batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+                outputs = model(signals)
+                vloss = F.mse_loss(outputs, targets) if config['criterion'] == 'MSELoss' else F.smooth_l1_loss(outputs, targets)
+                val_losses.update(vloss.item(), signals.size(0))
+
+        writer.add_scalar('val/stage1_loss_epoch', val_losses.avg, epoch)
+        print(f"[Stage1] Epoch {epoch+1}/{stage1_epochs} - Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
+
+        if val_losses.avg < best_val:
+            save_status(None, epoch, model_name + "_ft_stage1", save_name, model, optimizer_stage1, scheduler_stage1, val_losses, checkpoint_path, config)
+            best_val = val_losses.avg
+
+        if config['es_enable']:
+            early_stopping(val_losses.avg)
+            if early_stopping.early_stop:
+                print("Early stopping Stage 1")
+                break
+
+    # ===== Stage 2: Backbone + Head =====
+    lr_backbone = base_lr * backbone_lr_mul
+    set_requires_grad_safe(model.encoder, True, name_prefix="encoder")
+    set_requires_grad_safe(model.channel_proj, True, name_prefix="channel_proj")
+    set_requires_grad_safe(model.decoder, True, name_prefix="decoder")
+
+    backbone_params, head_params = get_backbone_and_head_params(model)
+    backbone_params = [p for p in backbone_params if p.requires_grad]
+    head_params = [p for p in head_params if p.requires_grad]
+
+    optimizer_stage2 = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': lr_backbone},
+        {'params': head_params, 'lr': base_lr}
+    ], weight_decay=weight_decay)
+    scheduler_stage2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage2, T_max=stage2_epochs)
+
+    print(f"=== Stage 2: fine-tune backbone, {stage2_epochs} epochs, head_lr={base_lr}, backbone_lr={lr_backbone} ===")
+    for epoch in range(stage2_epochs):
+        model.train()
+        # Warmup
+        for i, pg in enumerate(optimizer_stage2.param_groups):
+            target_lr = base_lr if i == 1 else lr_backbone
+            pg['lr'] = linear_warmup(epoch, warmup_stage2, target_lr)
+
+        train_losses = AverageMeter(name='train/loss')
+        for batch_idx, batch in enumerate(train_dataloader):
+            signals, targets = batch
+            signals = signals.to(device)
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            targets = targets.to(device) if config['sig2sig'] else torch.cat(
+                (batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+
+            optimizer_stage2.zero_grad()
+            outputs = model(signals)
+            if config['criterion'] == 'MSELoss':
+                loss = F.mse_loss(outputs, targets)
+            elif config['criterion'] == 'SmoothL1Loss':
+                loss = F.smooth_l1_loss(outputs, targets)
+            else:
+                raise ValueError("Invalid criterion")
+
+            loss *= config.get('lambda_supervised', 1.0)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer_stage2.step()
+
+            train_losses.update(loss.item(), signals.size(0))
+            writer.add_scalar('train/stage2_loss', loss.item(), epoch * len(train_dataloader) + batch_idx)
+
+        scheduler_stage2.step()
+
+        # Validation
+        model.eval()
+        val_losses = AverageMeter(name='val/loss')
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_dataloader):
+                signals, targets = batch
+                signals = signals.to(device)
+                if len(signals.shape) == 2:
+                    signals = signals.unsqueeze(-1)
+                targets = targets.to(device) if config['sig2sig'] else torch.cat(
+                    (batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+                outputs = model(signals)
+                vloss = F.mse_loss(outputs, targets) if config['criterion'] == 'MSELoss' else F.smooth_l1_loss(outputs, targets)
+                val_losses.update(vloss.item(), signals.size(0))
+
+        writer.add_scalar('val/stage2_loss_epoch', val_losses.avg, epoch)
+        print(f"[Stage2] Epoch {epoch+1}/{stage2_epochs} - Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
+
+        if val_losses.avg < best_val:
+            save_status(None, epoch, model_name + "_ft_stage2", save_name, model, optimizer_stage2, scheduler_stage2, val_losses, checkpoint_path, config)
+            best_val = val_losses.avg
+
+        if config['es_enable']:
+            early_stopping(val_losses.avg)
+            if early_stopping.early_stop:
+                print("Early stopping Stage 2")
+                break
+
+    # ===== Final test =====
+    
+    # Meters    
+    test_losses = AverageMeter(name='test/loss')
+    test_sbp_maes = AverageMeter(name='test/sbp_mae')
+    test_dbp_maes = AverageMeter(name='test/dbp_mae')
+    test_sbp_mes = AverageMeter(name='test/sbp_me')
+    test_dbp_mes = AverageMeter(name='test/dbp_me')
+    test_sbp_mae_stds = AverageMeter(name='test/sbp_mae_std')
+    test_dbp_mae_stds = AverageMeter(name='test/dbp_mae_std')
+    test_sbp_me_stds = AverageMeter(name='test/sbp_me_std')
+    test_dbp_me_stds = AverageMeter(name='test/dbp_me_std')
+    
+    # Record outputs and targets
+    if config['sig2sig']:
+        all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+        all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+    else:
+        all_test_outputs = np.empty((0, 2), dtype=float) # Assuming SBP/DBP output shape is 2
+        all_test_targets = np.empty((0, 2), dtype=float)
+        
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_dataloader):
+            
+            signals, targets = batch
+            signals = signals.to(device)
+            
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            
+            targets = targets.to(device) if config['sig2sig'] else torch.cat(
+                (batch[1][0].to(device), batch[1][1].to(device)), dim=-1)
+            
+            outputs = model(signals)
+            # Supervised loss (for metric logging)
+            if config['criterion'] == 'MSELoss':
+                test_loss = F.mse_loss(outputs, targets)
+            elif config['criterion'] == 'SmoothL1Loss':
+                test_loss = F.smooth_l1_loss(outputs, targets)
+            else:
+                raise ValueError("Invalid criterion ...")
+
+            # Record predictions and ground truths
+            all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
+            all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
+
+            # Log metrics
+            metric_values = get_metric_values(test_loss, outputs, targets, config)
+            
+            test_losses.update(metric_values['loss'], signals.size(0))
+            test_sbp_maes.update(metric_values['sbp_mae'], signals.size(0))
+            test_dbp_maes.update(metric_values['dbp_mae'], signals.size(0))
+            test_sbp_mes.update(metric_values['sbp_me'], signals.size(0))
+            test_dbp_mes.update(metric_values['dbp_me'], signals.size(0))
+            test_sbp_mae_stds.update(metric_values['sbp_mae_std'], signals.size(0))
+            test_dbp_mae_stds.update(metric_values['dbp_mae_std'], signals.size(0))
+            test_sbp_me_stds.update(metric_values['sbp_me_std'], signals.size(0))
+            test_dbp_me_stds.update(metric_values['dbp_me_std'], signals.size(0))
+
+
+    # Log test metrics
+    # Note: `epoch` here is the last epoch of training, not ideal for test summary
+    writer.add_scalar('test/loss_final', test_losses.avg, epoch)
+    writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, epoch)
+    writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, epoch)
+    writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, epoch)
+    writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, epoch)
+    writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, epoch)
+    writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, epoch)
+    
+    writer.close()
+
+    return all_test_targets, all_test_outputs
 
 def supcon_loss_old(features, config, labels=None, mask=None):
     r"""
@@ -680,7 +992,8 @@ def self_supervised_pretraining_training_validation_testing(
             input_seq_len_s=config['input_seq_len_s'],
             ecg=config['ecg'],
             resp=config['resp'],
-            sig2sig=config['sig2sig']
+            sig2sig=config['sig2sig'],
+            min_subject_sample_number=config['min_subject_sample_number']
         )
 
     # Get train/val/test samplers and build the dataloaders for linear probing

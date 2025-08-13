@@ -623,11 +623,10 @@ class SSLEUNet(nn.Module):
         Args:
             sa_output_embedding (torch.Tensor): Output from last attention/GRU block [Batch, filters[0], Length]
         Returns:
-            torch.Tensor: Reconstructed signal [Batch, Length, 2] (PPG, ECG)
+            torch.Tensor: Reconstructed signal [Batch, Length, Modalities] 
         """
         reconstructed_signal_conv = self.reconstruction_head(sa_output_embedding)
         return reconstructed_signal_conv.permute(0, 2, 1) # Permute back to [Batch, Length, Modalities]
-    
 
     def forward(self, x):
         """

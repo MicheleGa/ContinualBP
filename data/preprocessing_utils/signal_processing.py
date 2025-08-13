@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, filtfilt, correlate, welch, resample_poly
+from scipy.signal import butter, sosfiltfilt, filtfilt, correlate, welch, resample
 from scipy.interpolate import PchipInterpolator
 import matplotlib.pyplot as plt
 import pywt
@@ -368,30 +368,6 @@ def autocorrelation_filter(ppg_signal, threshold=0.7, verbose=False, plot=False,
         plt.close()
 
     return is_valid
-
-def low_pass_filter(signal, fs=125, cutoff=50, order=4):
-    """
-    Applies a low-pass Butterworth filter to the signal.
-
-    Parameters
-    ----------
-    signal (np.ndarray): 
-        The input signal as a NumPy array.
-    fs (int, optional): 
-        Sampling frequency. Defaults to 125.
-    cutoff (float, optional): 
-        Cutoff frequency of the filter. Defaults to 50.
-    order (int, optional): 
-        Order of the Butterworth filter. Defaults to 4.
-
-    Returns
-    -------
-    np.ndarray: 
-        The filtered signal.
-    """
-    sos = butter(order, cutoff, btype='low', fs=fs, output='sos')
-    filtered_signal = sosfiltfilt(sos, signal)
-    return filtered_signal
     
         
 def wavelet_denoise(signal, type='db8', fs=125, low_cut=0.5, high_cut=50, ecg=False, plot=False, title='DWT', savepath='./figs'):
@@ -503,15 +479,12 @@ def resample_signal(signal, original_fs, target_fs, plot=False, title='Resample'
     resampled_signal : numpy.ndarray
         Resampled signal.
     """
+    
+    # Calculate the number of samples for the resampled signal
+    num_samples = int(len(signal) * (target_fs / original_fs))
 
-    up = target_fs
-    down = original_fs
-
-    gcd = np.gcd(int(up), int(down))
-    up = int(up / gcd)
-    down = int(down / gcd)
-
-    resampled_signal = resample_poly(signal, up=up, down=down)
+    # Resample the signal using the Fourier method
+    resampled_signal = resample(signal, num=num_samples)
 
     if plot:
         # Plotting for debugging
@@ -530,6 +503,9 @@ def resample_signal(signal, original_fs, target_fs, plot=False, title='Resample'
         plt.legend()
         plt.xlabel('Time (seconds)')
         plt.tight_layout()
+        
+        # Ensure the savepath directory exists
+        os.makedirs(savepath, exist_ok=True)
         plt.savefig(os.path.join(savepath, f'{title}_original_vs_resampled.jpg'))
         plt.close()
 
@@ -593,18 +569,36 @@ def scalogram(signal, fs, high_freq, low_freq, num_scales, wavelet='cmor1.0-1.0'
 
 def butterworth_filtering(signal, fs=125, level=4, low_freq=0.5, high_freq=8, plot=False, title='Butterworth', savepath='./figs'):
     r"""
-    Denoises a PPG signal using a 4-th order bandpass butterworth filter as in https://bmcmedinformdecismak.biomedcentral.com/counter/pdf/10.1186/s12911-023-02215-2.pdf.
+    Denoises a signal using a 4-th order bandpass butterworth filter.
+    Sources for the frequency lower/upper cutoff points:
+        1 - https://pmc.ncbi.nlm.nih.gov/articles/PMC5844675/
+        2 - https://pmc.ncbi.nlm.nih.gov/articles/PMC5651164/
+        3 - https://biomedical-engineering-online.biomedcentral.com/articles/10.1186/1475-925X-8-13
+        4 - https://www.nature.com/articles/sdata201876
+        5 - https://dl.acm.org/doi/10.5555/3578948.3578955
 
     Parameters
     ------------
-    
-    signal (torch.Tensor): 
-        Input PPG signal of shape (sequence_length,).
-
+    signal (numpy.array): 
+        Input signal of shape (sequence_length,).
+    fs (int, optional): 
+        Sampling frequency in Hz. Default is 125.
+    level (int, optional): 
+        Order of the Butterworth filter. Default is 4.
+    low_freq (float, optional): 
+        Lower cutoff frequency in Hz. Default is 0.5.
+    high_freq (float, optional): 
+        Upper cutoff frequency in Hz. Default is 8.
+    plot (bool, optional): 
+        If True, plots the original and denoised signals. Default is False.
+    title (str, optional): 
+        Title prefix for saved plots. Default is 'Butterworth'.
+    savepath (str, optional):       
+        Directory path to save plots. Default is './figs'.
+        
     Returns
     ------------
-    
-    torch.Tensor: Denoised PPG signal of the same shape as the input.
+    numpy.array: Denoised PPG signal of the same shape as the input.
     """
 
     sequence_length = len(signal)
@@ -621,17 +615,100 @@ def butterworth_filtering(signal, fs=125, level=4, low_freq=0.5, high_freq=8, pl
 
         plt.figure(figsize=(12, 8))
         plt.subplot(2, 1, 1)
-        plt.plot(time, signal, label='Noisy PPG')
+        plt.plot(time, signal, label='Noisy Signal')
         plt.title('Noisy Signal')
         plt.legend()
 
         plt.subplot(2, 1, 2)
-        plt.plot(time, denoised_signal, label='Denoised PPG', color='orange')
+        plt.plot(time, denoised_signal, label='Denoised Signal', color='orange')
         plt.title('Denoised Signal')
         plt.legend()
         plt.xlabel('Time (seconds)')
         plt.tight_layout()
         plt.savefig(os.path.join(savepath, f'{title}_noisy_vs_denoised.jpg'))
+        plt.close()
+        
+    return denoised_signal
+
+
+def high_freq_butterworth(signal, fs=125, order=4, cutoff_freq=35.0, plot=False, title='Signal_LP', savepath='./figs'):
+    r"""
+    Removes high-frequency noise components above 35 Hz from a signal using a 4th-order
+    Butterworth low-pass filter.
+
+    This function is designed to specifically target and attenuate noise (e.g., industrial
+    frequency interference, muscle artifacts) that typically occurs at frequencies
+    significantly higher than the physiologically relevant components of signals
+    like blood pressure or PPG.
+
+    Parameters
+    ----------
+    signal (np.ndarray): 
+        Input signal of shape (sequence_length,).
+    fs (int, optional): 
+        Sampling frequency in Hz. Default is 125.
+    order (int, optional): 
+        Order of the Butterworth filter. Default is 4.
+    cutoff_freq (float, optional): 
+        The cutoff frequency for the low-pass filter in Hz. Frequencies above this
+        will be attenuated. Default is 35.0 Hz. This parameter is fixed here to 35.0 Hz
+        to meet the specific requirement.
+    plot (bool, optional): 
+        If True, plots the original and denoised signals. Default is False.
+    title (str, optional): 
+        Title prefix for saved plots. Default is 'Signal_LP_35Hz'.
+    savepath (str, optional):       
+        Directory path to save plots. Default is './figs'.
+        
+    Returns
+    ------------
+    np.ndarray: Denoised signal with high-frequency noise above 35 Hz removed.
+    """
+    signal = np.array(signal) # Ensure signal is a NumPy array
+    
+    sequence_length = len(signal)
+    
+    # Normalize cutoff frequency to Nyquist frequency (fs/2)
+    nyquist = fs / 2
+    
+    # Validate cutoff frequency
+    if not (0 < cutoff_freq <= nyquist):
+        raise ValueError(f"Cutoff frequency ({cutoff_freq} Hz) must be greater than 0 and less than or equal to Nyquist frequency ({nyquist} Hz).")
+    
+    # If you normnalize here you do not pass the argument fs in the butter function
+    normalized_cutoff = cutoff_freq / nyquist
+    
+    # Design the Butterworth low-pass filter
+    # btype='low' specifies a low-pass filter
+    # output='sos' (second-order sections) is used for numerical stability
+    sos = butter(order, normalized_cutoff, btype='low', analog=False, output='sos')
+    
+    # Apply the filter using filtfilt for zero-phase filtering
+    denoised_signal = sosfiltfilt(sos, signal)
+
+    if plot:
+        # Ensure savepath exists
+        if not os.path.exists(savepath):
+            os.makedirs(savepath)
+            
+        # Plotting for visualization
+        time = np.linspace(0, sequence_length / fs, sequence_length) 
+
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 1, 1)
+        plt.plot(time, signal, label='Original Signal (with high-freq noise)')
+        plt.title('Original Signal')
+        plt.ylabel('Amplitude')
+        plt.legend()
+
+        plt.subplot(2, 1, 2)
+        plt.plot(time, denoised_signal, label=f'Low-Pass Filtered Signal (<{cutoff_freq} Hz)', color='green')
+        plt.title(f'Denoised Signal (Noise Above {cutoff_freq} Hz Removed)')
+        plt.ylabel('Amplitude')
+        plt.legend()
+        plt.xlabel('Time (seconds)')
+        plt.tight_layout()
+        plt.savefig(os.path.join(savepath, f'{title}_original_vs_lowpass.jpg'))
         plt.close()
         
     return denoised_signal
@@ -727,6 +804,57 @@ def skewness_check(window_sig, fs=125, window_s=8, subsegment_s=1):
         skewness_subsegments.append(skewness)
     
     return True if all(s >= 0.0 for s in skewness_subsegments) else False
+
+
+def rescale_to_unit(signal, plot=False, title='Rescaled [0,1]', savepath='./figs'):
+    r"""
+    Rescales a signal to the range [0, 1].
+
+    Parameters
+    ------------
+    signal (np.ndarray): 
+        The input signal as a NumPy array.
+    plot (bool, optional): 
+        If True, plots the original and rescaled signals. Defaults to False.
+    title (str, optional): 
+        Title of the plot. Defaults to 'Rescaled [0,1]'.
+    savepath (str, optional): 
+        Path to save the plot. Defaults to './figs'.
+
+    Returns
+    ------------
+    np.ndarray: 
+        The rescaled signal. Returns the original signal if the 
+        range is zero (to avoid division by zero).
+    """
+
+    min_val = np.min(signal)
+    max_val = np.max(signal)
+    range_val = max_val - min_val + np.finfo(np.float32).eps  # Prevent division by zero
+
+    rescaled_signal = (signal - min_val) / range_val
+
+    if plot:
+        import matplotlib.pyplot as plt
+        import os
+        
+        plt.figure(figsize=(12, 6))
+        plt.subplot(2, 1, 1)
+        plt.plot(signal, label='Original Signal')
+        plt.title('Original Signal')
+        plt.legend()
+
+        plt.subplot(2, 1, 2)
+        plt.plot(rescaled_signal, label='Rescaled Signal [0,1]', color='green')
+        plt.title('Rescaled Signal [0,1]')
+        plt.legend()
+        
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(savepath, f'{title}.jpg'))
+        plt.close()
+
+    return rescaled_signal
 
 
 def standardize(signal, plot=False, title='Z-Score', savepath='./figs'):
@@ -828,6 +956,62 @@ def ema_normalization(signal, alpha=0.00796, plot=False, title='EMA Normalizatio
         plt.close()
 
     return norm_signal
+
+
+def percentile_normalize(signal, percentile=95, plot=False, title='Percentile Normalized', savepath='./figs'):
+    r"""
+    Normalizes a signal by dividing it by the specified percentile of its 
+    absolute amplitude. This scaling is robust to outliers and maintains
+    relative waveform shapes.
+
+    Parameters
+    ------------
+    signal (np.ndarray): 
+        The input signal as a NumPy array.
+    percentile (float, optional): 
+        The percentile of the absolute amplitude used for normalization. 
+        Defaults to 95.
+    plot (bool, optional): 
+        If True, plots the original and normalized signals. Defaults to False.
+    title (str, optional): 
+        Title of the plot. Defaults to 'Percentile Normalized'.
+    savepath (str, optional): 
+        Path to save the plot. Defaults to './figs'.
+
+    Returns
+    ------------
+    np.ndarray: 
+        The normalized signal. If the computed percentile is zero, returns the 
+        original signal (to avoid division by zero).
+    """
+
+    scale_val = np.percentile(np.abs(signal), percentile)
+    scale_val = scale_val + np.finfo(np.float32).eps  # Prevent division by zero
+
+    normalized_signal = signal / scale_val
+
+    if plot:
+        import matplotlib.pyplot as plt
+        import os
+        
+        plt.figure(figsize=(12, 6))
+        plt.subplot(2, 1, 1)
+        plt.plot(signal, label='Original Signal')
+        plt.title('Original Signal')
+        plt.legend()
+
+        plt.subplot(2, 1, 2)
+        plt.plot(normalized_signal, label=f'Normalized by {percentile}th Percentile', color='green')
+        plt.title(f'Percentile Normalized Signal ({percentile}th)')
+        plt.legend()
+        
+        plt.tight_layout()
+        
+        os.makedirs(savepath, exist_ok=True)
+        plt.savefig(os.path.join(savepath, f'{title}.jpg'))
+        plt.close()
+
+    return normalized_signal
 
 
 def average_smoothing(signal, window_size=3, plot=False, title='AVGSmoothing', savepath='./figs'):
