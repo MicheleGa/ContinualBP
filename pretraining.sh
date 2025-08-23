@@ -1,15 +1,15 @@
 # Pretraining
 
-## Supervised Pretrained BIOT
-experiment_name="pretrained_biot"
+# Meta-learning Setup
+## Reptile BIOT
+experiment_name="biot_reptile"
 mkdir "logs/$experiment_name"
 cd ./models
 python BIOT.py \
     --ecg True \
     --sig2sig True \
-    --fs 200 \
+    --fs 125 \
     --input_seq_len_s 10 \
-    --pretrained_path ../checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python pretraining.py \
@@ -18,17 +18,46 @@ python pretraining.py \
     --expname "$experiment_name" \
     --loader_worker 4 \
     --sig2sig True \
-    --fs 200 \
+    --fs 125 \
     --input_seq_len_s 10 \
     --ecg True \
     --batch_size 128 \
-    --mix_pretraining_subject_samples True \
-    --pretrained_path ./checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt \
+    --mix_pretraining_subject_samples False \
+    --meta_learning True \
+    --meta_log_step 1 \
+    --max_training_epochs 2 \
     --criterion "SmoothL1Loss" \
-    --eval_every_n_epochs 1 \
-    --lambda_supervised 1 \
     > "./logs/$experiment_name/${experiment_name}_training.log"
 
+
+## Supervised Pretrained BIOT
+#experiment_name="pretrained_biot"
+#mkdir "logs/$experiment_name"
+#cd ./models
+#python BIOT.py \
+#    --ecg True \
+#    --sig2sig True \
+#    --fs 200 \
+#    --input_seq_len_s 10 \
+#    --pretrained_path ../checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt
+#    > "../logs/$experiment_name/${experiment_name}_summary.log"
+#cd ..
+#python pretraining.py \
+#    --model models.BIOT \
+#    --dataset_name mimic_iii_biot \
+#    --expname "$experiment_name" \
+#    --loader_worker 4 \
+#    --sig2sig True \
+#    --fs 200 \
+#    --input_seq_len_s 10 \
+#    --ecg True \
+#    --batch_size 128 \
+#    --mix_pretraining_subject_samples True \
+#    --pretrained_path ./checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt \
+#    --criterion "SmoothL1Loss" \
+#    --eval_every_n_epochs 1 \
+#    --lambda_supervised 1 \
+#    > "./logs/$experiment_name/${experiment_name}_training.log"
 
 ### Supervised Efficient UNet
 #experiment_name="efficient_unet_test"

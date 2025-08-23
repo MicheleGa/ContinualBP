@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from data.dataset import PhysioDataset
 from data.dataset_ssl import PhysioDatasetSSL
+from data.meta_dataloaders import build_meta_splits_and_loaders
 from models.trainer import pretraining_training_validation_testing
 from training_utils.helpers import fixseed, generate_runname, parseargs
 from training_utils.metrics import call_metric
@@ -36,12 +37,15 @@ def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_pat
     """
     
     # Get train/val/test samplers and build the dataloaders
-    (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
-    
-    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
-    valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
-    test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
-    
+    if not config['meta_learning']:
+        (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
+        
+        train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
+        valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+        test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+    else:
+        _, train_dataloader, valid_dataloader, test_dataloader, _ = dataset
+
     all_targets, all_outputs = pretraining_training_validation_testing(
         save_name=save_name,
         checkpoint_path=checkpoint_path,
@@ -116,18 +120,33 @@ if __name__ == "__main__":
     
     if not config['ssl']:
         # Load data and annotation
-        dataset = PhysioDataset(
-            seed=config['seed'],
-            lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-            pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-            mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
-            fs=config['fs'],
-            input_seq_len_s=config['input_seq_len_s'],
-            ecg=config['ecg'],
-            resp=config['resp'],
-            sig2sig=config['sig2sig'],
-            min_subject_sample_number=config['min_subject_sample_number']
-        )
+        if not config['meta_learning']:
+            dataset = PhysioDataset(
+                seed=config['seed'],
+                lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+                pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+                mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
+                fs=config['fs'],
+                input_seq_len_s=config['input_seq_len_s'],
+                ecg=config['ecg'],
+                resp=config['resp'],
+                sig2sig=config['sig2sig'],
+                min_subject_sample_number=config['min_subject_sample_number']
+            )
+        else:
+            dataset = build_meta_splits_and_loaders(
+                lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+                seed=config['seed'],
+                fs=config['fs'],
+                input_seq_len_s=config['input_seq_len_s'],
+                ecg=config['ecg'],
+                resp=config['resp'],
+                sig2sig=config['sig2sig'],
+                pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+                mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects
+                k_support=config['k_support'],
+                k_query=config['k_query']
+            )
     else:
         # Load data
         dataset = PhysioDatasetSSL(

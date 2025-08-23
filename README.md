@@ -187,7 +187,7 @@ source ./venv/bin/activate
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 pip install numpy==1.24.3 matplotlib==3.9.2 scikit-learn==1.6.1 seaborn==0.13.2 pandas==1.5.3 markdown==3.4.1 tensorboard==2.17.0
 pip install netron==8.1.5 thop torchinfo==1.8.0 pyCompare lmdb pyampd wfdb==4.0.0 
-pip install PyWavelets==1.5.0 EMD-signal==1.6.4 lightning einops linear_attention_transformer
+pip install PyWavelets==1.5.0 EMD-signal==1.6.4 lightning einops linear_attention_transformer mat73
 ```
 
 ## Data Provisioning & Preprocessing
@@ -206,6 +206,11 @@ unzip ecg.zip -d ecg
 unzip ppg.zip -d ppg
 unzip resp.zip -d resp
 ```
+
+### Provisioning ~ MIMIC III from PulseDB
+
+The code in this repository explain how to downlaod the already preprocessed MIMIC III from the [PulseDB](https://www.frontiersin.org/journals/digital-health/articles/10.3389/fdgth.2022.1090854/full) publication: [GitHub](https://github.com/pulselabteam/PulseDB/tree/main).
+Additionally, after unzipping, the _.mat_ files directory have been renamed to *mimic_iii*.
 
 ### Preprocessing
 

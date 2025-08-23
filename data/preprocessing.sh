@@ -1,7 +1,7 @@
 # MIMIC III Preprocessing
-#python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 10 --sig2sig True --ecg True --window_length 10 --window_overlap 5 --percentile True --resample True --target_resample_fs 200 > ./data_logs/mimic_iii_biot_preprocessing.log
-#python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 1 --sig2sig True --ecg True --window_length 10 --window_overlap 5 --percentile True --resample True --target_resample_fs 200 --plot True
-python dataset.py --name mimic_iii_biot --fs 200 --input_seq_len_s 10 --ecg True --sig2sig True --plot True
+python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 10 --sig2sig True --ecg True --fs 125 --window_length 10 --window_overlap 5 --percentile True > ./data_logs/mimic_iii_biot_preprocessing.log
+python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 1 --sig2sig True --ecg True --fs 125 --window_length 10 --window_overlap 5 --percentile True --plot True
+python dataset.py --name mimic_iii_biot --fs 125 --input_seq_len_s 10 --ecg True --sig2sig True --plot True
 
 
 #python mimic_iii_xl_preprocessing.py --name mimic_iii_xl_filtered --num_threads 1 --sig2sig True --rescale_to_unit True --window_length 10 --window_overlap 5 --butterworth_filter True --fir_bp_filtering True --plot True
