@@ -90,24 +90,50 @@ def parseargs():
     # Meta-learning Setup
     parser.add_argument('--meta_learning', default='False', type=lambda x: bool(strtobool(x)), help='whether to do meta-learning or not')
     parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
-    parser.add_argument('--inner_steps', default=10, type=int, help='number of inner steps for meta-learning')
+    parser.add_argument('--inner_steps', default=12, type=int, help='number of inner steps for meta-learning (increased for ANIL)')
     parser.add_argument('--lr_inner', default=1e-2, type=float, help='inner learning rate for meta-learning')
     parser.add_argument('--meta_val_tasks', default=100, type=int, help='number of tasks for meta-validation')
     parser.add_argument('--meta_test_tasks', default=200, type=int, help='number of tasks for meta-validation')
-    parser.add_argument('--meta_log_step', default=10, type=int, help='how often to log meta-learning metrics')
+    parser.add_argument('--meta_log_step', default=50, type=int, help='how often to log meta-learning metrics (reduced for better monitoring)')
     parser.add_argument('--k_support', type=int, default=10, help='number of support samples in meta-learning')
     parser.add_argument('--k_query', type=int, default=10, help='number of query samples in meta-learning')
+
+    # Enhanced scheduling options
     parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'step', 'exponential'], help='meta-learning learning rate schedule type')
     parser.add_argument('--meta_lr_decay', default=0.95, type=float, help='meta-learning learning rate decay factor for exponential schedule')
     parser.add_argument('--meta_lr_steps', default=[50, 100, 150], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
     parser.add_argument('--meta_lr_gamma', default=0.5, type=float, help='meta-learning learning rate gamma for step decay')    
-    parser.add_argument('--inner_lr_schedule', default='adaptive', type=str, choices=['constant', 'cosine', 'adaptive'], help='inner learning rate schedule type')
-    parser.add_argument('--inner_lr_min', default=1e-4, type=float, help='minimum inner learning rate for adaptive schedule')
-    parser.add_argument('--inner_steps_schedule', default='adaptive', type=str, choices=['constant', 'increasing', 'adaptive'], help='inner steps schedule type')
-    parser.add_argument('--inner_steps_max', default=10, type=int, help='maximum inner steps for adaptive schedule')
+    parser.add_argument('--inner_lr_schedule', default='constant', type=str, choices=['constant', 'cosine', 'adaptive'], help='inner learning rate schedule type (simplified for ANIL)')
+    parser.add_argument('--inner_lr_min', default=5e-3, type=float, help='minimum inner learning rate (increased for ANIL stability)')
+    parser.add_argument('--inner_steps_schedule', default='constant', type=str, choices=['constant', 'increasing', 'adaptive'], help='inner steps schedule type (simplified for ANIL)')
+    parser.add_argument('--inner_steps_max', default=20, type=int, help='maximum inner steps for adaptive schedule')
     parser.add_argument('--adaptive_patience', default=10, type=int, help='patience for adaptive inner steps')
     parser.add_argument('--adaptive_factor', default=0.8, type=float, help='factor for adaptive inner steps')
     parser.add_argument('--first_order_reptile', default=False, type=lambda x: bool(strtobool(x)), help='use first-order approximation for Reptile (faster)')
+
+    # === NEW ANIL-SPECIFIC PARAMETERS ===
+    # Core ANIL settings
+    parser.add_argument('--anil_head_only', default=True, type=lambda x: bool(strtobool(x)), help='ANIL: adapt only head parameters in inner loop')
+
+    # Parameter identification tokens (BIOT-specific defaults)
+    parser.add_argument('--head_name_tokens', default=['decoder.1', 'regressor', 'head', 'fc', 'out'], type=str, nargs='+', 
+                    help='tokens to identify head parameters in BIOT model')
+    parser.add_argument('--last_block_tokens', default=['decoder.0', 'encoder.2', 'layer4', 'block4', 'stage4'], type=str, nargs='+',
+                    help='tokens to identify last block parameters in BIOT model')
+
+    # Per-parameter learning rate multipliers
+    parser.add_argument('--inner_head_lr_mult', default=3.0, type=float, help='learning rate multiplier for head parameters in inner loop')
+    parser.add_argument('--inner_last_block_lr_mult', default=0.5, type=float, help='learning rate multiplier for last block parameters')
+    parser.add_argument('--inner_backbone_lr_mult', default=0.1, type=float, help='learning rate multiplier for backbone parameters')
+
+    # Stability and debugging
+    parser.add_argument('--grad_clip_inner', default=1.0, type=float, help='gradient clipping norm for inner loop (0 to disable)')
+    parser.add_argument('--verbose_param_matching', default=False, type=lambda x: bool(strtobool(x)), help='print parameter group assignments')
+    parser.add_argument('--log_gradient_norms', default=False, type=lambda x: bool(strtobool(x)), help='log gradient norms to tensorboard')
+    parser.add_argument('--log_parameter_groups', default=False, type=lambda x: bool(strtobool(x)), help='log parameter group statistics')
+
+    # Pretrained model loading (useful for staged training)
+    parser.add_argument('--pretrained_scope', default='all', type=str, choices=['all', 'backbone', 'encoder'], help='scope of pretrained weights to load')
     
     # Fine-tuning with pretrained backbone Setup
     parser.add_argument('--pretrained_path', default=None, type=str)

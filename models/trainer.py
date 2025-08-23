@@ -857,28 +857,28 @@ def reptile_meta_training(
     """
     
     # Hyperparams / defaults
-    meta_epochs = config.get('max_training_epochs', 100)
-    base_meta_lr = config.get('meta_lr', 1e-3)
-    base_inner_steps = config.get('inner_steps', 5)
-    base_lr_inner = config.get('lr_inner', 1e-2)
-    meta_val_tasks = config.get('meta_val_tasks', 100)
+    meta_epochs = config.get('max_training_epochs')
+    base_meta_lr = config.get('meta_lr')
+    base_inner_steps = config.get('inner_steps')
+    base_lr_inner = config.get('lr_inner')
+    meta_val_tasks = config.get('meta_val_tasks')
     
     # Enhanced scheduling parameters
-    meta_lr_schedule = config.get('meta_lr_schedule', 'constant')  # 'constant', 'cosine', 'step', 'exponential'
-    inner_lr_schedule = config.get('inner_lr_schedule', 'constant')  # 'constant', 'cosine', 'adaptive'
-    inner_steps_schedule = config.get('inner_steps_schedule', 'constant')  # 'constant', 'increasing', 'adaptive'
+    meta_lr_schedule = config.get('meta_lr_schedule')  # 'constant', 'cosine', 'step', 'exponential'
+    inner_lr_schedule = config.get('inner_lr_schedule')  # 'constant', 'cosine', 'adaptive'
+    inner_steps_schedule = config.get('inner_steps_schedule')  # 'constant', 'increasing', 'adaptive'
     
     # Schedule-specific parameters
-    meta_lr_decay = config.get('meta_lr_decay', 0.95)  # for exponential decay
-    meta_lr_steps = config.get('meta_lr_steps', [50, 100, 150])  # for step decay
-    meta_lr_gamma = config.get('meta_lr_gamma', 0.5)  # step decay factor
+    meta_lr_decay = config.get('meta_lr_decay')  # for exponential decay
+    meta_lr_steps = config.get('meta_lr_steps')  # for step decay
+    meta_lr_gamma = config.get('meta_lr_gamma')  # step decay factor
     
-    inner_lr_min = config.get('inner_lr_min', 1e-4)
-    inner_steps_max = config.get('inner_steps_max', 10)
+    inner_lr_min = config.get('inner_lr_min')
+    inner_steps_max = config.get('inner_steps_max')
     
     # Adaptive scheduling parameters
-    patience_adaptive = config.get('adaptive_patience', 10)
-    adaptive_factor = config.get('adaptive_factor', 0.8)
+    patience_adaptive = config.get('adaptive_patience')
+    adaptive_factor = config.get('adaptive_factor')
     val_loss_history = []
     no_improvement_count = 0
 
@@ -948,27 +948,18 @@ def reptile_meta_training(
         else:
             model_state = ckpt
         
-        scope = config.get('pretrained_scope', 'all')
-        if scope == 'all':
-            model.load_state_dict(model_state, strict=False)
-            print(f"[Reptile] Loaded pretrained weights (all) from {config['pretrained_path']}")
-        elif scope == 'backbone':
-            cur_state = model.state_dict()
-            filtered = {k: v for k, v in model_state.items() if k in cur_state and k.startswith('encoder')}
-            cur_state.update(filtered)
-            model.load_state_dict(cur_state)
-            print(f"[Reptile] Loaded pretrained BACKBONE weights from {config['pretrained_path']}")
-        else:
-            model.load_state_dict(model_state, strict=False)
-            print(f"[Reptile] Loaded pretrained weights (fallback) from {config['pretrained_path']}")
+        scope = config.get('pretrained_scope')
+        
+        model.load_state_dict(model_state, strict=False)
+        print(f"[Reptile] Loaded pretrained weights (all) from {config['pretrained_path']}")
 
     model = model.to(device)
     
     # Keep meta-params as an explicit dict
-    meta_params = {k: v.clone().detach().to(device) for k, v in model.state_dict().items()}
+    meta_params = {n: p.detach().clone().to(device) for n, p in model.named_parameters()}
     
     # Initialize first-order approximation option (faster Reptile variant)
-    use_first_order = config.get('first_order_reptile', False)
+    use_first_order = config.get('first_order_reptile')
     
     best_val = float("+inf")
     
@@ -977,6 +968,53 @@ def reptile_meta_training(
     print(f"  - Inner LR schedule: {inner_lr_schedule}")
     print(f"  - Inner steps schedule: {inner_steps_schedule}")
     print(f"  - First-order approximation: {use_first_order}")
+    
+    # === Inner optimizer builder with per-parameter LRs and optional ANIL ===
+    def build_inner_optimizer(adapted_model, base_lr, cfg):
+        
+        anil = cfg.get('anil_head_only', False)
+        head_tokens = set(cfg.get('head_name_tokens'))
+        last_tokens = set(cfg.get('last_block_tokens'))
+        
+        # First pass: identify which parameters to optimize
+        params_to_optimize = []
+        for name, p in adapted_model.named_parameters():
+            if not p.requires_grad:
+                continue
+                
+            # For ANIL, only include head parameters
+            if anil:
+                if any(tok in name for tok in head_tokens):
+                    params_to_optimize.append((name, p))
+                else:
+                    # Freeze non-head parameters for ANIL
+                    p.requires_grad = False
+            else:
+                # Regular Reptile: include all trainable parameters
+                params_to_optimize.append((name, p))
+        
+        # Second pass: create parameter groups with different learning rates
+        groups = []
+        for name, p in params_to_optimize:
+            if any(tok in name for tok in head_tokens):
+                mult = cfg.get('inner_head_lr_mult')
+            elif any(tok in name for tok in last_tokens):
+                mult = cfg.get('inner_last_block_lr_mult')
+            else:
+                mult = cfg.get('inner_backbone_lr_mult', cfg.get('backbone_lr_multiplier'))
+            
+            groups.append({'params': [p], 'lr': base_lr * float(mult)})
+        
+        # Fallback: if no groups created, use all trainable parameters
+        if not groups:
+            all_params = [p for p in adapted_model.parameters() if p.requires_grad]
+            if all_params:
+                groups = [{'params': all_params, 'lr': base_lr}]
+            else:
+                raise RuntimeError("No trainable parameters found for inner optimization!")
+        
+        return torch.optim.SGD(groups, momentum=0.0)
+
 
     # Outer loop: epochs
     for epoch in range(meta_epochs):
@@ -1033,7 +1071,7 @@ def reptile_meta_training(
                 adapted.train()
                 
                 # Inner optimizer with current learning rate
-                inner_opt = torch.optim.SGD(adapted.parameters(), lr=current_inner_lr)
+                inner_opt = build_inner_optimizer(adapted, current_inner_lr, config)
 
                 # Inner loop: adapt to support with current number of steps
                 support_losses = []
@@ -1069,9 +1107,8 @@ def reptile_meta_training(
                 epoch_support_loss_meter.update(np.mean(support_losses), 1)
 
                 # Collect adapted parameters and compute delta
-                adapted_state = adapted.state_dict()
-                for k in meta_params:
-                    acc_deltas[k] += (adapted_state[k].detach().to(device) - meta_params[k])
+                for n, p in adapted.named_parameters():
+                    acc_deltas[n] += (p.detach() - meta_params[n])
 
                 # Free memory
                 del adapted
@@ -1083,10 +1120,12 @@ def reptile_meta_training(
                 meta_params[k] = meta_params[k] + current_meta_lr * avg_delta
 
             # Load updated meta params back into model
-            model.load_state_dict({k: meta_params[k].clone().detach() for k in meta_params})
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    p.copy_(meta_params[n])
 
             # Logging per-step
-            if (batch_idx + 1) % config.get('meta_log_step', 100) == 0:
+            if (batch_idx + 1) % config.get('meta_log_step') == 0:
                 avg_q = float(np.mean(task_query_losses))
                 avg_s = float(np.mean(task_support_losses))
                 step_idx = epoch * len(train_dataloader) + batch_idx
@@ -1143,7 +1182,7 @@ def reptile_meta_training(
     all_test_targets, all_test_outputs = evaluate_meta_with_bp_metrics(
         model, test_dataloader, device, config, 
         base_inner_steps, base_lr_inner,  # Use base values for final test
-        n_tasks_eval=config.get('meta_test_tasks', 200), 
+        n_tasks_eval=config.get('meta_test_tasks'), 
         test=True, writer=writer
     )
     
