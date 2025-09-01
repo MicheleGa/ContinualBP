@@ -18,7 +18,7 @@ def _stack_batch(batch):
     """
     xs = [b[0] for b in batch]
     ys = [b[1] for b in batch]
-
+    
     # Handle input X
     # If PhysioDataset gives (T, C), permute -> (C, T)
     x_tensors = []
@@ -28,23 +28,16 @@ def _stack_batch(batch):
             x = x.permute(1, 0)                  # -> (C, T)
         x_tensors.append(x)
     X = torch.stack(x_tensors, dim=0)  # (B, C, T)
-
-    # Handle output Y
-    if isinstance(ys[0], list):
-        # SBP/DBP regression (sig2sig=False)
-        sbp = torch.stack([torch.as_tensor(y[0], dtype=torch.float32).view(-1, 1) for y in ys], dim=0)
-        dbp = torch.stack([torch.as_tensor(y[1], dtype=torch.float32).view(-1, 1) for y in ys], dim=0)
-        return X, [sbp, dbp]
-    else:
-        # Waveform regression (sig2sig=True)
-        y_tensors = []
-        for y in ys:
-            y = torch.as_tensor(y, dtype=torch.float32)
-            if y.ndim == 2 and y.shape[0] == 1:  # (1, T)
-                y = y.squeeze(0)                 # -> (T,)
-            y_tensors.append(y)
-        Y = torch.stack(y_tensors, dim=0)       # (B, T)
-        return X, Y
+    
+    y_tensors = []
+    for y in ys:
+        y = torch.as_tensor(y, dtype=torch.float32)
+        if y.ndim == 2 and y.shape[0] == 1:  # (1, T)
+            y = y.squeeze(0)                 # -> (T,)
+        y_tensors.append(y)
+    Y = torch.stack(y_tensors, dim=0)       # (B, T)
+   
+    return X, Y
 
 
 class MetaTaskDataset(Dataset):
@@ -105,7 +98,7 @@ class MetaTaskDataset(Dataset):
         # Pull (x,y) using the base dataset's __getitem__(sample_id)
         support_batch = [self.ds[s_id] for s_id in support_ids]
         query_batch   = [self.ds[q_id] for q_id in query_ids]
-
+        
         Xs, Ys = _stack_batch(support_batch)
         Xq, Yq = _stack_batch(query_batch)
         
@@ -117,9 +110,9 @@ def build_meta_splits_and_loaders(
     seed: int = 42,
     fs: int = 125,
     input_seq_len_s: int = 10,
-    ecg: bool = True,
-    resp: bool = False,
-    sig2sig: bool = True,
+    ecg: bool = False,
+    sig2sig: bool = False,
+    bp_pattern = False, 
     pretraining_split_ratio=(0.7, 0.1, 0.2),
     mix_pretraining_subject_samples: bool = False,
     min_subject_sample_number: int = 0,
@@ -127,6 +120,7 @@ def build_meta_splits_and_loaders(
     # meta/task params
     k_support: int = 8,
     k_query: int = 8,
+    meta_batch_size: int = 16,
     tasks_per_epoch_train: Optional[int] = None,
     tasks_per_epoch_val: Optional[int] = None,
     tasks_per_epoch_test: Optional[int] = None,
@@ -145,8 +139,8 @@ def build_meta_splits_and_loaders(
         fs=fs,
         input_seq_len_s=input_seq_len_s,
         ecg=ecg,
-        resp=resp,
         sig2sig=sig2sig,
+        bp_pattern=bp_pattern,
         min_subject_sample_number=min_subject_sample_number,
         plot=False,
         savepath="./figs",
@@ -181,7 +175,7 @@ def build_meta_splits_and_loaders(
         k_support=k_support,
         k_query=k_query,
         allow_replacement=False,
-        seed=seed + 1,
+        seed=seed,
     )
     meta_test_ds = MetaTaskDataset(
         base_dataset=base_ds,
@@ -189,12 +183,12 @@ def build_meta_splits_and_loaders(
         k_support=k_support,
         k_query=k_query,
         allow_replacement=False,
-        seed=seed + 2,
+        seed=seed,
     )
 
     # 4) DataLoaders: each batch = 1 task (support, query, pid).
     #    Set batch_size=1; number of tasks per epoch = len(dataset) by default (one per patient).
-    def _mk_loader(ds, tasks_per_epoch):
+    def _mk_loader(ds, tasks_per_epoch, batch_size=1):
         # To cap per-epoch tasks, we can wrap the dataset so __len__ reports a custom size.
         if tasks_per_epoch is not None:
             class _LenWrap(Dataset):
@@ -203,11 +197,11 @@ def build_meta_splits_and_loaders(
                 def __len__(self): return self.length
                 def __getitem__(self, i): return self.base[i]
             ds = _LenWrap(ds, tasks_per_epoch)
-        return DataLoader(ds, batch_size=1, shuffle=True, num_workers=loader_workers, pin_memory=True)
+        return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=loader_workers, pin_memory=True)
 
-    meta_train_loader = _mk_loader(meta_train_ds, tasks_per_epoch_train)
-    meta_val_loader   = _mk_loader(meta_val_ds, tasks_per_epoch_val)
-    meta_test_loader  = _mk_loader(meta_test_ds, tasks_per_epoch_test)
+    meta_train_loader = _mk_loader(meta_train_ds, tasks_per_epoch_train, batch_size=meta_batch_size)
+    meta_val_loader   = _mk_loader(meta_val_ds, tasks_per_epoch_val, batch_size=1)  # keep =1 for adaptation
+    meta_test_loader  = _mk_loader(meta_test_ds, tasks_per_epoch_test, batch_size=1)
 
     split_ids = {
         "train_ids": train_ids,
@@ -222,15 +216,16 @@ def parseargs():
     
     parser.add_argument('--dataset_folder', default='./lmdb', type=str, help='path to the dataset to analyze')
     parser.add_argument('--dataset_name', default='test', type=str, help='name of the processed dataset')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--fs', type=int, default=125)
-    parser.add_argument('--input_seq_len_s', type=int, default=10)
+    parser.add_argument('--seed', type=int, default=42, help='seed')
+    parser.add_argument('--fs', type=int, default=125, help='signals frequency')
+    parser.add_argument('--input_seq_len_s', type=int, default=10, help='single window duration')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
-    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--k_support', type=int, default=8)
-    parser.add_argument('--k_query', type=int, default=8)
-    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--bp_pattern', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--k_support', type=int, default=8, help='meta-learning support set size')
+    parser.add_argument('--k_query', type=int, default=8, help='meta-learning query set size')
+    parser.add_argument('--meta_batch_size', type=int, default=16, help='meta batch size')
+    parser.add_argument('--workers', type=int, default=2, help='parallel data loaders')
     
     return parser.parse_args()
     
@@ -244,12 +239,13 @@ if __name__ == "__main__":
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
-        resp=args.resp,
         sig2sig=args.sig2sig,
+        bp_pattern=args.bp_pattern,
         pretraining_split_ratio=(0.7, 0.1, 0.2),
         mix_pretraining_subject_samples=False,     # IMPORTANT for meta-learning to test on unseen subjects
         k_support=args.k_support,
         k_query=args.k_query,
+        meta_batch_size=args.meta_batch_size,
         loader_workers=args.workers,
     )
 

@@ -155,13 +155,12 @@ class BIOT(nn.Module):
 
         self.input_seq_len = input_seq_len_s * fs
         self.ecg = ecg
-        self.resp = resp
         self.sig2sig = sig2sig
         self.n_fft = n_fft
         self.hop_length = hop_length
 
-        self.ppg_in_channels, self.ecg_in_channels, self.resp_in_channels = self.get_input_channels()
-        self.in_channels = self.ppg_in_channels + self.ecg_in_channels + self.resp_in_channels
+        self.ppg_in_channels, self.ecg_in_channels = self.get_input_channels()
+        self.in_channels = self.ppg_in_channels + self.ecg_in_channels
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -225,19 +224,15 @@ class BIOT(nn.Module):
             )
             channel_emb = self.encoder.positional_encoding(channel_spec_emb + channel_token_emb)
             emb_seq.append(channel_emb)
-
-        emb = torch.cat(emb_seq, dim=1)        # (B, total_ts, emb_dim)
-        emb = self.encoder.transformer(emb)    # (B, total_ts, emb_dim)
-
-        bp_waveform = self.decoder(emb)        # (B, output_len)
         
-        return bp_waveform
+        emb = torch.cat(emb_seq, dim=1)        # (B, total_ts, emb_dim)
+
+        return self.encoder.transformer(emb).mean(axis=1)    # (B, emb_dim)
 
     def get_input_channels(self):
         ppg_in_channels = 1
         ecg_in_channels = 1 if self.ecg else 0
-        resp_in_channels = 1 if self.resp else 0
-        return ppg_in_channels, ecg_in_channels, resp_in_channels
+        return ppg_in_channels, ecg_in_channels
 
     def print_summary(self, batch_size=128):
         total_input_channels = self.in_channels
@@ -254,7 +249,6 @@ def parseargs():
     parser = argparse.ArgumentParser(description="BIOT summary")
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)))
-    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)))
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)))
     parser.add_argument('--fs', default=125, type=int)
     parser.add_argument('--input_seq_len_s', default=5, type=int)
@@ -272,7 +266,6 @@ if __name__ == "__main__":
     args = parseargs()
     net = BIOT(
         ecg=args.ecg,
-        resp=args.resp,
         sig2sig=args.sig2sig,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,

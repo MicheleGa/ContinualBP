@@ -46,7 +46,7 @@ def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_pat
     else:
         _, train_dataloader, valid_dataloader, test_dataloader, _ = dataset
 
-    all_targets, all_outputs = pretraining_training_validation_testing(
+    pretraining_training_validation_testing(
         save_name=save_name,
         checkpoint_path=checkpoint_path,
         tensorboard_path=tensorboard_path,
@@ -58,10 +58,7 @@ def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_pat
         },
         config=config,
         device=device
-    )
-    
-    # Log test metrics (optionally, plot them) and return loss for validation
-    _ = call_metric(all_targets, all_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'pretraining'), plot=True)    
+    )  
     
     # Save the best model and configuration after training
     print(f"Pretraining completed, best model and configuration saved in {checkpoint_path}")
@@ -140,7 +137,6 @@ if __name__ == "__main__":
                 fs=config['fs'],
                 input_seq_len_s=config['input_seq_len_s'],
                 ecg=config['ecg'],
-                resp=config['resp'],
                 sig2sig=config['sig2sig'],
                 pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
                 mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects

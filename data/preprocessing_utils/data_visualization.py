@@ -3,6 +3,7 @@ import sys
 folders_to_add = ['preprocessing_utils']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
+from collections import Counter
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -12,6 +13,79 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 from preprocessing_utils.signal_processing import compute_sp_dp
 from preprocessing_utils.split import split_train_val_test_personalization
 
+
+def plot_bp_pattern_distribution(dataloaders, dataloaders_names, savepath='./figs/dataset'):
+    r"""
+    Calculates Hyper/Hypo/normo-tensive windows distributions of the train/val/test split
+    accessed through the corresponding dataloaders. The function plots them with mean,
+    standard deviation, and quartiles. This function should be called only from dataset.py.
+    
+    Parameters
+    ----------
+    dataloaders : list of DataLoader
+        List of dataloaders containing the data to analyze.
+    dataloaders_names : list of str
+        List of names corresponding to each dataloader, used for labeling the plots.
+    savepath : str, default './figs/dataset'
+        Path to save the generated plots.
+        
+    Returns
+    -------
+    None (saves the plots to the specified savepath)
+    """
+    labels_map = {
+        0: 'Hypotension', 
+        1: 'Normal', 
+        2: 'Elevated', 
+        3: 'Stage 1 Hypertension', 
+        4: 'Stage 2 Hypertension'
+    }
+
+    # Ensure the save directory exists
+    os.makedirs(savepath, exist_ok=True)
+
+    for dataloader, dataloader_name in zip(dataloaders, dataloaders_names):
+        all_data = []
+        labels = []
+        
+        for batch in dataloader:
+            # Unpack the batch. The label is the second element when bp_pattern is True
+            _, batch_labels, _ = batch
+            labels.extend(batch_labels.tolist())
+
+        if not labels:
+            print(f"No data collected for dataloader '{dataloader_name}'. Skipping plot.")
+            continue
+        
+        counts = Counter(labels)
+        for label, count in counts.items():
+            all_data.append({
+                'BP Pattern': labels_map.get(label, 'Unknown'),
+                'Count': count
+            })
+
+        df = pd.DataFrame(all_data)
+
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x='BP Pattern', y='Count', data=df)
+
+        # Calculate and add statistics for each group
+        total_count = df['Count'].sum()
+        for p in plt.gca().patches:
+            height = p.get_height()
+            if height > 0:
+                percent = (height / total_count) * 100
+                plt.gca().text(p.get_x() + p.get_width() / 2., height,
+                               f'{height}\n({percent:.1f}%)',
+                               ha='center', va='bottom', fontsize=10, color='black', weight='bold')
+
+        plt.title(f'Blood Pressure Pattern Distribution for {dataloader_name}')
+        plt.xlabel('Blood Pressure Pattern')
+        plt.ylabel('Number of Samples')
+        plt.tight_layout()
+        plt.savefig(os.path.join(savepath, f'{dataloader_name}_bp_distribution.jpg'))
+        plt.close()
+        
 
 def _calculate_dataset_mean_std(sbp_values, dbp_values, map_values, name, savepath):
     sbp_values = np.array(sbp_values)
@@ -114,11 +188,10 @@ def calculate_dataloaders_mean_std(dataloaders, dataloaders_names, savepath=f'./
 
         for batch in dataloader:
             _, annotation = batch
-            if isinstance(annotation, tuple):
-                # TODO: make MAP calculation also for the sig2label case
+            if isinstance(annotation, list):
                 sbp_values.extend(annotation[0].flatten().tolist())
                 dbp_values.extend(annotation[1].flatten().tolist())
-                raise NotImplementedError("MAP calculation for sig2label case is not implemented yet.")
+                map_values.extend(annotation[2].flatten().tolist())
             else:
                 window_abp = annotation.numpy()               
                 for el in range(window_abp.shape[0]):
@@ -180,7 +253,7 @@ def calculate_personalization_subjects_mean_std(dataset, args, savepath=f'./figs
             dataloaders_names=[f'{str(subject)}-Train', f'{str(subject)}-Val', f'{str(subject)}-Test'],
             savepath=subject_fig_path
         )
-                
+         
 
 def plot_subject_sample_distribution(subject_sample_dict, ids, savepath="subject_sample_distribution.png"):
     r"""

@@ -11,8 +11,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from sklearn.model_selection import train_test_split
-from preprocessing_utils.data_visualization import plot_signals, plot_pretraining_personalization_subjects_distribution, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std, calculate_personalization_subjects_mean_std
-from preprocessing_utils.augmentations import RandomAugmentor, Identity, Jitter, TimeWarp, Scaling, MagnitudeWarp, Flip
+from preprocessing_utils.data_visualization import plot_signals, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std, plot_bp_pattern_distribution
 from preprocessing_utils.split import split_train_val_test
 
 
@@ -25,8 +24,8 @@ class PhysioDataset(Dataset):
                  fs=125, 
                  input_seq_len_s=5, 
                  ecg=False, 
-                 resp=False, 
                  sig2sig=False,
+                 bp_pattern=False, 
                  min_subject_sample_number=0, 
                  plot=False, 
                  savepath='./figs'):
@@ -47,10 +46,10 @@ class PhysioDataset(Dataset):
         self.index_by_sample_id = pickle.loads(self.lmdbtxn.get("index_by_sample_id".encode()))
         self.check_subjects_list(min_subject_sample_number=min_subject_sample_number)
                 
-        # Which input data to load (PPG, PPG + ECG, PPG + ECG + RESP), PPG is always loaded
+        # Which input data to load (PPG or PPG + ECG), PPG is always loaded
         self.ecg = ecg
-        self.resp = resp
         self.sig2sig = sig2sig
+        self.bp_pattern = bp_pattern
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
         
@@ -199,7 +198,7 @@ class PhysioDataset(Dataset):
         sample = dict()
 
         # Input data        
-        if self.ecg and not self.resp:
+        if self.ecg:
             sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
             sample['ecg'] = np.frombuffer(self.lmdbtxn.get("{}-ecg".format(index).encode()), dtype="float32")
             
@@ -209,18 +208,6 @@ class PhysioDataset(Dataset):
                     np.expand_dims(sample['ecg'], axis=-1)
                 ), 
                 axis=-1)
-        elif self.ecg and self.resp:
-            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
-            sample['ecg'] = np.frombuffer(self.lmdbtxn.get("{}-ecg".format(index).encode()), dtype="float32")
-            sample['resp'] = np.frombuffer(self.lmdbtxn.get("{}-resp".format(index).encode()), dtype="float32")
-            
-            sample['sig'] = np.concatenate(
-                (
-                    np.expand_dims(sample['ppg'], axis=-1), 
-                    np.expand_dims(sample['ecg'], axis=-1),
-                    np.expand_dims(sample['resp'], axis=-1)
-                ), 
-                axis=-1)
         else:
             sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
             
@@ -228,9 +215,10 @@ class PhysioDataset(Dataset):
             
         # Annotation
         if self.sig2sig:
-            sample['abp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-abp".format(index).encode()), dtype="float32"))
+            sample['abp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
             
-            # Ensure that the signal and annotation are numpy arrays with writeable flags
+            # Ensure arrays are writeable
             for k in sample:
                 sample[k] = np.require(sample[k], requirements=['O', 'W'])
                 sample[k].setflags(write=1)
@@ -240,20 +228,58 @@ class PhysioDataset(Dataset):
             abp = torch.tensor(sample['abp'])
             
             return signals, abp
-        else:
-            sample['sbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-sbp".format(index).encode()), dtype="float32"))
-            sample['dbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get("{}-dbp".format(index).encode()), dtype="float32"))
-        
+
+        elif self.bp_pattern:
+            # Fetch scalar values
+            sample['sbp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
+            sample['dbp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
+            sample['map'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
+            
             for k in sample:
                 sample[k] = np.require(sample[k], requirements=['O', 'W'])
                 sample[k].setflags(write=1)
             
-            # Cast to torch tensor
             signals = torch.tensor(sample['sig'])
-            sbp_val = torch.tensor(sample['sbp']).unsqueeze(-1)
-            dbp_val = torch.tensor(sample['dbp']).unsqueeze(-1)
+            sbp_val = float(sample['sbp'])
+            dbp_val = float(sample['dbp'])
+
+            # ----- Label definition based on AHA/ACC guidelines -----
+            # Source: https://www.ahajournals.org/doi/10.1161/CIR.0000000000001356
+            if sbp_val < 90 or dbp_val < 60:
+                label = 0   # Hypotension
+            elif sbp_val < 120 and dbp_val < 80:
+                label = 1   # Normal
+            elif 120 <= sbp_val <= 129 and dbp_val < 80:
+                label = 2   # Elevated
+            elif (130 <= sbp_val <= 139) or (80 <= dbp_val <= 89):
+                label = 3   # Stage 1 Hypertension
+            else:  # sbp_val >= 140 or dbp_val >= 90
+                label = 4   # Stage 2 Hypertension
             
-            return signals, [sbp_val, dbp_val]
+            return signals, torch.tensor(label, dtype=torch.long), self.index_by_sample_id[index][0]
+
+        else:
+            # Regression mode: return SBP/DBP/MAP
+            sample['sbp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
+            sample['dbp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
+            sample['map'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
+            
+            for k in sample:
+                sample[k] = np.require(sample[k], requirements=['O', 'W'])
+                sample[k].setflags(write=1)
+            
+            signals = torch.tensor(sample['sig'])
+            sbp_val = torch.tensor(sample['sbp'])
+            dbp_val = torch.tensor(sample['dbp'])
+            map_val = torch.tensor(sample['map'])
+            
+            return signals, torch.stack([sbp_val, dbp_val, map_val], dim=-1)
     
 
 def parseargs():
@@ -270,8 +296,8 @@ def parseargs():
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
-    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--bp_pattern', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
@@ -295,8 +321,8 @@ if __name__ == "__main__":
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
-        resp=args.resp,
         sig2sig=args.sig2sig,
+        bp_pattern=args.bp_pattern,
         min_subject_sample_number=args.min_subject_sample_number,
         plot=args.plot, 
         savepath=root_figs_folder
@@ -309,169 +335,88 @@ if __name__ == "__main__":
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
-    if args.mix_pretraining_subject_samples:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-            savepath=root_figs_folder
-            ) 
-    else:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-            savepath=root_figs_folder
-            )
-    
-    input_batch = next(iter(train_dataloader))
-    sig = input_batch[0]
-    sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
-    annotation = input_batch[1]
-    
-    idx = np.random.randint(0, sig.shape[0])
-    if args.sig2sig:
-        sig = sig[idx, :, :].squeeze().numpy()
-        abp = annotation[idx, :].squeeze().numpy()
-    else:
-        sbp_val = annotation[0][idx].squeeze().numpy()
-        dbp_val = annotation[1][idx].squeeze().numpy()
-    
-    # Note that the train_dataloader will already return the required signals specified by the conditions
-    if args.ecg and not args.resp:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'ABP'], 
-                title=f'Input: PPG + ECG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'mmHg']
-            )
+    if not args.bp_pattern:
+        if args.mix_pretraining_subject_samples:
+            calculate_dataloaders_mean_std(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+                savepath=root_figs_folder
+                ) 
         else:
-            plot_signals(
-                sig[idx, :, :].T, fs=args.fs, 
-                labels=['PPG', 'ECG'], 
-                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV']
+            calculate_dataloaders_mean_std(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
+                savepath=root_figs_folder
                 )
-        
-        if args.plot_aug:
-            augments = RandomAugmentor(
-                [
-                    Identity(prob=0.2),
-                    Jitter(prob=0.2),
-                    Scaling(prob=0.2),
-                    MagnitudeWarp(prob=0.2),
-                    Flip(prob=0.2)
-                ]
-            )
-            inp_sigs_augs = []
-            for inp_mod in range(sig.shape[-1]):
-                sig_aug = augments(sig[:, :, inp_mod].squeeze())
-                sig_aug = sig_aug.unsqueeze(-1) if len(sig_aug.shape) == 2 else sig
-                inp_sigs_augs.append(sig_aug)
-            inp_sigs_augs = torch.cat(inp_sigs_augs, dim=-1)
-            plot_signals(
-                inp_sigs_augs[idx, :, :].T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG'], 
-                title=f'Augmented PPG + ECG', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mmV']
-            )
-            
-    elif args.ecg and args.resp:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'RESP', 'ABP'], 
-                title=f'Input: PPG + ECG + RESP, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'pm', 'mmHg']
-            )
-        else:    
-            plot_signals(
-                sig[idx, :, :].T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'RESP'], 
-                title=f'Input: PPG + ECG + RESP, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'pm']
-                )
-        
-        if args.plot_aug:
-            augments = RandomAugmentor(
-                [
-                    Identity(prob=0.2),
-                    Jitter(prob=0.2),
-                    Scaling(prob=0.2),
-                    MagnitudeWarp(prob=0.2),
-                    Flip(prob=0.2)
-                ]
-            )
-            inp_sigs_augs = []
-            for inp_mod in range(sig.shape[-1]):
-                sig_aug = augments(sig[:, :, inp_mod].squeeze())
-                sig_aug = sig_aug.unsqueeze(-1) if len(sig_aug.shape) == 2 else sig
-                inp_sigs_augs.append(sig_aug)
-            inp_sigs_augs = torch.cat(inp_sigs_augs, dim=-1)
-            plot_signals(
-                inp_sigs_augs[idx, :, :].T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'RESP'], 
-                title=f'Augmented PPG + ECG + RESP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'pm']
-            )
-            
     else:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ABP'], 
-                title=f'Input: PPG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mmHg']
-            )
+        if args.mix_pretraining_subject_samples:
+            plot_bp_pattern_distribution(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+                savepath=root_figs_folder
+                ) 
         else:
-            plot_signals(
-                sig[idx, :, :].T, 
-                fs=args.fs,
-                labels=['PPG'], 
-                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.']
+            plot_bp_pattern_distribution(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
+                savepath=root_figs_folder
                 )
+    
+    if not args.bp_pattern:
+        input_batch = next(iter(train_dataloader))
+        sig = input_batch[0]
+        sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
+        annotation = input_batch[1]
         
-        if args.plot_aug:
-            augments = RandomAugmentor(
-                [
-                    Identity(prob=0.2),
-                    Jitter(prob=0.2),
-                    Scaling(prob=0.2),
-                    MagnitudeWarp(prob=0.2),
-                    Flip(prob=0.2)
-                ]
-            )
-            inp_sigs_augs = []
-            for inp_mod in range(sig.shape[-1]):
-                sig_aug = augments(sig[:, :, inp_mod].squeeze())
-                sig_aug = sig_aug.unsqueeze(-1) if len(sig_aug.shape) == 2 else sig
-                inp_sigs_augs.append(sig_aug)
-            inp_sigs_augs = torch.cat(inp_sigs_augs, dim=-1)
-            plot_signals(
-                inp_sigs_augs[idx, :, :].T, 
-                fs=args.fs, 
-                labels=['PPG'], 
-                title=f'Augmented PPG', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.']
-            )
+        idx = np.random.randint(0, sig.shape[0])
+        if args.sig2sig:
+            sig = sig[idx, :, :].squeeze().numpy()
+            abp = annotation[idx, :].squeeze().numpy()
+        else:
+            sbp_val = annotation[idx, 0].squeeze().numpy()
+            dbp_val = annotation[idx, 1].squeeze().numpy()
+            map_val = annotation[idx, 2].squeeze().numpy()
+        
+        # Note that the train_dataloader will already return the required signals specified by the conditions
+        if args.ecg:
+            
+            if args.sig2sig:
+                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+                plot_signals(
+                    sigs.T, 
+                    fs=args.fs, 
+                    labels=['PPG', 'ECG', 'ABP'], 
+                    title=f'Input: PPG + ECG, Output: ABP', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mV', 'mmHg']
+                )
+            else:
+                plot_signals(
+                    sig[idx, :, :].T, fs=args.fs, 
+                    labels=['PPG', 'ECG'], 
+                    title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mV']
+                    )
+                
+        else:
+            
+            if args.sig2sig:
+                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+                plot_signals(
+                    sigs.T, 
+                    fs=args.fs, 
+                    labels=['PPG', 'ABP'], 
+                    title=f'Input: PPG, Output: ABP', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mmHg']
+                )
+            else:
+                plot_signals(
+                    sig[idx, :, :].T, 
+                    fs=args.fs,
+                    labels=['PPG'], 
+                    title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.']
+                    )

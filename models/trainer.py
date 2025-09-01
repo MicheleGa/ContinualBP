@@ -7,12 +7,14 @@ import copy
 import math
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+from torch.autograd import Function
 from data.dataset import PhysioDataset
 from training_utils.helpers import save_status, load_status, EarlyStopping, set_trainable_parameters, configure_optimizer_and_scheduler, get_model_architecture
-from training_utils.metrics import AverageMeter, get_metric_values
+from training_utils.metrics import AverageMeter, get_metric_values, call_metric
 
 
 
@@ -71,7 +73,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
     if not config['ssl']:
         if not config['meta_learning']:
             if config['model_name'] == 'BIOT' and config['pretrained_path'] is not None:
-                return supervised_finetune_with_pretrained_backbone(
+                supervised_finetune_with_pretrained_backbone(
                     save_name=save_name,
                     checkpoint_path=checkpoint_path,
                     writer=writer,
@@ -87,7 +89,7 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
                     device=device
                 )
             else:
-                return supervised_pretraining_training_validation_testing(
+                supervised_pretraining_training_validation_testing(
                     save_name=save_name,
                     checkpoint_path=checkpoint_path,
                     writer=writer,
@@ -103,24 +105,53 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
                     device=device
                     )
         else:
-            # call Reptile meta-training (this returns the final model after meta-training)
-            return reptile_meta_training(
-                save_name=save_name,
-                checkpoint_path=checkpoint_path,
-                writer=writer,
-                model_name=model_name,
-                model=model,
-                train_dataloader=train_dataloader,
-                val_dataloader=val_dataloader,
-                test_dataloader=test_dataloader,
-                early_stopping=early_stopping,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                config=config,
-                device=device
-            )
+            if config['meta_algorithm'] == 'maml':
+                maml_meta_training(
+                    save_name,
+                    checkpoint_path,
+                    writer,
+                    model_name,
+                    model,
+                    train_dataloader,
+                    val_dataloader,
+                    test_dataloader,
+                    early_stopping,
+                    config,
+                    device
+                )
+            elif config['meta_algorithm'] == 'mann':
+                # call Reptile meta-training (this returns the final model after meta-training)
+                mann_meta_training(
+                    save_name,
+                    checkpoint_path,
+                    writer,
+                    model_name,
+                    model,
+                    train_dataloader,
+                    val_dataloader,
+                    test_dataloader,
+                    early_stopping,
+                    config,
+                    device
+                )
+            elif config['meta_algorithm'] == 'reptile':
+                reptile_meta_training(
+                    save_name=save_name,
+                    checkpoint_path=checkpoint_path,
+                    writer=writer,
+                    model_name=model_name,
+                    model=model,
+                    train_dataloader=train_dataloader,
+                    val_dataloader=val_dataloader,
+                    test_dataloader=test_dataloader,
+                    early_stopping=early_stopping,
+                    config=config,
+                    device=device
+                )
+            else:
+                raise ValueError('Unsupported Meta-Learning algorithm')
     else: 
-        return self_supervised_pretraining_training_validation_testing(
+        self_supervised_pretraining_training_validation_testing(
             save_name=save_name,
             checkpoint_path=checkpoint_path,
             writer=writer,
@@ -407,7 +438,7 @@ def supervised_finetune_with_pretrained_backbone(
       - Original trainable mask to avoid unfreezing fixed params (e.g., encoder.index)
     """
 
-    # ===== Store original trainable mask =====
+    # ====== Store original trainable mask ======
     original_trainable = {n: p.requires_grad for n, p in model.named_parameters()}
 
     def set_requires_grad_safe(module, req, name_prefix=""):
@@ -434,7 +465,7 @@ def supervised_finetune_with_pretrained_backbone(
             return base_lr
         return base_lr * (0.1 + 0.9 * (current_epoch / warmup_epochs))
 
-    # ===== Common config =====
+    # ====== Common config ======
     base_lr = config.get('base_lr', 3e-4)
     backbone_lr_mul = config.get('backbone_lr_multiplier', 0.05)
     weight_decay = config.get('weight_decay', 1e-2)
@@ -447,7 +478,7 @@ def supervised_finetune_with_pretrained_backbone(
 
     best_val = float("+inf")
 
-    # ===== Stage 1: Head-only =====
+    # ====== Stage 1: Head-only ======
     if config.get('freeze_backbone_first', True):
         if hasattr(model, 'encoder'):
             set_requires_grad_safe(model.encoder, False, name_prefix="encoder")
@@ -460,7 +491,7 @@ def supervised_finetune_with_pretrained_backbone(
     optimizer_stage1 = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=weight_decay)
     scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=stage1_epochs)
 
-    print(f"=== Stage 1: head-only, {stage1_epochs} epochs, base_lr={base_lr} ===")
+    print(f"==== Stage 1: head-only, {stage1_epochs} epochs, base_lr={base_lr} ====")
     for epoch in range(stage1_epochs):
         model.train()
         # Warmup LR
@@ -524,7 +555,7 @@ def supervised_finetune_with_pretrained_backbone(
                 print("Early stopping Stage 1")
                 break
 
-    # ===== Stage 2: Backbone + Head =====
+    # ====== Stage 2: Backbone + Head ======
     lr_backbone = base_lr * backbone_lr_mul
     set_requires_grad_safe(model.encoder, True, name_prefix="encoder")
     set_requires_grad_safe(model.channel_proj, True, name_prefix="channel_proj")
@@ -540,7 +571,7 @@ def supervised_finetune_with_pretrained_backbone(
     ], weight_decay=weight_decay)
     scheduler_stage2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage2, T_max=stage2_epochs)
 
-    print(f"=== Stage 2: fine-tune backbone, {stage2_epochs} epochs, head_lr={base_lr}, backbone_lr={lr_backbone} ===")
+    print(f"==== Stage 2: fine-tune backbone, {stage2_epochs} epochs, head_lr={base_lr}, backbone_lr={lr_backbone} ====")
     for epoch in range(stage2_epochs):
         model.train()
         # Warmup
@@ -605,7 +636,7 @@ def supervised_finetune_with_pretrained_backbone(
                 print("Early stopping Stage 2")
                 break
 
-    # ===== Final test =====
+    # ====== Final test ======
     
     # Meters    
     test_losses = AverageMeter(name='test/loss')
@@ -680,37 +711,556 @@ def supervised_finetune_with_pretrained_backbone(
 
     return all_test_targets, all_test_outputs
 
+class MAMLLearner(nn.Module):
+    """
+    Learner wrapper that cleanly supports MAML-style functional forward using
+    torch.nn.utils.stateless.functional_call for both the BIOT encoder and the
+    BPRegressor head. This avoids in-place param swapping and shape/order bugs.
+    """
+    def __init__(self, model, regressor):
+        super().__init__()
+        self.model = model
+        self.regressor = regressor
 
-def _compute_supervised_loss(outputs, targets, config):
-    """Helper to compute supervised loss consistent with the rest of the repo."""
-    if config['criterion'] == 'MSELoss':
-        return F.mse_loss(outputs, targets)
-    elif config['criterion'] == 'SmoothL1Loss':
-        return F.smooth_l1_loss(outputs, targets)
+        # Capture parameter names in a deterministic order (matches .parameters())
+        self.model_named_params = list(self.model.named_parameters())
+        self.reg_named_params = list(self.regressor.named_parameters())
+
+        # Keep a flattened list of parameters with the same order as learner.parameters()
+        self._flattened_params = list(p for _, p in self.model_named_params if p.is_floating_point() or p.is_complex())
+        self._flattened_params += list(p for _, p in self.reg_named_params if p.is_floating_point() or p.is_complex())
+        
+        # Save names in the same order (to reconstruct dicts quickly)
+        self._model_names_in_order = [n for n, _ in self.model_named_params]
+        self._reg_names_in_order = [n for n, _ in self.reg_named_params]
+
+        # Guardrail: the BPRegressor expects 256-dim embeddings as input.
+        self.expected_feat_dim = None
+        try:
+            if hasattr(self.model, "embed_dim"):
+                self.expected_feat_dim = int(self.model.embed_dim)
+        except Exception:
+            self.expected_feat_dim = None
+
+    def _split_vars_to_dicts(self, vars_list):
+        """
+        Split a flat list of tensors into two param dicts matching model and regressor.
+        The ordering *must* match how we created fast_weights.
+        """
+        n_model = len(self._model_names_in_order)
+        model_vars = vars_list[:n_model]
+        reg_vars = vars_list[n_model:]
+
+        model_param_dict = {name: tensor for name, tensor in zip(self._model_names_in_order, model_vars)}
+        reg_param_dict = {name: tensor for name, tensor in zip(self._reg_names_in_order, reg_vars)}
+        return model_param_dict, reg_param_dict
+
+    def forward(self, x, vars=None):
+        """
+        If vars is None -> regular forward (encoder -> head).
+        If vars is not None -> functional forward using provided weights (MAML inner loop).
+        """
+        if vars is None:
+            feats = self.model(x)            # Expect [B, 256] from BIOT
+            assert feats.dim() == 2, f"Encoder output must be [B, D], got {list(feats.shape)}"
+            if self.expected_feat_dim is not None:
+                assert feats.shape[-1] == self.expected_feat_dim,                     f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+            out = self.regressor(feats)      # [B, 3]
+            return out
+
+        # Functional forward: use stateless.functional_call so autograd can build
+        # a graph w.r.t. 'vars' (fast weights). This is the canonical PyTorch way.
+        from torch.nn.utils.stateless import functional_call
+
+        model_param_dict, reg_param_dict = self._split_vars_to_dicts(vars)
+
+        # Run encoder with provided params
+        feats = functional_call(self.model, model_param_dict, (x,))
+
+        # Sanity checks to catch shape issues early
+        if feats.dim() == 3 and feats.shape[1] != feats.shape[-1]:
+            # If accidentally a sequence [B, T, C] got returned without pooling, try to pool
+            feats = feats.mean(dim=1)
+
+        assert feats.dim() == 2, f"Encoder output must be [B, D]; got {list(feats.shape)}"
+        if self.expected_feat_dim is not None:
+            assert feats.shape[-1] == self.expected_feat_dim,                 f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+
+        # Run head with provided params
+        out = torch.func.functional_call(self.regressor, reg_param_dict, (feats,))
+        return out
+
+
+def maml_meta_training(
+    save_name,
+    checkpoint_path,
+    writer,
+    model_name,
+    model,
+    train_dataloader,
+    val_dataloader,
+    test_dataloader,
+    early_stopping,
+    config,
+    device
+):
+    
+    # Load best model
+    model = get_model_architecture(config)
+    #checkpoint = torch.load('/data/users/mgaspari/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTencoder_ft_stage2', weights_only=False)
+    checkpoint = torch.load('/home/michele/Documents/ContinualBP/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTencoder_ft_stage2', weights_only=False)
+    model.load_state_dict(checkpoint['model'])
+    model = model.to(device)
+    
+    feat_dim = model.embed_dim
+    output_dim = 3  # SBP, DBP, MAP
+    bp_regressor = BPRegressor(feat_dim, output_dim)
+    #checkpoint = torch.load('/data/users/mgaspari/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTregressor_ft_stage2', weights_only=False)
+    checkpoint = torch.load('/home/michele/Documents/ContinualBP/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTregressor_ft_stage2', weights_only=False)
+    bp_regressor.load_state_dict(checkpoint['model'])
+    bp_regressor = bp_regressor.to(device)
+    print("Loaded checkpoints")
+    
+    # Create enhanced learner wrapper
+    learner = MAMLLearner(model, bp_regressor).to(device)
+    
+    # Configure functional forward approach based on your preference
+    learner.use_pure_functional = config.get('use_pure_functional', False)  # Set to True for memory efficiency
+    
+    # ==== Meta-learning (MAML) Stage ====
+    
+    # ---- Setup ----
+    
+    # Hyperparams / defaults
+    meta_epochs = config.get('max_training_epochs')
+    meta_val_tasks = config.get('meta_val_tasks')
+    grad_clip_norm = config.get('grad_clip', 10.0)  # Increased for MAML
+    
+    # Enhanced scheduling parameters
+    meta_lr_schedule = config.get('meta_lr_schedule')
+    inner_lr_schedule = config.get('inner_lr_schedule')
+    inner_steps_schedule = config.get('inner_steps_schedule')
+    
+    # MAML specific parameters
+    second_order = config.get('second_order_maml')
+    
+    print(f"==== Stage 3 Starting MAML meta-training ====")
+    print(f"  - Meta LR schedule: {meta_lr_schedule}")
+    print(f"  - Inner LR schedule: {inner_lr_schedule}")
+    print(f"  - Inner steps schedule: {inner_steps_schedule}")
+    print(f"  - Second-order gradients: {second_order}")
+    print(f"  - Using pure functional: {learner.use_pure_functional}")
+    
+    # Meta-optimizer for the meta-parameters
+    meta_optimizer = torch.optim.Adam(learner.parameters(), lr=get_meta_lr(0, config))
+    
+    # Learning rate scheduler for meta-optimizer
+    if config.get('meta_lr_scheduler') == 'cosine':
+        meta_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            meta_optimizer, T_max=meta_epochs
+        )
+    elif config.get('meta_lr_scheduler') == 'step':
+        meta_scheduler = torch.optim.lr_scheduler.StepLR(
+            meta_optimizer, step_size=config.get('meta_lr_step_size', 100), 
+            gamma=config.get('meta_lr_gamma', 0.5)
+        )
     else:
-        raise ValueError("Invalid criterion in config['criterion']")
+        meta_scheduler = None
 
-def _ensure_meta_batch(tensor):
+    best_val = float("+inf")
+    global_step = 0
+
+    # Outer loop: epochs
+    for epoch in range(meta_epochs):
+        learner.train()
+        
+        # Get current hyperparameters based on schedules
+        current_meta_lr = get_meta_lr(epoch, config)
+        current_inner_lr = get_inner_lr(epoch, config)
+        current_inner_steps = get_inner_steps(epoch, config)
+        
+        # Update meta-optimizer learning rate if using manual schedule
+        if meta_scheduler is None:
+            for param_group in meta_optimizer.param_groups:
+                param_group['lr'] = current_meta_lr
+        
+        epoch_query_loss_meter = AverageMeter(name='meta/train_query_loss')
+        epoch_support_loss_meter = AverageMeter(name='meta/train_support_loss')
+        epoch_meta_loss_meter = AverageMeter(name='meta/train_meta_loss')
+        
+        # Log current hyperparameters
+        writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
+        writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
+        writer.add_scalar('meta/inner_steps', current_inner_steps, epoch)
+                
+        # Iterate over tasks provided by train_dataloader
+        for batch_idx, batch in enumerate(train_dataloader):
+            (Xs, Ys), (Xq, Yq), pid = batch
+            meta_batch = Xs.shape[0]
+
+            meta_optimizer.zero_grad()
+            
+            task_query_losses = []
+            task_support_losses = []
+            task_query_pre_losses = []
+            meta_loss = 0.0
+
+            for t in range(meta_batch):
+                # Extract task-specific support/query
+                sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
+                qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
+
+                # --------------------
+                # Query loss before adaptation (step 0)
+                with torch.no_grad():
+                    out_q0 = learner(qX)  # Use current meta-parameters
+                    loss_q0 = F.smooth_l1_loss(out_q0, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q0, qY)
+                task_query_pre_losses.append(loss_q0.item())
+                # --------------------
+
+                # Build fast_weights normally (all params)
+                fast_weights = [p.clone() for p in learner.parameters()]
+                support_losses = []                
+                
+                for step in range(current_inner_steps):
+                    out_s = learner(sX, fast_weights)
+                    loss_s = F.smooth_l1_loss(out_s, sY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_s, sY)
+                    support_losses.append(loss_s.item())
+                    
+                    # Select only differentiable (float + requires_grad) params
+                    opt_idx, opt_params = zip(
+                        *[(i, w) for i, w in enumerate(fast_weights)
+                        if w.requires_grad and torch.is_floating_point(w)]
+                    )
+
+                    grads = torch.autograd.grad(
+                        loss_s,
+                        opt_params,
+                        create_graph=second_order,
+                        retain_graph=True,
+                        allow_unused=True
+                    )
+
+                    # Clip grads
+                    clipped = []
+                    for g in grads:
+                        if g is None:
+                            clipped.append(None)
+                        else:
+                            norm = g.norm(p=2).clamp(min=1e-12)
+                            scale = (grad_clip_norm / norm).clamp(max=1.0)
+                            clipped.append(g * scale)
+
+                    # Update only the differentiable params, leave others untouched
+                    new_fast_weights = []
+                    g_iter = iter(clipped)
+                    for i, w in enumerate(fast_weights):
+                        if i in opt_idx:
+                            g = next(g_iter)
+                            if g is not None:
+                                new_fast_weights.append(w - current_inner_lr * g)
+                            else:
+                                new_fast_weights.append(w)
+                        else:
+                            new_fast_weights.append(w)  # carry over unchanged
+
+                    fast_weights = new_fast_weights
+                                    
+                    # Log per-inner-step support loss
+                    writer.add_scalar(f"inner/support_loss_step{step}", loss_s.item(), global_step)
+
+                # Evaluate adapted model on query set (meta-loss computation)
+                out_q = learner(qX, fast_weights)
+                loss_q = F.smooth_l1_loss(out_q, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q, qY)
+
+                meta_loss += loss_q / meta_batch  # Average over tasks
+                
+                task_query_losses.append(loss_q.item())
+                task_support_losses.append(np.mean(support_losses))
+
+                epoch_query_loss_meter.update(loss_q.item(), 1)
+                epoch_support_loss_meter.update(np.mean(support_losses), 1)
+
+            # Meta-backward pass
+            meta_loss.backward()
+            
+            # Gradient clipping
+            total_norm = torch.nn.utils.clip_grad_norm_(learner.parameters(), grad_clip_norm)
+            writer.add_scalar("meta/grad_norm", total_norm.item(), global_step)
+            
+            # Meta-optimization step
+            meta_optimizer.step()
+            
+            epoch_meta_loss_meter.update(meta_loss.item(), 1)
+
+            global_step += 1
+            
+            # Logging per meta step
+            if (batch_idx + 1) % config.get('meta_log_step', 50) == 0:
+                avg_q = float(np.mean(task_query_losses))
+                avg_s = float(np.mean(task_support_losses))
+                avg_q0 = float(np.mean(task_query_pre_losses))
+
+                step_idx = epoch * len(train_dataloader) + batch_idx
+                writer.add_scalar('meta/train_query_loss_step', avg_q, step_idx)
+                writer.add_scalar('meta/train_support_loss_step', avg_s, step_idx)
+                writer.add_scalar('meta/train_query_pre_loss_step', avg_q0, step_idx)
+                writer.add_scalar('meta/train_meta_loss_step', meta_loss.item(), step_idx)
+                writer.add_histogram("meta/task_query_losses", torch.tensor(task_query_losses), step_idx)
+
+                print(f"[MAML] Epoch {epoch+1} Step {batch_idx+1}/{len(train_dataloader)} - "
+                    f"support_loss {avg_s:.6f}, query_loss_pre {avg_q0:.6f}, "
+                    f"query_loss_post {avg_q:.6f}, meta_loss {meta_loss.item():.6f} "
+                    f"(meta_lr={current_meta_lr:.6f}, inner_lr={current_inner_lr:.6f}, "
+                    f"inner_steps={current_inner_steps}, grad_norm={total_norm.item():.3f})")
+
+        # Update learning rate scheduler
+        if meta_scheduler is not None:
+            meta_scheduler.step()
+
+        # End epoch: run validation on val tasks
+        val_loss = evaluate_meta_with_bp_metrics_maml(
+            learner, 
+            val_dataloader, 
+            device, 
+            config
+        )
+        
+        writer.add_scalar('meta/val_loss_epoch', val_loss, epoch)
+        writer.add_scalar('meta/train_query_loss_epoch', epoch_query_loss_meter.avg, epoch)
+        writer.add_scalar('meta/train_support_loss_epoch', epoch_support_loss_meter.avg, epoch)
+        writer.add_scalar('meta/train_meta_loss_epoch', epoch_meta_loss_meter.avg, epoch)
+        
+        print(f"[MAML] Epoch {epoch+1}/{meta_epochs} - "
+              f"train_support_loss {epoch_support_loss_meter.avg:.6f}, "
+              f"train_query_loss {epoch_query_loss_meter.avg:.6f}, "
+              f"train_meta_loss {epoch_meta_loss_meter.avg:.6f}, "
+              f"val_loss {val_loss:.6f}")
+
+        # Save best model according to validation loss
+        if val_loss < best_val:
+            save_ckpt = {
+                'epoch': epoch,
+                'learner_state_dict': learner.state_dict(),
+                'meta_optimizer_state_dict': meta_optimizer.state_dict(),
+                'config': config,
+                'val_loss': val_loss
+            }
+            best_model_path = os.path.join(checkpoint_path, f"{save_name}_best_maml")
+            torch.save(save_ckpt, best_model_path)
+            best_val = val_loss
+            print(f"[MAML] New best validation loss: {val_loss:.6f}, saved to {best_model_path}")
+
+        # Early stopping if configured
+        if config.get('es_enable', False):
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                print("Early stopping MAML meta-training")
+                break
+
+    # After meta-training, run final test evaluation
+    print(f"[MAML] Starting final test evaluation with best model...")
+    
+    # Load best model
+    best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_maml"), weights_only=False)
+    learner.load_state_dict(best_ckpt['learner_state_dict'])
+    learner = learner.to(device)
+    
+    all_test_targets, all_test_outputs = evaluate_meta_with_bp_metrics_maml(
+        learner, 
+        test_dataloader, 
+        device, 
+        config, 
+        test=True, 
+        writer=writer
+    )
+    
+    # Log test metrics and return loss for validation
+    _ = call_metric(all_test_targets, all_test_outputs, config, 
+                   figure_savepath=os.path.join(config['figure_path'], 'maml_meta_stage'), 
+                   plot=True)  
+    
+    writer.close()
+    
+    
+def evaluate_meta_with_bp_metrics_maml(learner, dataloader, device, config, test=False, writer=None):
     """
-    Ensure tensor has meta-batch dim at axis 0.
-    Expected task tensor shapes from MetaTaskDataset:
-      - X support: (k_support, C, T)  -> returns (1, k_support, C, T)
-      - if outer DataLoader uses batch_size>1: (meta_batch, k_support, C, T)
+    Evaluation function adapted for MAML learner
     """
-    if not isinstance(tensor, torch.Tensor):
-        tensor = torch.as_tensor(tensor)
-    if tensor.dim() == 3:
-        return tensor.unsqueeze(0)
-    return tensor  # already has meta-batch dim (or another unexpected shape)
+    learner.eval()
+    
+    current_inner_lr = config.get('inner_lr')
+    current_inner_steps = config.get('inner_steps')
+    second_order = config['second_order_maml']
+    grad_clip_norm = config['grad_clip']
+    
+    if test:
+        # Meters    
+        test_losses = AverageMeter(name='pre_train_test/loss')
+        test_sbp_maes = AverageMeter(name='pre_train_test/sbp_mae')
+        test_dbp_maes = AverageMeter(name='pre_train_test/dbp_mae')
+        test_map_maes = AverageMeter(name='pre_train_test/map_mae')
+        test_sbp_mes = AverageMeter(name='pre_train_test/sbp_me')
+        test_dbp_mes = AverageMeter(name='pre_train_test/dbp_me')
+        test_map_mes = AverageMeter(name='pre_train_test/map_me')
+        test_sbp_mae_stds = AverageMeter(name='pre_train_test/sbp_mae_std')
+        test_dbp_mae_stds = AverageMeter(name='pre_train_test/dbp_mae_std')
+        test_map_mae_stds = AverageMeter(name='pre_train_test/map_mae_std')
+        test_sbp_me_stds = AverageMeter(name='pre_train_test/sbp_me_std')
+        test_dbp_me_stds = AverageMeter(name='pre_train_test/dbp_me_std')
+        test_map_me_stds = AverageMeter(name='pre_train_test/map_me_std')
+    
+        # Record outputs and targets
+        if config['sig2sig']:
+            all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+            all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+        else:
+            all_test_outputs = np.empty((0, 3), dtype=float) # Assuming SBP/DBP/MAP output shape is 3
+            all_test_targets = np.empty((0, 3), dtype=float)
+    else:
+        val_losses = AverageMeter(name='meta/val_loss')
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            (Xs, Ys), (Xq, Yq), pid = batch
+            meta_batch = Xs.shape[0]
+            
+            for t in range(meta_batch):
+                sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
+                qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
+                
+                # Get current meta-parameters
+                # Build fast_weights normally (all params)
+                fast_weights = [p.clone() for p in learner.parameters()]
+                support_losses = []                
+                
+                for step in range(current_inner_steps):
+                    out_s = learner(sX, fast_weights)
+                    loss_s = F.smooth_l1_loss(out_s, sY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_s, sY)
+                    support_losses.append(loss_s.item())
+                    
+                    # Select only differentiable (float + requires_grad) params
+                    opt_idx, opt_params = zip(
+                        *[(i, w) for i, w in enumerate(fast_weights)
+                        if w.requires_grad and torch.is_floating_point(w)]
+                    )
+
+                    grads = torch.autograd.grad(
+                        loss_s,
+                        opt_params,
+                        create_graph=second_order,
+                        retain_graph=True,
+                        allow_unused=True
+                    )
+
+                    # Clip grads
+                    clipped = []
+                    for g in grads:
+                        if g is None:
+                            clipped.append(None)
+                        else:
+                            norm = g.norm(p=2).clamp(min=1e-12)
+                            scale = (grad_clip_norm / norm).clamp(max=1.0)
+                            clipped.append(g * scale)
+
+                    # Update only the differentiable params, leave others untouched
+                    new_fast_weights = []
+                    g_iter = iter(clipped)
+                    for i, w in enumerate(fast_weights):
+                        if i in opt_idx:
+                            g = next(g_iter)
+                            if g is not None:
+                                new_fast_weights.append(w - current_inner_lr * g)
+                            else:
+                                new_fast_weights.append(w)
+                        else:
+                            new_fast_weights.append(w)  # carry over unchanged
+
+                    fast_weights = new_fast_weights
+                
+                # Evaluate on query
+                out_q = learner(qX, fast_weights)
+                loss_q = F.smooth_l1_loss(out_q, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q, qY)
+                
+                metric_values = get_metric_values(loss_q, out_q, qY, config)
+            
+                if test:
+                    # Record predictions and ground truths
+                    all_test_outputs = np.concatenate((all_test_outputs, out_q.detach().cpu().numpy()), axis=0)
+                    all_test_targets = np.concatenate((all_test_targets, qY.detach().cpu().numpy()), axis=0)
+
+                    # Log metrics
+                    metric_values = get_metric_values(loss_q, out_q, qY, config)
+                    
+                    test_losses.update(metric_values['loss'], qX.size(0))
+                    test_sbp_maes.update(metric_values['sbp_mae'], qX.size(0))
+                    test_dbp_maes.update(metric_values['dbp_mae'], qX.size(0))
+                    test_map_maes.update(metric_values['map_mae'], qX.size(0))
+                    test_sbp_mes.update(metric_values['sbp_me'], qX.size(0))
+                    test_dbp_mes.update(metric_values['dbp_me'], qX.size(0))
+                    test_map_mes.update(metric_values['map_me'], qX.size(0))
+                    test_sbp_mae_stds.update(metric_values['sbp_mae_std'], qX.size(0))
+                    test_dbp_mae_stds.update(metric_values['dbp_mae_std'], qX.size(0))
+                    test_map_mae_stds.update(metric_values['map_mae_std'], qX.size(0))
+                    test_sbp_me_stds.update(metric_values['sbp_me_std'], qX.size(0))
+                    test_dbp_me_stds.update(metric_values['dbp_me_std'], qX.size(0))
+                    test_map_me_stds.update(metric_values['map_me_std'], qX.size(0))
+                    
+                else:
+                    val_losses.update(loss_q.item(), qX.size(0))
+    
+    if test:
+        
+        # Log test metrics
+        writer.add_scalar('test/loss_final', test_losses.avg, config.get('max_training_epochs'))
+        writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_mae_final', test_map_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_me_final', test_map_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_mae_std_final', test_map_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/sbp_me_std_final', test_sbp_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_me_std_final', test_dbp_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_me_std_final', test_map_me_stds.avg, config['max_training_epochs'])
+        
+        return all_test_targets, all_test_outputs
+
+    else:
+        return val_losses.avg
+    
+
+class BPRegressor(torch.nn.Module):
+    """
+    Blood pressure regressor for SBP/DBP/MAP prediction during Reptile stage.
+    """
+    def __init__(self, input_dim, output_dim=2):  # 2 for SBP/DBP, can be 3 for SBP/DBP/MAP
+        super(BPRegressor, self).__init__()
+        
+        self.regressor = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(128, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.regressor(x)
+
 
 def evaluate_meta_with_bp_metrics(
     model,
+    bp_regressor,
     dataloader,
     device,
     config,
-    inner_steps=5,
-    lr_inner=1e-2,
-    n_tasks_eval=None,
     test=False,
     writer=None
 ):
@@ -722,117 +1272,639 @@ def evaluate_meta_with_bp_metrics(
     """
     model = model.to(device)
     model.eval()
+    bp_regressor = bp_regressor.to(device)
+    bp_regressor.eval()
 
     if test:
         # Meters    
-        test_losses = AverageMeter(name='test/loss')
-        test_sbp_maes = AverageMeter(name='test/sbp_mae')
-        test_dbp_maes = AverageMeter(name='test/dbp_mae')
-        test_sbp_mes = AverageMeter(name='test/sbp_me')
-        test_dbp_mes = AverageMeter(name='test/dbp_me')
-        test_sbp_mae_stds = AverageMeter(name='test/sbp_mae_std')
-        test_dbp_mae_stds = AverageMeter(name='test/dbp_mae_std')
-        test_sbp_me_stds = AverageMeter(name='test/sbp_me_std')
-        test_dbp_me_stds = AverageMeter(name='test/dbp_me_std')
+        test_losses = AverageMeter(name='pre_train_test/loss')
+        test_sbp_maes = AverageMeter(name='pre_train_test/sbp_mae')
+        test_dbp_maes = AverageMeter(name='pre_train_test/dbp_mae')
+        test_map_maes = AverageMeter(name='pre_train_test/map_mae')
+        test_sbp_mes = AverageMeter(name='pre_train_test/sbp_me')
+        test_dbp_mes = AverageMeter(name='pre_train_test/dbp_me')
+        test_map_mes = AverageMeter(name='pre_train_test/map_me')
+        test_sbp_mae_stds = AverageMeter(name='pre_train_test/sbp_mae_std')
+        test_dbp_mae_stds = AverageMeter(name='pre_train_test/dbp_mae_std')
+        test_map_mae_stds = AverageMeter(name='pre_train_test/map_mae_std')
+        test_sbp_me_stds = AverageMeter(name='pre_train_test/sbp_me_std')
+        test_dbp_me_stds = AverageMeter(name='pre_train_test/dbp_me_std')
+        test_map_me_stds = AverageMeter(name='pre_train_test/map_me_std')
     
         # Record outputs and targets
         if config['sig2sig']:
             all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
             all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
         else:
-            all_test_outputs = np.empty((0, 2), dtype=float) # Assuming SBP/DBP output shape is 2
-            all_test_targets = np.empty((0, 2), dtype=float)
+            all_test_outputs = np.empty((0, 3), dtype=float) # Assuming SBP/DBP/MAP output shape is 3
+            all_test_targets = np.empty((0, 3), dtype=float)
     else:
         val_losses = AverageMeter(name='meta/val_loss')
 
-    tasks_done = 0
-    data_iter = iter(dataloader)
-
-    while True:
-        if n_tasks_eval is not None and tasks_done >= n_tasks_eval:
-            break
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            break
+    for batch_idx, batch in enumerate(dataloader):
 
         (Xs, Ys), (Xq, Yq), pid = batch
-        if isinstance(Xs, torch.Tensor) and Xs.dim() == 4 and Xs.shape[0] == 1:
-            Xs, Ys, Xq, Yq = Xs[0], Ys[0], Xq[0], Yq[0]
-
-        sX = Xs.to(device).float()
-        sY = Ys.to(device).float()
-        qX = Xq.to(device).float()
-        qY = Yq.to(device).float()
-
-        # --- Inner adaptation ---
-        adapted = copy.deepcopy(model).to(device)
-        adapted.train()
-        inner_opt = torch.optim.SGD(adapted.parameters(), lr=lr_inner)
-        for _ in range(inner_steps):
-            inner_opt.zero_grad()
-            out_s = adapted(sX)
-            loss_s = (
-                F.mse_loss(out_s, sY)
-                if config.get("criterion", "MSELoss") == "MSELoss"
-                else F.smooth_l1_loss(out_s, sY)
-            )
-            loss_s.backward()
-            inner_opt.step()
-
-        # --- Evaluate on query ---
-        adapted.eval()
-        with torch.no_grad():
-            out_q = adapted(qX)
-            loss_q = (
-                F.mse_loss(out_q, qY)
-                if config.get("criterion", "MSELoss") == "MSELoss"
-                else F.smooth_l1_loss(out_q, qY)
-            )
-            # use your existing metrics function
-            metric_values = get_metric_values(loss_q, out_q, qY, config)
         
-            if test:
-                
-                # Record predictions and ground truths
-                all_test_outputs = np.concatenate((all_test_outputs, out_q.detach().cpu().numpy()), axis=0)
-                all_test_targets = np.concatenate((all_test_targets, qY.detach().cpu().numpy()), axis=0)
+        meta_batch = Xs.shape[0]
+        
+        for t in range(meta_batch):
+        
+            # Extract task-specific support/query
+            sX = Xs[t].to(device).float()
+            qX = Xq[t].to(device).float()
+            
+            sY = Ys[t].to(device).float()
+            qY = Yq[t].to(device).float()
 
-                # Log metrics
+            # --- Inner adaptation ---
+            adapted = copy.deepcopy(model).to(device)
+            adapted_regressor = copy.deepcopy(bp_regressor).to(device)
+            
+            adapted.train()
+            adapted_regressor.train()
+                
+            # Combine parameters for optimization
+            params_to_optimize = list(adapted.parameters())
+            params_to_optimize.extend(list(adapted_regressor.parameters()))
+                
+            inner_opt = build_inner_optimizer(
+                adapted,
+                adapted_regressor,
+                base_lr=config.get('lr_inner'),
+                config=config
+            )
+            inner_steps = config['inner_steps_max']
+            
+            for _ in range(inner_steps):
+                inner_opt.zero_grad()
+                
+                feats_s = adapted(sX)
+                out_s = adapted_regressor(feats_s)
+                    
+                loss_s = F.mse_loss(out_s, sY) if config.get("criterion") == "MSELoss" else F.smooth_l1_loss(out_s, sY)
+                
+                loss_s.backward()
+                torch.nn.utils.clip_grad_norm_(adapted.parameters(), max_norm=config['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(adapted_regressor.parameters(), max_norm=config['grad_clip'])
+                inner_opt.step()
+
+            # --- Evaluate on query ---
+            adapted.eval()
+            adapted_regressor.eval()
+                
+            with torch.no_grad():
+                feats_q = adapted(qX)
+                out_q = adapted_regressor(feats_q)
+                    
+                loss_q = F.mse_loss(out_q, qY) if config.get("criterion", "MSELoss") == "MSELoss" else F.smooth_l1_loss(out_q, qY)
+                
                 metric_values = get_metric_values(loss_q, out_q, qY, config)
-                
-                test_losses.update(metric_values['loss'], qX.size(0))
-                test_sbp_maes.update(metric_values['sbp_mae'], qX.size(0))
-                test_dbp_maes.update(metric_values['dbp_mae'], qX.size(0))
-                test_sbp_mes.update(metric_values['sbp_me'], qX.size(0))
-                test_dbp_mes.update(metric_values['dbp_me'], qX.size(0))
-                test_sbp_mae_stds.update(metric_values['sbp_mae_std'], qX.size(0))
-                test_dbp_mae_stds.update(metric_values['dbp_mae_std'], qX.size(0))
-                test_sbp_me_stds.update(metric_values['sbp_me_std'], qX.size(0))
-                test_dbp_me_stds.update(metric_values['dbp_me_std'], qX.size(0))
+            
+                if test:
+                    # Record predictions and ground truths
+                    all_test_outputs = np.concatenate((all_test_outputs, out_q.detach().cpu().numpy()), axis=0)
+                    all_test_targets = np.concatenate((all_test_targets, qY.detach().cpu().numpy()), axis=0)
 
-            else:
-                val_losses.update(loss_q.item(), qX.size(0))
+                    # Log metrics
+                    metric_values = get_metric_values(loss_q, out_q, qY, config)
+                    
+                    test_losses.update(metric_values['loss'], qX.size(0))
+                    test_sbp_maes.update(metric_values['sbp_mae'], qX.size(0))
+                    test_dbp_maes.update(metric_values['dbp_mae'], qX.size(0))
+                    test_map_maes.update(metric_values['map_mae'], qX.size(0))
+                    test_sbp_mes.update(metric_values['sbp_me'], qX.size(0))
+                    test_dbp_mes.update(metric_values['dbp_me'], qX.size(0))
+                    test_map_mes.update(metric_values['map_me'], qX.size(0))
+                    test_sbp_mae_stds.update(metric_values['sbp_mae_std'], qX.size(0))
+                    test_dbp_mae_stds.update(metric_values['dbp_mae_std'], qX.size(0))
+                    test_map_mae_stds.update(metric_values['map_mae_std'], qX.size(0))
+                    test_sbp_me_stds.update(metric_values['sbp_me_std'], qX.size(0))
+                    test_dbp_me_stds.update(metric_values['dbp_me_std'], qX.size(0))
+                    test_map_me_stds.update(metric_values['map_me_std'], qX.size(0))
+                    
+                else:
+                    val_losses.update(loss_q.item(), qX.size(0))
 
-        tasks_done += 1
-        del adapted
-        torch.cuda.empty_cache()
+            del adapted
+            del adapted_regressor
+            torch.cuda.empty_cache()
 
     if test:
+        
         # Log test metrics
-        # Note: `epoch` here is the last epoch of training, not ideal for test summary
-        writer.add_scalar('test/loss_final', test_losses.avg, config.get('max_training_epochs', 100))
-        writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, config.get('max_training_epochs', 100))
-        writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, config.get('max_training_epochs', 100))
-        writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, config.get('max_training_epochs', 100))
-        writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, config.get('max_training_epochs', 100))
-        writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, config.get('max_training_epochs', 100))
-        writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, config.get('max_training_epochs', 100))
-
+        writer.add_scalar('test/loss_final', test_losses.avg, config.get('max_training_epochs'))
+        writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_mae_final', test_map_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_me_final', test_map_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_mae_std_final', test_map_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/sbp_me_std_final', test_sbp_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/dbp_me_std_final', test_dbp_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/map_me_std_final', test_map_me_stds.avg, config['max_training_epochs'])
+        
         return all_test_targets, all_test_outputs
 
     else:
         return val_losses.avg
+    
+
+def get_meta_lr(epoch, config):
+    
+    meta_lr_schedule = config['meta_lr_schedule']
+    meta_epochs = config['max_training_epochs']
+    base_meta_lr = config['meta_lr']
+    
+    if meta_lr_schedule == 'constant':
+        return base_meta_lr
+    elif meta_lr_schedule == 'cosine':
+        return base_meta_lr * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
+    elif meta_lr_schedule == 'step':
+        lr = base_meta_lr
+        meta_lr_steps = config['meta_lr_steps']
+        meta_lr_gamma = config['meta_lr_gamma']
+    
+        for step in meta_lr_steps:
+            if epoch >= step:
+                lr *= meta_lr_gamma
+        return lr
+    elif meta_lr_schedule == 'exponential':
+        meta_lr_decay = config['meta_lr_decay']
+        
+        return base_meta_lr * (meta_lr_decay ** epoch)
+    else:
+        return base_meta_lr
+
+def get_inner_lr(epoch, config):
+    
+    inner_lr_schedule = config['inner_lr_schedule']
+    meta_epochs = config['max_training_epochs']
+    base_lr_inner = config['lr_inner']
+    inner_lr_min = config['inner_lr_min']
+    
+    if inner_lr_schedule == 'constant':
+        return base_lr_inner
+    elif inner_lr_schedule == 'cosine':
+        return inner_lr_min + (base_lr_inner - inner_lr_min) * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
+    else:
+        return base_lr_inner
+
+def get_inner_steps(epoch, config):
+    
+    meta_epochs = config['max_training_epochs']
+    inner_steps_schedule = config['inner_steps_schedule']
+    base_inner_steps = config['inner_steps']
+    inner_steps_max = config['inner_steps_max']
+    
+    if inner_steps_schedule == 'constant':
+        return base_inner_steps
+    elif inner_steps_schedule == 'increasing':
+        progress = epoch / meta_epochs
+        return int(base_inner_steps + progress * (inner_steps_max - base_inner_steps))
+    else:
+        return base_inner_steps
+
+
+# === Inner optimizer builder (two behaviors: all vs head-only) ===
+def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
+    """
+    Build inner optimizer for Reptile.
+    Behaviors:
+    - inner_adapt='all'  : adapt backbone + regressor
+    - inner_adapt='head' : freeze backbone, adapt only regressor
+    Also supports per-group LR multipliers and opt type.
+    """
+    mode = config.get('inner_adapt')   
+    opt_type = config.get('inner_opt').lower()  
+    head_mult = float(config.get('inner_head_lr_mult'))
+    bb_mult   = float(config.get('inner_backbone_lr_mult'))
+    weight_decay = float(config.get('weight_decay'))
+    momentum = float(config.get('sgd_momentum'))
+
+    # Decide which params to adapt
+    backbone_params = [p for p in adapted_model.parameters()
+                       if p.is_floating_point() or p.is_complex()]
+    head_params = [p for p in adapted_regressor.parameters()
+                   if p.is_floating_point() or p.is_complex()]
+
+    if mode == 'head':
+        # freeze backbone
+        for p in backbone_params:
+            p.requires_grad = False
+        params = [
+            {'params': head_params, 'lr': base_lr * head_mult},
+        ]
+    elif mode == 'all':
+        # train both
+        for p in backbone_params:
+            p.requires_grad = True
+        for p in head_params:
+            p.requires_grad = True
+        params = [
+            {'params': backbone_params, 'lr': base_lr * bb_mult},
+            {'params': head_params,     'lr': base_lr * head_mult},
+        ]
+    else:
+        raise ValueError("config['inner_adapt'] must be 'all' or 'head'")
+
+    # Build optimizer
+    if opt_type == 'adam':
+        inner_opt = torch.optim.Adam(params, lr=base_lr, weight_decay=weight_decay)
+    elif opt_type == 'sgd':
+        inner_opt = torch.optim.SGD(params, lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+    else:
+        raise ValueError("config['inner_opt'] must be 'adam' or 'sgd'")
+
+    return inner_opt
+    
+
+def pre_training(
+    save_name,
+    checkpoint_path,
+    writer,
+    model_name,
+    model,
+    early_stopping,
+    config,
+    device
+    ):
+    
+    # Optionally load a pretrained checkpoint
+    if config.get('pretrained_path') is not None:
+        ckpt = torch.load(config['pretrained_path'], map_location=device)
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            model_state = ckpt['model_state_dict']
+        elif isinstance(ckpt, dict) and any(k.startswith('encoder') for k in ckpt.keys()):
+            model_state = ckpt
+        else:
+            model_state = ckpt
+        
+        model.load_state_dict(model_state, strict=False)
+        print(f"[Reptile] Loaded pretrained weights (all) from {config['pretrained_path']}")
+
+    model = model.to(device)
+    
+    # ---- Pre-training task with improved loss handling ----
+    
+    pretrain_ds = PhysioDataset(
+        seed=config['seed'],
+        lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+        pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
+        fs=config['fs'],
+        input_seq_len_s=config['input_seq_len_s'],
+        ecg=config['ecg'],
+        sig2sig=config['sig2sig'],
+        bp_pattern=False,
+        min_subject_sample_number=config['min_subject_sample_number'],
+    )
+    
+    (pre_train_sampler, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
+    
+    pre_train_dataloader = DataLoader(pretrain_ds, sampler=pre_train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
+    pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+    pre_test_dataloader = DataLoader(pretrain_ds, sampler=pre_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+    
+    """
+    Two-stage supervised fine-tuning with:
+      - Stage 1: head-only training (backbone frozen)
+      - Stage 2: backbone + head with param-group LRs
+      - Cosine LR schedule per stage with linear warmup
+      - Original trainable mask to avoid unfreezing fixed params (e.g., encoder.index)
+    """
+
+    # ====== Store original trainable mask ======
+    original_trainable = {n: p.requires_grad for n, p in model.named_parameters()}
+
+    def set_requires_grad_safe(module, req, name_prefix=""):
+        """Toggle requires_grad but respect original_trainable mask when unfreezing."""
+        for n, p in module.named_parameters():
+            full_name = f"{name_prefix}.{n}" if name_prefix else n
+            if not req:  # freezing
+                p.requires_grad = False
+            else:        # unfreezing
+                if original_trainable.get(full_name, True):
+                    p.requires_grad = True
+
+    def get_backbone_and_head_params(model, regressor):
+        backbone_params, head_params = [], []
+        for _, p in model.named_parameters():
+            backbone_params.append(p)
+        for _, p in regressor.named_parameters():
+            head_params.append(p)
+        return backbone_params, head_params
+
+    def linear_warmup(current_epoch, warmup_epochs, base_lr):
+        if current_epoch >= warmup_epochs:
+            return base_lr
+        return base_lr * (0.1 + 0.9 * (current_epoch / warmup_epochs))
+
+    # ====== Common config ======
+    base_lr = config.get('base_lr')
+    backbone_lr_mul = config.get('backbone_lr_multiplier')
+    weight_decay = config.get('weight_decay')
+    grad_clip = config.get('grad_clip')
+
+    stage1_epochs = config.get('ft_stage1_epochs')
+    stage2_epochs = config.get('ft_stage2_epochs')
+    warmup_stage1 = config.get('warmup_epochs_stage1')
+    warmup_stage2 = config.get('warmup_epochs_stage2')
+
+    best_val = float("+inf")
+
+    # ====== Stage 1: Head-only ======
+    if config.get('freeze_backbone_first'):
+        if hasattr(model, 'encoder'):
+            set_requires_grad_safe(model.encoder, False, name_prefix="encoder")
+    if hasattr(model, 'channel_proj'):
+        set_requires_grad_safe(model.channel_proj, True, name_prefix="channel_proj")
+    
+    feat_dim = model.embed_dim
+    output_dim = 3  # SBP, DBP, MAP
+    bp_regressor = BPRegressor(feat_dim, output_dim).to(device)
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad] + [p for p in bp_regressor.parameters() if p.requires_grad]
+    optimizer_stage1 = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=weight_decay)
+    scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=stage1_epochs)
+
+    print(f"==== Stage 1: head-only, {stage1_epochs} epochs, base_lr={base_lr} ====")
+    for epoch in range(stage1_epochs):
+        model.train()
+        bp_regressor.train()
+        
+        # Warmup LR
+        for pg in optimizer_stage1.param_groups:
+            pg['lr'] = linear_warmup(epoch, warmup_stage1, base_lr)
+
+        train_losses = AverageMeter(name='pre_train_stage_1/train_loss')
+        for batch_idx, batch in enumerate(pre_train_dataloader):
+            signals, targets = batch
+            signals = signals.to(device)
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            targets = targets.to(device) if config['sig2sig'] else torch.cat((batch[1][0].to(device), batch[1][1].to(device), batch[1][2].to(device)), dim=-1)
+
+            optimizer_stage1.zero_grad()
+            
+            feats = model(signals)
+            outputs = bp_regressor(feats)
+
+            if config['criterion'] == 'MSELoss':
+                loss = F.mse_loss(outputs, targets)
+            elif config['criterion'] == 'SmoothL1Loss':
+                loss = F.smooth_l1_loss(outputs, targets)
+            else:
+                raise ValueError("Invalid criterion")
+
+            loss *= config.get('lambda_supervised')
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            torch.nn.utils.clip_grad_norm_(bp_regressor.parameters(), max_norm=grad_clip)
+            optimizer_stage1.step()
+
+            train_losses.update(loss.item(), signals.size(0))
+            writer.add_scalar('pre_train_stage_1/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
+
+        writer.add_scalar('pre_train_stage_1/train_loss_epoch', train_losses.avg, epoch)
+        scheduler_stage1.step()
+
+        # Validation
+        model.eval()
+        bp_regressor.eval()
+        val_losses = AverageMeter(name='pre_train_stage_1/val_loss')
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(pre_valid_dataloader):
+                signals, targets = batch
+                signals = signals.to(device)
+                if len(signals.shape) == 2:
+                    signals = signals.unsqueeze(-1)
+                targets = targets.to(device) if config['sig2sig'] else torch.cat((batch[1][0].to(device), batch[1][1].to(device), batch[1][2].to(device)), dim=-1)
+                
+                feats = model(signals)
+                outputs = bp_regressor(feats)
+                
+                vloss = F.mse_loss(outputs, targets) if config['criterion'] == 'MSELoss' else F.smooth_l1_loss(outputs, targets)
+                val_losses.update(vloss.item(), signals.size(0))
+
+        writer.add_scalar('pre_train_stage_1/val_loss_epoch', val_losses.avg, epoch)
+        print(f"[Stage1] Epoch {epoch+1}/{stage1_epochs} - Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
+
+        if val_losses.avg < best_val:
+            save_status(None, epoch, model_name + "encoder_ft_stage1", save_name, model, optimizer_stage1, scheduler_stage1, val_losses, checkpoint_path, config)
+            save_status(None, epoch, model_name + "regressor_ft_stage1", save_name, bp_regressor, optimizer_stage1, scheduler_stage1, val_losses, checkpoint_path, config)
+            
+            best_val = val_losses.avg
+
+    print(f"==== Stage 1 completed, best val loss {best_val} ====")
+
+    # Load best model
+    model = get_model_architecture(config)
+    load_status(None, model_name + "encoder_ft_stage1", save_name, model, None, None, checkpoint_path, config)
+    model = model.to(device)
+    print(f"[Reptile] Loaded encoder pretrained weights after pre-training stage 1")
+    
+    feat_dim = model.embed_dim
+    output_dim = 3  # SBP, DBP, MAP
+    bp_regressor = BPRegressor(feat_dim, output_dim)
+    load_status(None, model_name + "regressor_ft_stage1", save_name, bp_regressor, None, None, checkpoint_path, config)
+    bp_regressor = bp_regressor.to(device)
+    print(f"[Reptile] Loaded regressor pretrained weights after pre-training stage 1")
+    
+    # ====== Stage 2: Backbone + Head ======
+    lr_backbone = base_lr * backbone_lr_mul
+    set_requires_grad_safe(model.encoder, True, name_prefix="encoder")
+    set_requires_grad_safe(model.channel_proj, True, name_prefix="channel_proj")
+
+    backbone_params, head_params = get_backbone_and_head_params(model, bp_regressor)
+    backbone_params = [p for p in backbone_params if p.requires_grad]
+    head_params = [p for p in head_params if p.requires_grad]
+
+    optimizer_stage2 = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': lr_backbone},
+        {'params': head_params, 'lr': base_lr}
+    ], weight_decay=weight_decay)
+    scheduler_stage2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage2, T_max=stage2_epochs)
+
+    best_val = float("+inf")
+    print(f"==== Stage 2: fine-tune backbone, {stage2_epochs} epochs, head_lr={base_lr}, backbone_lr={lr_backbone} ====")
+    for epoch in range(stage2_epochs):
+        model.train()
+        bp_regressor.train()
+        
+        # Warmup
+        for i, pg in enumerate(optimizer_stage2.param_groups):
+            target_lr = base_lr if i == 1 else lr_backbone
+            pg['lr'] = linear_warmup(epoch, warmup_stage2, target_lr)
+
+        train_losses = AverageMeter(name='pre_train_stage_2/train_loss')
+        for batch_idx, batch in enumerate(pre_train_dataloader):
+            signals, targets = batch
+            signals = signals.to(device)
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            targets = targets.to(device) if config['sig2sig'] else torch.cat((batch[1][0].to(device), batch[1][1].to(device), batch[1][2].to(device)), dim=-1)
+
+            optimizer_stage2.zero_grad()
+            
+            feats = model(signals)
+            outputs = bp_regressor(feats)
+            
+            if config['criterion'] == 'MSELoss':
+                loss = F.mse_loss(outputs, targets)
+            elif config['criterion'] == 'SmoothL1Loss':
+                loss = F.smooth_l1_loss(outputs, targets)
+            else:
+                raise ValueError("Invalid criterion")
+
+            loss *= config.get('lambda_supervised', 1.0)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            torch.nn.utils.clip_grad_norm_(bp_regressor.parameters(), max_norm=grad_clip)
+            optimizer_stage2.step()
+
+            train_losses.update(loss.item(), signals.size(0))
+            writer.add_scalar('pre_train_stage_2/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
+
+        writer.add_scalar('pre_train_stage_2/train_loss_epoch', train_losses.avg, epoch)
+        scheduler_stage2.step()
+
+        # Validation
+        model.eval()
+        bp_regressor.eval()
+        val_losses = AverageMeter(name='pre_train_stage_2/val_loss')
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(pre_valid_dataloader):
+                signals, targets = batch
+                signals = signals.to(device)
+                if len(signals.shape) == 2:
+                    signals = signals.unsqueeze(-1)
+                targets = targets.to(device) if config['sig2sig'] else torch.cat((batch[1][0].to(device), batch[1][1].to(device), batch[1][2].to(device)), dim=-1)
+                
+                feats = model(signals)
+                outputs = bp_regressor(feats)
+                
+                vloss = F.mse_loss(outputs, targets) if config['criterion'] == 'MSELoss' else F.smooth_l1_loss(outputs, targets)
+                val_losses.update(vloss.item(), signals.size(0))
+
+        writer.add_scalar('pre_train_stage_2/val_loss_epoch', val_losses.avg, epoch)
+        print(f"[Stage2] Epoch {epoch+1}/{stage2_epochs} - Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
+
+        if val_losses.avg < best_val:
+            save_status(None, epoch, model_name + "encoder_ft_stage2", save_name, model, optimizer_stage2, scheduler_stage2, val_losses, checkpoint_path, config)
+            save_status(None, epoch, model_name + "regressor_ft_stage2", save_name, bp_regressor, optimizer_stage2, scheduler_stage2, val_losses, checkpoint_path, config)
+            
+            best_val = val_losses.avg
+
+        if config['es_enable']:
+            early_stopping(val_losses.avg)
+            if early_stopping.early_stop:
+                print("Early stopping Stage 2")
+                break
+            
+    # ====== Final test ======
+    # Load best model
+    model = get_model_architecture(config)
+    load_status(None, model_name + "encoder_ft_stage2", save_name, model, None, None, checkpoint_path, config)
+    model = model.to(device)
+    
+    feat_dim = model.embed_dim
+    output_dim = 3  # SBP, DBP, MAP
+    bp_regressor = BPRegressor(feat_dim, output_dim)
+    load_status(None, model_name + "regressor_ft_stage2", save_name, bp_regressor, None, None, checkpoint_path, config)
+    bp_regressor = bp_regressor.to(device)    
+    
+    # Meters    
+    test_losses = AverageMeter(name='pre_train_test/loss')
+    test_sbp_maes = AverageMeter(name='pre_train_test/sbp_mae')
+    test_dbp_maes = AverageMeter(name='pre_train_test/dbp_mae')
+    test_map_maes = AverageMeter(name='pre_train_test/map_mae')
+    test_sbp_mes = AverageMeter(name='pre_train_test/sbp_me')
+    test_dbp_mes = AverageMeter(name='pre_train_test/dbp_me')
+    test_map_mes = AverageMeter(name='pre_train_test/map_me')
+    test_sbp_mae_stds = AverageMeter(name='pre_train_test/sbp_mae_std')
+    test_dbp_mae_stds = AverageMeter(name='pre_train_test/dbp_mae_std')
+    test_map_mae_stds = AverageMeter(name='pre_train_test/map_mae_std')
+    test_sbp_me_stds = AverageMeter(name='pre_train_test/sbp_me_std')
+    test_dbp_me_stds = AverageMeter(name='pre_train_test/dbp_me_std')
+    test_map_me_stds = AverageMeter(name='pre_train_test/map_me_std')
+    
+    # Record outputs and targets
+    if config['sig2sig']:
+        all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+        all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float)
+    else:
+        all_test_outputs = np.empty((0, 3), dtype=float) # Assuming SBP/DBP/MAP output shape is 3
+        all_test_targets = np.empty((0, 3), dtype=float)
+        
+    model.eval()
+    bp_regressor.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(pre_test_dataloader):
+            
+            signals, targets = batch
+            signals = signals.to(device)
+            
+            if len(signals.shape) == 2:
+                signals = signals.unsqueeze(-1)
+            
+            targets = targets.to(device) if config['sig2sig'] else torch.cat((batch[1][0].to(device), batch[1][1].to(device), batch[1][2].to(device)), dim=-1)
+            
+            feats = model(signals)
+            outputs = bp_regressor(feats)
+            
+            # Supervised loss (for metric logging)
+            if config['criterion'] == 'MSELoss':
+                test_loss = F.mse_loss(outputs, targets)
+            elif config['criterion'] == 'SmoothL1Loss':
+                test_loss = F.smooth_l1_loss(outputs, targets)
+            else:
+                raise ValueError("Invalid criterion ...")
+
+            # Record predictions and ground truths
+            all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
+            all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
+
+            # Log metrics
+            metric_values = get_metric_values(test_loss, outputs, targets, config)
+            
+            test_losses.update(metric_values['loss'], signals.size(0))
+            test_sbp_maes.update(metric_values['sbp_mae'], signals.size(0))
+            test_dbp_maes.update(metric_values['dbp_mae'], signals.size(0))
+            test_map_maes.update(metric_values['map_mae'], signals.size(0))
+            test_sbp_mes.update(metric_values['sbp_me'], signals.size(0))
+            test_dbp_mes.update(metric_values['dbp_me'], signals.size(0))
+            test_map_mes.update(metric_values['map_me'], signals.size(0))
+            test_sbp_mae_stds.update(metric_values['sbp_mae_std'], signals.size(0))
+            test_dbp_mae_stds.update(metric_values['dbp_mae_std'], signals.size(0))
+            test_map_mae_stds.update(metric_values['map_mae_std'], signals.size(0))
+            test_sbp_me_stds.update(metric_values['sbp_me_std'], signals.size(0))
+            test_dbp_me_stds.update(metric_values['dbp_me_std'], signals.size(0))
+            test_map_me_stds.update(metric_values['map_me_std'], signals.size(0))
+
+
+    # Log test metrics
+    # Note: `epoch` here is the last epoch of training, not ideal for test summary
+    writer.add_scalar('pre_train_test/loss_final', test_losses.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/sbp_mae_final', test_sbp_maes.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/dbp_mae_final', test_dbp_maes.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/map_mae_final', test_map_maes.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/sbp_me_final', test_sbp_mes.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/dbp_me_final', test_dbp_mes.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/map_me_final', test_map_mes.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/map_mae_std_final', test_map_mae_stds.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/sbp_me_std_final', test_sbp_me_stds.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/dbp_me_std_final', test_dbp_me_stds.avg, config['ft_stage2_epochs'])
+    writer.add_scalar('pre_train_test/map_me_std_final', test_map_me_stds.avg, config['ft_stage2_epochs'])
+    
+    # Log test metrics (optionally, plot them) and return loss for validation
+    _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'pretraining_supervised_stage'), plot=True)    
+    
+    print(f"==== Stage 2 completed ====")
 
 def reptile_meta_training(
     save_name,
@@ -844,186 +1916,79 @@ def reptile_meta_training(
     val_dataloader,
     test_dataloader,
     early_stopping,
-    optimizer,          # unused here, kept for API parity
-    scheduler,          # unused here
     config,
     device
 ):
-    """
-    Enhanced Reptile meta-training loop with sophisticated scheduling.
-    - train_dataloader yields tasks: ((Xs, Ys), (Xq, Yq), pid) where support/query have shapes (k,C,T)/(k,T)
-    - meta-batching supported by setting DataLoader(batch_size > 1).
-    - Enhanced scheduling options for both outer and inner loops
-    """
+    
+    #pre_training(save_name, checkpoint_path, writer, model_name, model, early_stopping, config, device)
+
+    # Load best model after pre-training
+    #model = get_model_architecture(config)
+    #load_status(None, model_name + "encoder_ft_stage2", save_name, model, None, None, checkpoint_path, config)
+    #model = model.to(device)
+    #print(f"[Reptile] Loaded encoder pretrained weights after pre-training stage 2")
+    #
+    #feat_dim = model.embed_dim
+    #output_dim = 3  # SBP, DBP, MAP
+    #bp_regressor = BPRegressor(feat_dim, output_dim)
+    #load_status(None, model_name + "regressor_ft_stage2", save_name, bp_regressor, None, None, checkpoint_path, config)
+    #bp_regressor = bp_regressor.to(device)
+    #print(f"[Reptile] Loaded regressor pretrained weights after pre-training stage 2")
+    
+    # Load best model
+    model = get_model_architecture(config)
+    checkpoint = torch.load('/data/users/mgaspari/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTencoder_ft_stage2', weights_only=False)
+    model.load_state_dict(checkpoint['model'])
+    model = model.to(device)
+    
+    feat_dim = model.embed_dim
+    output_dim = 3  # SBP, DBP, MAP
+    bp_regressor = BPRegressor(feat_dim, output_dim)
+    checkpoint = torch.load('/data/users/mgaspari/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTregressor_ft_stage2', weights_only=False)
+    bp_regressor.load_state_dict(checkpoint['model']) # N.B. look at the save_status keys, using model as key for the checkpoint is correct to restore'
+    bp_regressor = bp_regressor.to(device)
+    print("Loaded chckpoints")
+    
+    # ==== Meta-learning (Reptile) Stage ====
+    
+    # ---- Setup ----
     
     # Hyperparams / defaults
     meta_epochs = config.get('max_training_epochs')
-    base_meta_lr = config.get('meta_lr')
-    base_inner_steps = config.get('inner_steps')
-    base_lr_inner = config.get('lr_inner')
     meta_val_tasks = config.get('meta_val_tasks')
+    grad_clip_norm = config['grad_clip']
     
-    # Enhanced scheduling parameters
-    meta_lr_schedule = config.get('meta_lr_schedule')  # 'constant', 'cosine', 'step', 'exponential'
-    inner_lr_schedule = config.get('inner_lr_schedule')  # 'constant', 'cosine', 'adaptive'
-    inner_steps_schedule = config.get('inner_steps_schedule')  # 'constant', 'increasing', 'adaptive'
-    
-    # Schedule-specific parameters
-    meta_lr_decay = config.get('meta_lr_decay')  # for exponential decay
-    meta_lr_steps = config.get('meta_lr_steps')  # for step decay
-    meta_lr_gamma = config.get('meta_lr_gamma')  # step decay factor
-    
-    inner_lr_min = config.get('inner_lr_min')
-    inner_steps_max = config.get('inner_steps_max')
-    
-    # Adaptive scheduling parameters
-    patience_adaptive = config.get('adaptive_patience')
-    adaptive_factor = config.get('adaptive_factor')
-    val_loss_history = []
-    no_improvement_count = 0
-
-    def get_meta_lr(epoch):
-        """Get meta learning rate based on schedule."""
-        if meta_lr_schedule == 'constant':
-            return base_meta_lr
-        elif meta_lr_schedule == 'cosine':
-            return base_meta_lr * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
-        elif meta_lr_schedule == 'step':
-            lr = base_meta_lr
-            for step in meta_lr_steps:
-                if epoch >= step:
-                    lr *= meta_lr_gamma
-            return lr
-        elif meta_lr_schedule == 'exponential':
-            return base_meta_lr * (meta_lr_decay ** epoch)
-        else:
-            return base_meta_lr
-
-    def get_inner_lr(epoch, val_loss=None):
-        """Get inner learning rate based on schedule."""
-        nonlocal no_improvement_count
-        
-        if inner_lr_schedule == 'constant':
-            return base_lr_inner
-        elif inner_lr_schedule == 'cosine':
-            return inner_lr_min + (base_lr_inner - inner_lr_min) * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
-        elif inner_lr_schedule == 'adaptive':
-            if val_loss is not None and len(val_loss_history) > 0:
-                if val_loss >= min(val_loss_history):
-                    no_improvement_count += 1
-                else:
-                    no_improvement_count = 0
-                
-                if no_improvement_count >= patience_adaptive:
-                    return max(base_lr_inner * (adaptive_factor ** (no_improvement_count // patience_adaptive)), inner_lr_min)
-            return base_lr_inner
-        else:
-            return base_lr_inner
-
-    def get_inner_steps(epoch, val_loss=None):
-        """Get number of inner steps based on schedule."""
-        if inner_steps_schedule == 'constant':
-            return base_inner_steps
-        elif inner_steps_schedule == 'increasing':
-            # Linearly increase inner steps over epochs
-            progress = epoch / meta_epochs
-            return int(base_inner_steps + progress * (inner_steps_max - base_inner_steps))
-        elif inner_steps_schedule == 'adaptive':
-            if val_loss is not None and len(val_loss_history) > 1:
-                # Increase steps if validation loss is not improving
-                recent_improvement = val_loss < min(val_loss_history[-5:]) if len(val_loss_history) >= 5 else True
-                if not recent_improvement:
-                    return min(base_inner_steps + 2, inner_steps_max)
-            return base_inner_steps
-        else:
-            return base_inner_steps
-
-    # Optionally load a pretrained checkpoint
-    if config.get('pretrained_path') is not None:
-        ckpt = torch.load(config['pretrained_path'], map_location=device)
-        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-            model_state = ckpt['model_state_dict']
-        elif isinstance(ckpt, dict) and any(k.startswith('encoder') for k in ckpt.keys()):
-            model_state = ckpt
-        else:
-            model_state = ckpt
-        
-        scope = config.get('pretrained_scope')
-        
-        model.load_state_dict(model_state, strict=False)
-        print(f"[Reptile] Loaded pretrained weights (all) from {config['pretrained_path']}")
-
-    model = model.to(device)
-    
-    # Keep meta-params as an explicit dict
+    # Keep meta-params as an explicit dict (include regressor)
     meta_params = {n: p.detach().clone().to(device) for n, p in model.named_parameters()}
+    regressor_meta_params = {f"regressor.{n}": p.detach().clone().to(device) for n, p in bp_regressor.named_parameters()}
+    meta_params.update(regressor_meta_params)
     
     # Initialize first-order approximation option (faster Reptile variant)
-    use_first_order = config.get('first_order_reptile')
+    use_first_order = config.get('first_order_reptile', True)
     
-    best_val = float("+inf")
+    # Enhanced scheduling parameters (keeping existing functionality)
+    meta_lr_schedule = config.get('meta_lr_schedule')
+    inner_lr_schedule = config.get('inner_lr_schedule')
+    inner_steps_schedule = config.get('inner_steps_schedule')
     
-    print(f"[Reptile] Starting meta-training with schedules:")
+    print(f"==== Stage 3 Starting meta-training with schedules ====")
     print(f"  - Meta LR schedule: {meta_lr_schedule}")
     print(f"  - Inner LR schedule: {inner_lr_schedule}")
     print(f"  - Inner steps schedule: {inner_steps_schedule}")
     print(f"  - First-order approximation: {use_first_order}")
     
-    # === Inner optimizer builder with per-parameter LRs and optional ANIL ===
-    def build_inner_optimizer(adapted_model, base_lr, cfg):
-        
-        anil = cfg.get('anil_head_only', False)
-        head_tokens = set(cfg.get('head_name_tokens'))
-        last_tokens = set(cfg.get('last_block_tokens'))
-        
-        # First pass: identify which parameters to optimize
-        params_to_optimize = []
-        for name, p in adapted_model.named_parameters():
-            if not p.requires_grad:
-                continue
-                
-            # For ANIL, only include head parameters
-            if anil:
-                if any(tok in name for tok in head_tokens):
-                    params_to_optimize.append((name, p))
-                else:
-                    # Freeze non-head parameters for ANIL
-                    p.requires_grad = False
-            else:
-                # Regular Reptile: include all trainable parameters
-                params_to_optimize.append((name, p))
-        
-        # Second pass: create parameter groups with different learning rates
-        groups = []
-        for name, p in params_to_optimize:
-            if any(tok in name for tok in head_tokens):
-                mult = cfg.get('inner_head_lr_mult')
-            elif any(tok in name for tok in last_tokens):
-                mult = cfg.get('inner_last_block_lr_mult')
-            else:
-                mult = cfg.get('inner_backbone_lr_mult', cfg.get('backbone_lr_multiplier'))
-            
-            groups.append({'params': [p], 'lr': base_lr * float(mult)})
-        
-        # Fallback: if no groups created, use all trainable parameters
-        if not groups:
-            all_params = [p for p in adapted_model.parameters() if p.requires_grad]
-            if all_params:
-                groups = [{'params': all_params, 'lr': base_lr}]
-            else:
-                raise RuntimeError("No trainable parameters found for inner optimization!")
-        
-        return torch.optim.SGD(groups, momentum=0.0)
-
+    best_val = float("+inf")
+    global_step = 0  # define once before training loop
 
     # Outer loop: epochs
     for epoch in range(meta_epochs):
         model.train()
+        bp_regressor.train()
         
         # Get current hyperparameters based on schedules
-        current_meta_lr = get_meta_lr(epoch)
-        current_inner_lr = get_inner_lr(epoch)
-        current_inner_steps = get_inner_steps(epoch)
+        current_meta_lr = get_meta_lr(epoch, config)
+        current_inner_lr = get_inner_lr(epoch, config)
+        current_inner_steps = get_inner_steps(epoch, config)
         
         epoch_query_loss_meter = AverageMeter(name='meta/train_query_loss')
         epoch_support_loss_meter = AverageMeter(name='meta/train_support_loss')
@@ -1032,121 +1997,143 @@ def reptile_meta_training(
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
         writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
         writer.add_scalar('meta/inner_steps', current_inner_steps, epoch)
-        
+                
         # Iterate over tasks provided by train_dataloader
         for batch_idx, batch in enumerate(train_dataloader):
             (Xs, Ys), (Xq, Yq), pid = batch
-
-            # Ensure meta-batch dim exists
-            Xs = _ensure_meta_batch(Xs).to(device).float()
-            Xq = _ensure_meta_batch(Xq).to(device).float()
-
-            if isinstance(Ys, list):
-                Ys = [_ensure_meta_batch(y).to(device).float() for y in Ys]
-                Yq = [_ensure_meta_batch(y).to(device).float() for y in Yq]
-            else:
-                Ys = _ensure_meta_batch(Ys).to(device).float()
-                Yq = _ensure_meta_batch(Yq).to(device).float()
-                
             meta_batch = Xs.shape[0]
-            
+
             # Accumulate parameter deltas across tasks
             acc_deltas = {k: torch.zeros_like(v) for k, v in meta_params.items()}
             task_query_losses = []
             task_support_losses = []
+            task_query_pre_losses = []   # NEW: pre-adaptation query loss per task
 
             for t in range(meta_batch):
                 # Extract task-specific support/query
-                sX = Xs[t]
-                qX = Xq[t]
-                if isinstance(Ys, list):
-                    sY = [y[t] for y in Ys]
-                    qY = [y[t] for y in Yq]
-                else:
-                    sY = Ys[t]
-                    qY = Yq[t]
+                sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
+                qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
 
                 # Create adapted model copy for this task
                 adapted = copy.deepcopy(model).to(device)
-                adapted.train()
-                
-                # Inner optimizer with current learning rate
-                inner_opt = build_inner_optimizer(adapted, current_inner_lr, config)
+                adapted_regressor = copy.deepcopy(bp_regressor).to(device)
+                adapted.train(), adapted_regressor.train()
 
-                # Inner loop: adapt to support with current number of steps
+                inner_opt = build_inner_optimizer(adapted, adapted_regressor, current_inner_lr, config)
+
                 support_losses = []
+
+                # --------------------
+                # Query loss before adaptation (step 0)
+                with torch.no_grad():
+                    feats_q0 = adapted(qX)
+                    out_q0 = adapted_regressor(feats_q0)
+                    loss_q0 = F.smooth_l1_loss(out_q0, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q0, qY)
+                task_query_pre_losses.append(loss_q0.item())
+                # --------------------
+
+                # Inner loop: adapt to support
                 for step in range(current_inner_steps):
                     inner_opt.zero_grad()
-                    out_s = adapted(sX)
-                    loss_s = _compute_supervised_loss(out_s, sY.squeeze(0), config)
-                    
+                    feats_s = adapted(sX)
+                    out_s = adapted_regressor(feats_s)
+                    loss_s = F.smooth_l1_loss(out_s, sY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_s, sY)
+                    loss_s.backward()
+
+                    # Log gradient norm before clipping
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        list(adapted.parameters()) + list(adapted_regressor.parameters()), grad_clip_norm
+                    )
+                    writer.add_scalar("inner/grad_norm", total_norm.item(), global_step)
+
+                    # Update params (first-order or standard reptile)
                     if not use_first_order:
-                        # Standard Reptile: compute gradients and update
-                        loss_s.backward()
                         inner_opt.step()
                     else:
-                        # First-order approximation: detach gradients
-                        loss_s.backward()
                         with torch.no_grad():
-                            for param in adapted.parameters():
+                            for param in list(adapted.parameters()) + list(adapted_regressor.parameters()):
                                 if param.grad is not None:
                                     param.data -= current_inner_lr * param.grad.data
                         inner_opt.zero_grad()
-                    
-                    support_losses.append(loss_s.item())
 
-                # Evaluate adapted model on query (for logging)
-                adapted.eval()
+                    support_losses.append(loss_s.item())
+                    # Log per-inner-step support loss
+                    writer.add_scalar(f"inner/support_loss_step{step}", loss_s.item(), global_step)
+
+                # Evaluate adapted model on query (after adaptation)
+                adapted.eval(), adapted_regressor.eval()
                 with torch.no_grad():
-                    out_q = adapted(qX)
-                    loss_q = _compute_supervised_loss(out_q, qY.squeeze(0), config)
-                
+                    feats_q = adapted(qX)
+                    out_q = adapted_regressor(feats_q)
+                    loss_q = F.smooth_l1_loss(out_q, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q, qY)
+
                 task_query_losses.append(loss_q.item())
                 task_support_losses.append(np.mean(support_losses))
+
                 epoch_query_loss_meter.update(loss_q.item(), 1)
                 epoch_support_loss_meter.update(np.mean(support_losses), 1)
 
-                # Collect adapted parameters and compute delta
+                # Compute parameter delta norm for this task
                 for n, p in adapted.named_parameters():
-                    acc_deltas[n] += (p.detach() - meta_params[n])
+                    if n in meta_params:
+                        delta = (p.detach() - meta_params[n])
+                        acc_deltas[n] += delta
+
+                for n, p in adapted_regressor.named_parameters():
+                    reg_key = f"regressor.{n}"
+                    if reg_key in meta_params:
+                        delta = (p.detach() - meta_params[reg_key])
+                        acc_deltas[reg_key] += delta
+                        
+                delta_norm = torch.sqrt(sum((d**2).sum() for d in acc_deltas.values()))
+                writer.add_scalar("meta/task_delta_norm", delta_norm, global_step)
 
                 # Free memory
-                del adapted
+                del adapted, adapted_regressor
                 torch.cuda.empty_cache()
 
-            # Average deltas over tasks in meta-batch and take a meta step
+            # Average deltas over tasks and meta-update
             for k in meta_params:
                 avg_delta = acc_deltas[k] / float(meta_batch)
                 meta_params[k] = meta_params[k] + current_meta_lr * avg_delta
 
-            # Load updated meta params back into model
+            # Load updated params back
             with torch.no_grad():
                 for n, p in model.named_parameters():
-                    p.copy_(meta_params[n])
+                    if n in meta_params:
+                        p.copy_(meta_params[n])
+                for n, p in bp_regressor.named_parameters():
+                    reg_key = f"regressor.{n}"
+                    if reg_key in meta_params:
+                        p.copy_(meta_params[reg_key])
 
-            # Logging per-step
-            if (batch_idx + 1) % config.get('meta_log_step') == 0:
+            global_step += 1
+            
+            # Logging per meta step
+            if (batch_idx + 1) % config.get('meta_log_step', 50) == 0:
                 avg_q = float(np.mean(task_query_losses))
                 avg_s = float(np.mean(task_support_losses))
+                avg_q0 = float(np.mean(task_query_pre_losses))   # NEW: query pre-adaptation avg
+
                 step_idx = epoch * len(train_dataloader) + batch_idx
                 writer.add_scalar('meta/train_query_loss_step', avg_q, step_idx)
                 writer.add_scalar('meta/train_support_loss_step', avg_s, step_idx)
+                writer.add_scalar('meta/train_query_pre_loss_step', avg_q0, step_idx)
+                writer.add_histogram("meta/task_query_losses", torch.tensor(task_query_losses), step_idx)
+
                 print(f"[Meta] Epoch {epoch+1} Step {batch_idx+1}/{len(train_dataloader)} - "
-                      f"support_loss {avg_s:.6f}, query_loss {avg_q:.6f} "
-                      f"(meta_lr={current_meta_lr:.6f}, inner_lr={current_inner_lr:.6f}, inner_steps={current_inner_steps})")
+                    f"support_loss {avg_s:.6f}, query_loss_pre {avg_q0:.6f}, query_loss_post {avg_q:.6f} "
+                    f"(meta_lr={current_meta_lr:.6f}, inner_lr={current_inner_lr:.6f}, inner_steps={current_inner_steps})")
+
 
         # End epoch: run validation on val tasks
         val_loss = evaluate_meta_with_bp_metrics(
-            model, val_dataloader, device, config, 
-            current_inner_steps, current_inner_lr, 
-            n_tasks_eval=meta_val_tasks
+            model, 
+            bp_regressor, 
+            val_dataloader, 
+            device, 
+            config
         )
-        
-        val_loss_history.append(val_loss)
-        
-        # Update adaptive schedules based on validation performance
-        current_inner_lr = get_inner_lr(epoch, val_loss)
-        current_inner_steps = get_inner_steps(epoch, val_loss)
         
         writer.add_scalar('meta/val_loss_epoch', val_loss, epoch)
         writer.add_scalar('meta/train_query_loss_epoch', epoch_query_loss_meter.avg, epoch)
@@ -1159,10 +2146,18 @@ def reptile_meta_training(
 
         # Save best model according to validation loss
         if val_loss < best_val:
-            save_status(None, epoch, model_name, save_name, model, None, None, 
-                       epoch_query_loss_meter, checkpoint_path, config)
+            # Save both model and regressor
+            save_ckpt = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'bp_regressor_state_dict': bp_regressor.state_dict(),
+                'config': config,
+                'val_loss': val_loss
+            }
+            best_model_path = os.path.join(checkpoint_path, f"{save_name}_best_meta")
+            torch.save(save_ckpt, best_model_path)
             best_val = val_loss
-            print(f"[Meta] New best validation loss: {val_loss:.6f}")
+            print(f"[Meta] New best validation loss: {val_loss:.6f}, saved to {best_model_path}")
 
         # Early stopping if configured
         if config.get('es_enable', False):
@@ -1174,19 +2169,539 @@ def reptile_meta_training(
     # After meta-training, run final test evaluation
     print(f"[Meta] Starting final test evaluation with best model...")
     
-    # Load best model
-    model = get_model_architecture(config)
-    load_status(None, model_name, save_name, model, None, None, checkpoint_path, config)
+    # Load best model and regressor
+    best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_meta"), weights_only=False)
+    model.load_state_dict(best_ckpt['model_state_dict'])
+    bp_regressor.load_state_dict(best_ckpt['bp_regressor_state_dict'])
     model = model.to(device)
+    bp_regressor = bp_regressor.to(device)
     
     all_test_targets, all_test_outputs = evaluate_meta_with_bp_metrics(
-        model, test_dataloader, device, config, 
-        base_inner_steps, base_lr_inner,  # Use base values for final test
-        n_tasks_eval=config.get('meta_test_tasks'), 
-        test=True, writer=writer
+        model, 
+        bp_regressor, 
+        test_dataloader, 
+        device, 
+        config, 
+        test=True, 
+        writer=writer
     )
     
+    # Log test metrics (optionally, plot them) and return loss for validation
+    _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'pretraining_meta_stage'), plot=True)  
+    
     writer.close()
+    
+
+
+class MemoryModule(nn.Module):
+    """
+    Memory-Augmented Neural Network memory module for physiological signal processing.
+    """
+    def __init__(self, memory_size, memory_dim, feature_dim):
+        super(MemoryModule, self).__init__()
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+        self.feature_dim = feature_dim
+        
+        # Memory matrix [memory_size, memory_dim]
+        # memory_dim = feature_dim + output_dim (256 + 3 for features + SBP/DBP/MAP)
+        self.register_buffer('memory', torch.randn(memory_size, memory_dim) * 0.1)
+        self.register_buffer('memory_age', torch.zeros(memory_size))  # For memory management
+        
+        # Controllers for memory operations
+        self.read_controller = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, memory_size),
+            nn.Softmax(dim=-1)
+        )
+        
+        self.write_controller = nn.Sequential(
+            nn.Linear(feature_dim + 3, 128),  # features + BP values
+            nn.ReLU(),
+            nn.Linear(128, memory_size),
+            nn.Softmax(dim=-1)
+        )
+        
+        # Value predictor using memory content
+        self.value_predictor = nn.Sequential(
+            nn.Linear(feature_dim + memory_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)  # SBP, DBP, MAP
+        )
+    
+    def read(self, features):
+        """
+        Read from memory based on input features.
+        Returns:
+            read_content: [batch_size, memory_dim]
+        """
+        batch_size = features.size(0)
+
+        # Compute attention weights for each sample in batch
+        read_weights = self.read_controller(features)  # [batch_size, memory_size]
+
+        # IMPORTANT: use a detached clone of the memory for read so subsequent in-place writes
+        # won't modify the tensor that participated in the forward graph.
+        # detach() ensures no grad, clone() ensures new storage.
+        memory_for_read = self.memory.unsqueeze(0).expand(batch_size, -1, -1).detach().clone()
+
+        # Read from memory using attention
+        read_content = torch.bmm(
+            read_weights.unsqueeze(1),          # [batch_size, 1, memory_size]
+            memory_for_read                     # [batch_size, memory_size, memory_dim] (detached clone)
+        ).squeeze(1)  # [batch_size, memory_dim]
+
+        return read_content, read_weights
+
+    def write(self, features, targets):
+        """
+        Write new experience to memory.
+        features: [batch_size, feature_dim]  - NOTE: caller should pass detached features
+        targets: [batch_size, 3]
+        """
+        batch_size = features.size(0)
+
+        # Create memory content to write
+        write_content = torch.cat([features, targets], dim=-1)  # [batch_size, memory_dim]
+
+        # Compute write weights. Because we expect features to be detached before write,
+        # write_controller shouldn't be part of the gradient graph. Still, we prevent grad tracking here.
+        with torch.no_grad():
+            write_weights = self.write_controller(write_content)  # [batch_size, memory_size]
+
+            # Update memory using weighted write — pick the highest weight slot per sample.
+            # Use .item() to get a python int for indexing (avoid autograd involvement).
+            for i in range(batch_size):
+                slot_idx = int(torch.argmax(write_weights[i]).item())
+                # assign in no_grad (safe)
+                self.memory[slot_idx] = write_content[i]
+                self.memory_age[slot_idx] = 0  # Reset age
+
+            # Age all other memory slots (in-place but under no_grad)
+            self.memory_age += 1
+
+    def clear_old_memories(self, max_age=1000):
+        """
+        Clear old memories to prevent stagnation.
+        """
+        with torch.no_grad():
+            old_mask = self.memory_age > max_age
+            if old_mask.any():
+                self.memory[old_mask] = torch.randn_like(self.memory[old_mask]) * 0.1
+                self.memory_age[old_mask] = 0
+    
+    def predict(self, features):
+        """
+        Predict BP values using features and memory.
+        """
+        read_content, _ = self.read(features)
+        combined = torch.cat([features, read_content], dim=-1)
+        return self.value_predictor(combined)
+
+
+class MANNBPEstimator(nn.Module):
+    """
+    Complete MANN-based blood pressure estimator.
+    """
+    def __init__(self, backbone_model, memory_size=2000, feature_dim=256):
+        super(MANNBPEstimator, self).__init__()
+        self.backbone = backbone_model
+        self.memory = MemoryModule(memory_size, feature_dim + 3, feature_dim)
+        
+    def forward(self, x, update_memory=False, targets=None):
+        """
+        Forward pass with optional memory update.
+        """
+        # Extract features using backbone
+        features = self.backbone(x)  # [batch_size, feature_dim]
+        
+        # Predict using memory
+        predictions = self.memory.predict(features)
+        
+        # Update memory if training and targets provided
+        if update_memory and targets is not None:
+            self.memory.write(features.detach(), targets)
+        
+        return predictions
+
+
+def mann_meta_training(
+    save_name,
+    checkpoint_path,
+    writer,
+    model_name,
+    model,
+    train_dataloader,
+    val_dataloader,
+    test_dataloader,
+    early_stopping,
+    config,
+    device
+):
+    """
+    Memory-Augmented Neural Network meta-training replacement for Reptile.
+    Maintains the same interface but uses continuous memory-based learning.
+    """
+    
+    # Load pretrained weights (same as your original code)
+    model = get_model_architecture(config)
+    checkpoint = torch.load('/home/michele/Documents/ContinualBP/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTencoder_ft_stage2', weights_only=False)
+    model.load_state_dict(checkpoint['model'])
+    model = model.to(device)
+    
+    feat_dim = model.embed_dim
+    #bp_regressor = BPRegressor(feat_dim, 3)  # SBP, DBP, MAP
+    #checkpoint = torch.load('/home/michele/Documents/ContinualBP/checkpoints/biot_reptile_w_pre_train/biot_reptile_w_pre_train-BIOT-2025_08_28-13_23_50/biot_reptile_w_pre_train/ckpt/BIOTregressor_ft_stage2', weights_only=False)
+    #bp_regressor.load_state_dict(checkpoint['model'])
+    #bp_regressor = bp_regressor.to(device)
+    print("Loaded checkpoints")
+    
+    # Create MANN model
+    memory_size = config.get('memory_size')
+    mann_model = MANNBPEstimator(model, memory_size, feat_dim).to(device)
+    
+    # Setup optimizer for MANN (simpler than meta-learning)
+    base_lr = config.get('mann_lr')
+    weight_decay = config.get('weight_decay')
+    
+    # Separate learning rates for backbone and memory components
+    backbone_params = list(mann_model.backbone.parameters())
+    memory_params = list(mann_model.memory.parameters())
+    
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': base_lr * config.get('mann_backbone_lr_mult')},
+        {'params': memory_params, 'lr': base_lr}
+    ], weight_decay=weight_decay)
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=config.get('max_training_epochs')
+    )
+    
+    print(f"==== Starting MANN meta-training ====")
+    print(f"  - Memory size: {memory_size}")
+    print(f"  - Base learning rate: {base_lr}")
+    print(f"  - Backbone LR multiplier: {config.get('mann_backbone_lr_mult')}")
+    
+    best_val = float("+inf")
+    meta_epochs = config.get('max_training_epochs')
+    
+    # Training loop
+    for epoch in range(meta_epochs):
+        mann_model.train()
+        
+        epoch_train_loss = AverageMeter(name='mann/train_loss')
+        
+        # Training phase
+        for batch_idx, batch in enumerate(train_dataloader):
+            optimizer.zero_grad()
+            
+            (Xs, Ys), (Xq, Yq), pid = batch
+            
+            # Process support and query sets together for memory learning
+            # Support set: learn and update memory
+            # Query set: test memory retrieval
+            
+            support_loss = 0.0
+            query_loss = 0.0
+            
+            meta_batch = Xs.shape[0]
+            
+            for t in range(meta_batch):
+                
+                sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
+                qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
+                
+                # Phase 1: Learn from support set and update memory
+                support_pred = mann_model(sX, update_memory=True, targets=sY)
+                
+                if config['criterion'] == 'MSELoss':
+                    s_loss = F.mse_loss(support_pred, sY)
+                elif config['criterion'] == 'SmoothL1Loss':
+                    s_loss = F.smooth_l1_loss(support_pred, sY)
+                else:
+                    raise ValueError("Invalid criterion")
+                
+                support_loss += s_loss
+                
+                # Phase 2: Test on query set (memory retrieval only, no update)
+                with torch.no_grad():
+                    query_pred = mann_model(qX, update_memory=False)
+                    
+                    if config['criterion'] == 'MSELoss':
+                        q_loss = F.mse_loss(query_pred, qY)
+                    elif config['criterion'] == 'SmoothL1Loss':
+                        q_loss = F.smooth_l1_loss(query_pred, qY)
+                    else:
+                        raise ValueError("Invalid criterion")
+                    
+                    query_loss += q_loss
+            
+            # Average losses over meta-batch
+            support_loss = support_loss / meta_batch
+            query_loss = query_loss / meta_batch
+            
+            # Backpropagate only support loss (memory updates are part of forward pass)
+            total_loss = support_loss
+            total_loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(mann_model.parameters(), max_norm=config['grad_clip'])
+            
+            optimizer.step()
+            
+            epoch_train_loss.update(total_loss.item(), meta_batch)
+            
+            # Periodic memory cleanup
+            if (batch_idx + 1) % 100 == 0:
+                mann_model.memory.clear_old_memories(max_age=500)
+            
+            # Logging
+            if (batch_idx + 1) % config.get('meta_log_step', 50) == 0:
+                step_idx = epoch * len(train_dataloader) + batch_idx
+                writer.add_scalar('mann/train_support_loss_step', support_loss.item(), step_idx)
+                writer.add_scalar('mann/train_query_loss_step', query_loss.item(), step_idx)
+                writer.add_scalar('mann/train_total_loss_step', total_loss.item(), step_idx)
+                
+                print(f"[MANN] Epoch {epoch+1} Step {batch_idx+1}/{len(train_dataloader)} - "
+                      f"support_loss {support_loss.item():.6f}, query_loss {query_loss.item():.6f}, "
+                      f"total_loss {total_loss.item():.6f}")
+        
+        # End of epoch: validation
+        val_loss = evaluate_mann_validation(
+            mann_model, 
+            val_dataloader, 
+            device, 
+            config,
+            n_tasks_eval=config.get('meta_val_tasks')
+        )
+        
+        # Learning rate scheduling
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Logging
+        writer.add_scalar('mann/train_loss_epoch', epoch_train_loss.avg, epoch)
+        writer.add_scalar('mann/val_loss_epoch', val_loss, epoch)
+        writer.add_scalar('mann/learning_rate', current_lr, epoch)
+        
+        print(f"[MANN] Epoch {epoch+1}/{meta_epochs} - "
+              f"train_loss {epoch_train_loss.avg:.6f}, "
+              f"val_loss {val_loss:.6f}, lr {current_lr:.6f}")
+        
+        # Save best model
+        if val_loss < best_val:
+            save_ckpt = {
+                'epoch': epoch,
+                'model_state_dict': mann_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'config': config,
+                'val_loss': val_loss,
+                'memory_state': mann_model.memory.memory.clone(),
+                'memory_age': mann_model.memory.memory_age.clone()
+            }
+            best_model_path = os.path.join(checkpoint_path, f"{save_name}_best_mann")
+            torch.save(save_ckpt, best_model_path)
+            best_val = val_loss
+            print(f"[MANN] New best validation loss: {val_loss:.6f}, saved to {best_model_path}")
+        
+        # Early stopping
+        if config.get('es_enable', False):
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                print("Early stopping MANN training")
+                break
+    
+    # Final test evaluation
+    print(f"[MANN] Starting final test evaluation with best model...")
+    
+    # Load best model
+    best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_mann"), weights_only=False)
+    mann_model.load_state_dict(best_ckpt['model_state_dict'])
+    mann_model.memory.memory.copy_(best_ckpt['memory_state'])
+    mann_model.memory.memory_age.copy_(best_ckpt['memory_age'])
+    mann_model = mann_model.to(device)
+    
+    all_test_targets, all_test_outputs = evaluate_mann_test(
+        mann_model,
+        test_dataloader,
+        device,
+        config,
+        n_tasks_eval=config.get('meta_test_tasks'),
+        writer=writer
+    )
+    
+    # Final metrics computation
+    _ = call_metric(all_test_targets, all_test_outputs, config, 
+                   figure_savepath=os.path.join(config['figure_path'], 'mann_meta_stage'), 
+                   plot=True)
+    
+    writer.close()
+
+
+def evaluate_mann_validation(mann_model, val_dataloader, device, config, n_tasks_eval=None):
+    """
+    Validation evaluation for MANN model.
+    """
+    mann_model.eval()
+    val_losses = AverageMeter(name='mann/val_loss')
+    
+    tasks_done = 0
+    data_iter = iter(val_dataloader)
+    
+    # Create temporary memory state for validation (don't pollute training memory)
+    original_memory = mann_model.memory.memory.clone()
+    original_age = mann_model.memory.memory_age.clone()
+    
+    with torch.no_grad():
+        while True:
+            if n_tasks_eval is not None and tasks_done >= n_tasks_eval:
+                break
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                break
+            
+            (Xs, Ys), (Xq, Yq), pid = batch
+            
+            meta_batch = Xs.shape[0]
+            batch_query_losses = []
+            
+            for t in range(meta_batch):
+                # Extract and normalize data
+                sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
+                qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
+                
+                # Learn from support set (update validation memory)
+                _ = mann_model(sX, update_memory=True, targets=sY)
+                
+                # Test on query set
+                query_pred = mann_model(qX, update_memory=False)
+                
+                if config['criterion'] == 'MSELoss':
+                    q_loss = F.mse_loss(query_pred, qY)
+                elif config['criterion'] == 'SmoothL1Loss':
+                    q_loss = F.smooth_l1_loss(query_pred, qY)
+                else:
+                    raise ValueError("Invalid criterion")
+                
+                batch_query_losses.append(q_loss.item())
+            
+            # Average over tasks in this meta-batch
+            avg_batch_loss = np.mean(batch_query_losses)
+            val_losses.update(avg_batch_loss, meta_batch)
+            tasks_done += 1
+    
+    # Restore original memory state
+    mann_model.memory.memory.copy_(original_memory)
+    mann_model.memory.memory_age.copy_(original_age)
+    
+    return val_losses.avg
+
+
+def evaluate_mann_test(mann_model, test_dataloader, device, config, n_tasks_eval=None, writer=None):
+    """
+    Final test evaluation for MANN model with detailed metrics.
+    """
+    mann_model.eval()
+    
+    # Metrics
+    test_losses = AverageMeter(name='mann_test/loss')
+    test_sbp_maes = AverageMeter(name='mann_test/sbp_mae')
+    test_dbp_maes = AverageMeter(name='mann_test/dbp_mae')
+    test_map_maes = AverageMeter(name='mann_test/map_mae')
+    test_sbp_mes = AverageMeter(name='mann_test/sbp_me')
+    test_dbp_mes = AverageMeter(name='mann_test/dbp_me')
+    test_map_mes = AverageMeter(name='mann_test/map_me')
+    test_sbp_mae_stds = AverageMeter(name='mann_test/sbp_mae_std')
+    test_dbp_mae_stds = AverageMeter(name='mann_test/dbp_mae_std')
+    test_map_mae_stds = AverageMeter(name='mann_test/map_mae_std')
+    test_sbp_me_stds = AverageMeter(name='mann_test/sbp_me_std')
+    test_dbp_me_stds = AverageMeter(name='mann_test/dbp_me_std')
+    test_map_me_stds = AverageMeter(name='mann_test/map_me_std')
+    
+    # Output collection
+    all_test_outputs = np.empty((0, 3), dtype=float)
+    all_test_targets = np.empty((0, 3), dtype=float)
+    
+    tasks_done = 0
+    data_iter = iter(test_dataloader)
+    
+    with torch.no_grad():
+        while True:
+            if n_tasks_eval is not None and tasks_done >= n_tasks_eval:
+                break
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                break
+            
+            (Xs, Ys), (Xq, Yq), pid = batch
+            meta_batch = Xs.shape[0]
+            
+            for t in range(meta_batch):
+                # Extract and normalize data
+                sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
+                qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
+                
+                # Learn from support set
+                _ = mann_model(sX, update_memory=True, targets=sY)
+                
+                # Test on query set
+                query_pred = mann_model(qX, update_memory=False)
+                
+                # Compute loss
+                if config['criterion'] == 'MSELoss':
+                    test_loss = F.mse_loss(query_pred, qY)
+                elif config['criterion'] == 'SmoothL1Loss':
+                    test_loss = F.smooth_l1_loss(query_pred, qY)
+                else:
+                    raise ValueError("Invalid criterion")
+                
+                # Record outputs
+                all_test_outputs = np.concatenate((all_test_outputs, query_pred.detach().cpu().numpy()), axis=0)
+                all_test_targets = np.concatenate((all_test_targets, qY.detach().cpu().numpy()), axis=0)
+                
+                # Compute metrics
+                metric_values = get_metric_values(test_loss, query_pred, qY, config)
+                
+                test_losses.update(metric_values['loss'], qX.size(0))
+                test_sbp_maes.update(metric_values['sbp_mae'], qX.size(0))
+                test_dbp_maes.update(metric_values['dbp_mae'], qX.size(0))
+                test_map_maes.update(metric_values['map_mae'], qX.size(0))
+                test_sbp_mes.update(metric_values['sbp_me'], qX.size(0))
+                test_dbp_mes.update(metric_values['dbp_me'], qX.size(0))
+                test_map_mes.update(metric_values['map_me'], qX.size(0))
+                test_sbp_mae_stds.update(metric_values['sbp_mae_std'], qX.size(0))
+                test_dbp_mae_stds.update(metric_values['dbp_mae_std'], qX.size(0))
+                test_map_mae_stds.update(metric_values['map_mae_std'], qX.size(0))
+                test_sbp_me_stds.update(metric_values['sbp_me_std'], qX.size(0))
+                test_dbp_me_stds.update(metric_values['dbp_me_std'], qX.size(0))
+                test_map_me_stds.update(metric_values['map_me_std'], qX.size(0))
+            
+            tasks_done += 1
+    
+    # Log final test metrics
+    if writer:
+        writer.add_scalar('mann_test/loss_final', test_losses.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/sbp_mae_final', test_sbp_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/dbp_mae_final', test_dbp_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/map_mae_final', test_map_maes.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/sbp_me_final', test_sbp_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/dbp_me_final', test_dbp_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/map_me_final', test_map_mes.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/map_mae_std_final', test_map_mae_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/sbp_me_std_final', test_sbp_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/dbp_me_std_final', test_dbp_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('mann_test/map_me_std_final', test_map_me_stds.avg, config['max_training_epochs'])
     
     return all_test_targets, all_test_outputs
 
@@ -1195,7 +2710,7 @@ def supcon_loss_old(features, config, labels=None, mask=None):
     r"""
     Supervised Contrastive Loss
     from https://github.com/pulp-platform/fscil/blob/main/code/lib/torch_blocks.py#L114
-    abd from https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/tutorial17/SimCLR.html#SimCLR-implementation
+    and from https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/tutorial17/SimCLR.html#SimCLR-implementation
     """
     device = features.device
 
