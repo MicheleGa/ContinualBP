@@ -126,7 +126,6 @@ if __name__ == "__main__":
                 fs=config['fs'],
                 input_seq_len_s=config['input_seq_len_s'],
                 ecg=config['ecg'],
-                resp=config['resp'],
                 sig2sig=config['sig2sig'],
                 min_subject_sample_number=config['min_subject_sample_number']
             )
@@ -139,9 +138,10 @@ if __name__ == "__main__":
                 ecg=config['ecg'],
                 sig2sig=config['sig2sig'],
                 pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-                mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects
+                mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects, must be False
                 k_support=config['k_support'],
-                k_query=config['k_query']
+                k_query=config['k_query'],
+                meta_batch_size=config['meta_batch_size']
             )
     else:
         # Load data
@@ -153,12 +153,8 @@ if __name__ == "__main__":
             fs=config['fs'],
             input_seq_len_s=config['input_seq_len_s'],
             ecg=config['ecg'],
-            resp=config['resp'],
             sig2sig=config['sig2sig'],
-            min_subject_sample_number=config['min_subject_sample_number'],
-            masking_ratio=config['masking_ratio'],
-            augmentation_types=config['augmentation_types'].split(','),
-            aug_prob=config['aug_prob']
+            min_subject_sample_number=config['min_subject_sample_number']
         )
         
     ## Pretraining

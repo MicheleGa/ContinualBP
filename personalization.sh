@@ -1,69 +1,30 @@
-## Personalization
+# Personalization
 
-# Efficient UNet
-experiment_name="personalization_eunet_last_layer"
+# BIOT personalization
+experiment_name="biot_maml_personalization"
 mkdir "logs/$experiment_name"
 cd ./models
-python EUNet.py \
-    --fs 125 \
-    --input_seq_len_s 5 \
+python BIOT.py \
     --ecg True \
-    --batch_size 128 \
-    --channels "16,32,64" \
+    --fs 125 \
+    --input_seq_len_s 10 \
+    --pretrained_path ../checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
-    --model models.EUNet \
+    --model models.BIOT \
     --dataset_name vital_db \
     --expname "$experiment_name" \
-    --pretrained_model_checkpoint ./checkpoints/efficient_unet_ch_16_32_64/efficient_unet_ch_16_32_64-EUNet-2025_05_30-11_21_42/efficient_unet_ch_16_32_64/ckpt/EUNet \
-    --loader_worker 4 \
-    --batch_size 128 \
-    --tune 'last_layer' \
-    --channels "16,32,64" \
-    --num_personalization_subjects 100 \
-    --num_passes 8 \
-    --lr 0.003 \
-    --sig2sig True \
-    --ecg True \
+    --loader_worker 10 \
+    --sig2sig False \
     --fs 125 \
-    --input_seq_len_s 5 \
-    --mix_pretraining_subject_samples True \
-    --personalization_sample_number -1.0 \
-    --optimizer_type "Adam" \
-    --criterion "SmoothL1Loss" \
-    --eval_every_n_epochs 1 \
-    --lambda_supervised 1 \
-    > "./logs/$experiment_name/${experiment_name}_training.log"
-
-## Efficient UNet Nystrom
-#experiment_name="personalization_vanilla_eunet_nystrom_attention"
-#mkdir "logs/$experiment_name"
-#cd ./models
-#python EUNet.py \
-#    --fs 125 \
-#    --input_seq_len_s 5 \
-#    --ecg True \
-#    --channels "16,32,64" \
-#    --attention_type "nystrom_attention" \
-#    > "../logs/$experiment_name/${experiment_name}_summary.log"
-#cd ..
-#python personalization.py \
-#    --model models.EUNet \
-#    --dataset_name vital_db \
-#    --expname "$experiment_name" \
-#    --pretrained_model_checkpoint ./checkpoints/efficient_unet_ch_16_32_64_nystrom/efficient_unet_ch_16_32_64_nystrom-EUNet-2025_05_30-11_22_04/efficient_unet_ch_16_32_64_nystrom/ckpt/EUNet \
-#    --loader_worker 4 \
-#    --sig2sig True \
-#    --ecg True \
-#    --fs 125 \
-#    --input_seq_len_s 5 \
-#    --channels "16,32,64" \
-#    --attention_type "nystrom_attention" \
-#    --mix_pretraining_subject_samples True \
-#    --optimizer_type "Adam" \
-#    --criterion "SmoothL1Loss" \
-#    --eval_every_n_epochs 1 \
-#    --lambda_supervised 1 \
-#    > "./logs/$experiment_name/${experiment_name}_training.log"
-#
+    --input_seq_len_s 10 \
+    --pretrained_path ./checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt \
+    --ecg True \
+    --pretrained_model_checkpoint ./checkpoints/biot_maml/biot_maml-BIOT-2025_09_01-17_13_16/biot_maml_best_maml \
+    --min_run_length 10 \
+    --training_samples 8 \
+    --criterion 'SmoothL1Loss' \
+    --personalization_steps 5 \
+    --grad_clip 10.0 \
+    > "./logs/$experiment_name/${experiment_name}_personalization.log"

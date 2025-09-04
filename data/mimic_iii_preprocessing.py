@@ -11,13 +11,15 @@ from preprocessing_utils.signal_processing import *
 from preprocessing_utils.data_visualization import plot_signals, plot_abp
 
 
-def process_windows(abp, ppg, ecg, subject_id, subject_data, segment, fs, window_length, window_overlap, args, savepath):
+def process_windows(abp, ppg, ecg, subject_id, segment, fs, window_length, window_overlap, args, savepath):
     # Number of measurements in the annotation signal
     sample_n_in_current_subject = len(abp)
 
     # Divide signals in windows for analysis
     win_start, win_stop = create_windows(window_length, fs, sample_n_in_current_subject, window_overlap)
     n_win = len(win_start)
+    
+    segment_data = []
     
     # Cycle over windows        
     for j in range(0, n_win):
@@ -82,20 +84,25 @@ def process_windows(abp, ppg, ecg, subject_id, subject_data, segment, fs, window
             window_ppg = window_ppg.astype(np.float32)
             window_ecg = window_ecg.astype(np.float32)
                 
-            subject_data.append((window_ppg, window_ecg, window_abp, sbp, dbp, map))
+            segment_data.append((window_ppg, window_ecg, window_abp, sbp, dbp, map))
                                     
             if args.plot:
                 plot_signals(
                     [window_ppg, window_ecg, window_abp], 
                     fs=fs if not args.resample else args.target_resample_fs,
                     labels=['PPG', 'ECG', 'ABP'], 
-                    title=f'Sample Input Signals ~ SBP {sbp:.2f} - DBP {dbp:.2f} - MAP {map:.2f}', 
+                    title=f'Subject {subject_id} Sample Input Signals ~ SBP {sbp:.2f} - DBP {dbp:.2f} - MAP {map:.2f}', 
                     savepath=savepath, 
                     ylabels=['a.u.', 'mV', 'mmHg']
                     )
                             
                 # No need to do the preprocessing of all subjects when plot true
                 return
+    if len(segment_data) > 0:
+        return segment_data
+    else:
+        return None
+
 
 def process_subject(subject_id, args, savepath, result_queue=None):
     
@@ -121,12 +128,11 @@ def process_subject(subject_id, args, savepath, result_queue=None):
         ppg = subject_ppgs[segment, :]
         ecg = subject_ecgs[segment, :]
 
-        process_windows(
+        segment_data = process_windows(
             abp=abp,
             ppg=ppg,
             ecg=ecg,
             subject_id=subject_id,
-            subject_data=subject_data,
             segment=segment,
             fs=fs,
             window_length=window_length,
@@ -138,6 +144,8 @@ def process_subject(subject_id, args, savepath, result_queue=None):
         # No need to do the preprocessing of all subjects when plot true
         if args.plot:
             return
+        
+        subject_data.extend(segment_data)
     
     print(f'Completed {subject_id}')
     result_queue.put((int(subject_id[1:]), subject_data)) # subject id is integer
@@ -183,7 +191,7 @@ def preprocess_dataset(args):
 
     # Use joblib for parallel processing
     Parallel(n_jobs=num_threads)(
-        delayed(process_subject)(subject_id, args, savepath, result_queue) for subject_id in subjects_ids
+        delayed(process_subject)(subject_id, args, savepath, result_queue) for subject_id in subjects_ids[:10]
     )
     
     index_by_sample_id = list()

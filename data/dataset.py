@@ -25,7 +25,6 @@ class PhysioDataset(Dataset):
                  input_seq_len_s=5, 
                  ecg=False, 
                  sig2sig=False,
-                 bp_pattern=False, 
                  min_subject_sample_number=0, 
                  plot=False, 
                  savepath='./figs'):
@@ -49,7 +48,6 @@ class PhysioDataset(Dataset):
         # Which input data to load (PPG or PPG + ECG), PPG is always loaded
         self.ecg = ecg
         self.sig2sig = sig2sig
-        self.bp_pattern = bp_pattern
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
         
@@ -228,39 +226,7 @@ class PhysioDataset(Dataset):
             abp = torch.tensor(sample['abp'])
             
             return signals, abp
-
-        elif self.bp_pattern:
-            # Fetch scalar values
-            sample['sbp'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
-            sample['dbp'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
-            sample['map'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
-            
-            for k in sample:
-                sample[k] = np.require(sample[k], requirements=['O', 'W'])
-                sample[k].setflags(write=1)
-            
-            signals = torch.tensor(sample['sig'])
-            sbp_val = float(sample['sbp'])
-            dbp_val = float(sample['dbp'])
-
-            # ----- Label definition based on AHA/ACC guidelines -----
-            # Source: https://www.ahajournals.org/doi/10.1161/CIR.0000000000001356
-            if sbp_val < 90 or dbp_val < 60:
-                label = 0   # Hypotension
-            elif sbp_val < 120 and dbp_val < 80:
-                label = 1   # Normal
-            elif 120 <= sbp_val <= 129 and dbp_val < 80:
-                label = 2   # Elevated
-            elif (130 <= sbp_val <= 139) or (80 <= dbp_val <= 89):
-                label = 3   # Stage 1 Hypertension
-            else:  # sbp_val >= 140 or dbp_val >= 90
-                label = 4   # Stage 2 Hypertension
-            
-            return signals, torch.tensor(label, dtype=torch.long), self.index_by_sample_id[index][0]
-
+        
         else:
             # Regression mode: return SBP/DBP/MAP
             sample['sbp'] = np.squeeze(np.frombuffer(
@@ -297,7 +263,6 @@ def parseargs():
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--bp_pattern', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
@@ -322,7 +287,6 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         sig2sig=args.sig2sig,
-        bp_pattern=args.bp_pattern,
         min_subject_sample_number=args.min_subject_sample_number,
         plot=args.plot, 
         savepath=root_figs_folder
@@ -335,88 +299,73 @@ if __name__ == "__main__":
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
-    if not args.bp_pattern:
-        if args.mix_pretraining_subject_samples:
-            calculate_dataloaders_mean_std(
-                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-                savepath=root_figs_folder
-                ) 
-        else:
-            calculate_dataloaders_mean_std(
-                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-                savepath=root_figs_folder
-                )
+    if args.mix_pretraining_subject_samples:
+        calculate_dataloaders_mean_std(
+            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+            savepath=root_figs_folder
+            ) 
     else:
-        if args.mix_pretraining_subject_samples:
-            plot_bp_pattern_distribution(
-                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-                savepath=root_figs_folder
-                ) 
-        else:
-            plot_bp_pattern_distribution(
-                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-                savepath=root_figs_folder
-                )
+        calculate_dataloaders_mean_std(
+            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+            dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
+            savepath=root_figs_folder
+            )
     
-    if not args.bp_pattern:
-        input_batch = next(iter(train_dataloader))
-        sig = input_batch[0]
-        sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
-        annotation = input_batch[1]
+    input_batch = next(iter(train_dataloader))
+    sig = input_batch[0]
+    sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
+    annotation = input_batch[1]
+    
+    idx = np.random.randint(0, sig.shape[0])
+    if args.sig2sig:
+        sig = sig[idx, :, :].squeeze().numpy()
+        abp = annotation[idx, :].squeeze().numpy()
+    else:
+        sbp_val = annotation[idx, 0].squeeze().numpy()
+        dbp_val = annotation[idx, 1].squeeze().numpy()
+        map_val = annotation[idx, 2].squeeze().numpy()
+    
+    # Note that the train_dataloader will already return the required signals specified by the conditions
+    if args.ecg:
         
-        idx = np.random.randint(0, sig.shape[0])
         if args.sig2sig:
-            sig = sig[idx, :, :].squeeze().numpy()
-            abp = annotation[idx, :].squeeze().numpy()
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ECG', 'ABP'], 
+                title=f'Input: PPG + ECG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV', 'mmHg']
+            )
         else:
-            sbp_val = annotation[idx, 0].squeeze().numpy()
-            dbp_val = annotation[idx, 1].squeeze().numpy()
-            map_val = annotation[idx, 2].squeeze().numpy()
+            plot_signals(
+                sig[idx, :, :].T, fs=args.fs, 
+                labels=['PPG', 'ECG'], 
+                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV']
+                )
+            
+    else:
         
-        # Note that the train_dataloader will already return the required signals specified by the conditions
-        if args.ecg:
-            
-            if args.sig2sig:
-                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-                plot_signals(
-                    sigs.T, 
-                    fs=args.fs, 
-                    labels=['PPG', 'ECG', 'ABP'], 
-                    title=f'Input: PPG + ECG, Output: ABP', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.', 'mV', 'mmHg']
-                )
-            else:
-                plot_signals(
-                    sig[idx, :, :].T, fs=args.fs, 
-                    labels=['PPG', 'ECG'], 
-                    title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.', 'mV']
-                    )
-                
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ABP'], 
+                title=f'Input: PPG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mmHg']
+            )
         else:
-            
-            if args.sig2sig:
-                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-                plot_signals(
-                    sigs.T, 
-                    fs=args.fs, 
-                    labels=['PPG', 'ABP'], 
-                    title=f'Input: PPG, Output: ABP', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.', 'mmHg']
+            plot_signals(
+                sig[idx, :, :].T, 
+                fs=args.fs,
+                labels=['PPG'], 
+                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.']
                 )
-            else:
-                plot_signals(
-                    sig[idx, :, :].T, 
-                    fs=args.fs,
-                    labels=['PPG'], 
-                    title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.']
-                    )

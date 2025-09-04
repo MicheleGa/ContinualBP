@@ -137,6 +137,105 @@ class BPWaveformDecoder(nn.Module):
         return x
 
 
+class BPRegressor(torch.nn.Module):
+    """
+    Blood pressure regressor for SBP/DBP/MAP prediction during Reptile stage.
+    """
+    def __init__(self, input_dim, output_dim=2):  # 2 for SBP/DBP, can be 3 for SBP/DBP/MAP
+        super(BPRegressor, self).__init__()
+        
+        self.regressor = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(128, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.regressor(x)
+
+
+class MAMLLearner(nn.Module):
+    """
+    Learner wrapper that cleanly supports MAML-style functional forward using
+    torch.nn.utils.stateless.functional_call for both the BIOT encoder and the
+    BPRegressor head. This avoids in-place param swapping and shape/order bugs.
+    """
+    def __init__(self, model, regressor):
+        super().__init__()
+        self.model = model
+        self.regressor = regressor
+
+        # Capture parameter names in a deterministic order (matches .parameters())
+        self.model_named_params = list(self.model.named_parameters())
+        self.reg_named_params = list(self.regressor.named_parameters())
+
+        # Keep a flattened list of parameters with the same order as learner.parameters()
+        self._flattened_params = list(p for _, p in self.model_named_params if p.is_floating_point() or p.is_complex())
+        self._flattened_params += list(p for _, p in self.reg_named_params if p.is_floating_point() or p.is_complex())
+        
+        # Save names in the same order (to reconstruct dicts quickly)
+        self._model_names_in_order = [n for n, _ in self.model_named_params]
+        self._reg_names_in_order = [n for n, _ in self.reg_named_params]
+
+        # Guardrail: the BPRegressor expects 256-dim embeddings as input.
+        self.expected_feat_dim = None
+        try:
+            if hasattr(self.model, "embed_dim"):
+                self.expected_feat_dim = int(self.model.embed_dim)
+        except Exception:
+            self.expected_feat_dim = None
+
+    def _split_vars_to_dicts(self, vars_list):
+        """
+        Split a flat list of tensors into two param dicts matching model and regressor.
+        The ordering *must* match how we created fast_weights.
+        """
+        n_model = len(self._model_names_in_order)
+        model_vars = vars_list[:n_model]
+        reg_vars = vars_list[n_model:]
+
+        model_param_dict = {name: tensor for name, tensor in zip(self._model_names_in_order, model_vars)}
+        reg_param_dict = {name: tensor for name, tensor in zip(self._reg_names_in_order, reg_vars)}
+        return model_param_dict, reg_param_dict
+
+    def forward(self, x, vars=None):
+        """
+        If vars is None -> regular forward (encoder -> head).
+        If vars is not None -> functional forward using provided weights (MAML inner loop).
+        """
+        if vars is None:
+            feats = self.model(x)            # Expect [B, 256] from BIOT
+            assert feats.dim() == 2, f"Encoder output must be [B, D], got {list(feats.shape)}"
+            if self.expected_feat_dim is not None:
+                assert feats.shape[-1] == self.expected_feat_dim, f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+            out = self.regressor(feats)      # [B, 3]
+            return out
+
+        model_param_dict, reg_param_dict = self._split_vars_to_dicts(vars)
+
+        # Run encoder with provided params
+        feats = torch.func.functional_call(self.model, model_param_dict, (x,))
+
+        # Sanity checks to catch shape issues early
+        if feats.dim() == 3 and feats.shape[1] != feats.shape[-1]:
+            # If accidentally a sequence [B, T, C] got returned without pooling, try to pool
+            feats = feats.mean(dim=1)
+
+        assert feats.dim() == 2, f"Encoder output must be [B, D]; got {list(feats.shape)}"
+        if self.expected_feat_dim is not None:
+            assert feats.shape[-1] == self.expected_feat_dim, f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+
+        # Run head with provided params
+        out = torch.func.functional_call(self.regressor, reg_param_dict, (feats,))
+        return out
+
+
 class BIOT(nn.Module):
     def __init__(self,
                  ecg=False,

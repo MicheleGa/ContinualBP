@@ -8,450 +8,291 @@ import sys
 import lmdb
 import torch
 from torch.utils.data import Dataset, DataLoader # Keep Dataset import for clarity and potential future base datasets
-from preprocessing_utils.data_visualization import plot_subject_validity_over_time
+from preprocessing_utils.data_visualization import plot_subject_sample_distribution, plot_consecutive_runs_subject, plot_consecutive_runs_all, plot_subject_annotation_runs
 
 
-class OnlinePhysioDataset: # NO LONGER INHERITS from Dataset
+class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid openinng the LMDB environment two times (would raise errors)
     def __init__(self,
-                 lmdb_folder,
-                 fs=125,
-                 input_seq_len_s=5,
-                 ecg=False,
-                 resp=False,
+                 seed, 
+                 lmdb_folder, 
+                 fs=125, 
+                 input_seq_len_s=5, 
+                 ecg=False, 
                  sig2sig=False,
-                 min_subject_sample_number=0):
-        # super(OnlinePhysioDataset, self).__init__() # Remove this as it's not inheriting from Dataset
-
+                 min_subject_sample_number=0, 
+                 plot=False, 
+                 savepath='./figs'):
+        super(OnlineDatasetBase, self).__init__()
+        
+        # Generic arguments
         LMDB_MAP_SIZE = 1000 * 1000 * 1000 * 1000 # 1T
 
+        self.seed = seed
         self.dataset_folder = lmdb_folder
         self.min_subject_sample_number = min_subject_sample_number
+        self.lmdbenv = lmdb.open(lmdb_folder, map_size=LMDB_MAP_SIZE)
+        self.lmdbtxn = self.lmdbenv.begin()
 
-        # Open LMDB in readonly mode with no locks for safe concurrent access across processes
-        self.lmdbenv = lmdb.open(lmdb_folder, map_size=LMDB_MAP_SIZE, readonly=True, lock=False)
-        self.lmdbtxn = self.lmdbenv.begin() # Start a read transaction
-
-        # Load metadata
-        self.subject_list: list = pickle.loads(self.lmdbtxn.get("subject_list".encode()))
-        self.index_by_subject_id: dict = pickle.loads(self.lmdbtxn.get("index_by_subject_id".encode())) # Maps subject_id to list of LMDB keys (strings)
-
-        # Filter subjects with insufficient samples
-        self._check_subjects_list(min_subject_sample_number=min_subject_sample_number)
-
-        # Configure signal loading
+        # Subject/Sample lists/dicts
+        self.subjects_for_personalization:list = pickle.loads(self.lmdbtxn.get("subject_list".encode()))
+        self.index_by_subject_id:dict = pickle.loads(self.lmdbtxn.get("index_by_subject_id".encode()))
+        self.index_by_sample_id = pickle.loads(self.lmdbtxn.get("index_by_sample_id".encode()))
+        self.subject_adjacent_samples:dict = pickle.loads(self.lmdbtxn.get("subject_adjacent_samples".encode()))
+        self.check_subjects_list(min_subject_sample_number=min_subject_sample_number)
+                
+        # Which input data to load (PPG or PPG + ECG), PPG is always loaded
         self.ecg = ecg
-        self.resp = resp
         self.sig2sig = sig2sig
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
-        self.sample_length_in_samples = self.fs * self.input_seq_len_s
+        
+        # Plot arguments
+        self.plot = plot
+        self.savepath = savepath
 
-        print("{:s} initialized for online learning with following configuration:".format(self.__class__.__name__))
+        # Dataset split
+        self.total_subject_n = len(self.subjects_for_personalization)
+        
+        if self.plot:
+            if self.min_subject_sample_number > 0:
+                plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_personalization, savepath=os.path.join(savepath, f'personalization_subject_sample_distribution_min_sample_{self.min_subject_sample_number}.jpg'))
+            else:
+                plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_personalization, savepath=os.path.join(savepath, 'personalization_subject_sample_distribution.jpg'))
+        
+        print("{:s} initialized with following configuration:".format(self.__class__.__name__))
         pprint.pprint(
             {
-                "LMDB Folder": lmdb_folder,
-                "Sampling Frequency (Hz)": fs,
-                "Input Sequence Length (s)": input_seq_len_s,
-                "Include ECG": ecg,
-                "Include RESP": resp,
-                "Signal-to-Signal Prediction": sig2sig,
-                "Min Subject Sample Number": min_subject_sample_number,
-                "Total Subjects Available": len(self.subject_list),
+                "Total Subjects": len(self.subjects_for_personalization),
+                "Total Samples": len(self.index_by_sample_id)
             }
         )
 
-    def _check_subjects_list(self, min_subject_sample_number=0):
-        """Removes subjects with less than min_subject_sample_number samples."""
-        invalid_subjects = []
-        for subject in self.subject_list:
-            if len(self.index_by_subject_id.get(subject, [])) < min_subject_sample_number:
+    def check_subjects_list(self, min_subject_sample_number):
+        # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
+        # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
+        # with lmdbenv.begin(write=True) as txn: deos not make this check
+        invalid_subjects = list()
+        for subject in self.subjects_for_personalization:
+            if len(self.index_by_subject_id[subject]) <= min_subject_sample_number:
                 invalid_subjects.append(subject)
-
-        if invalid_subjects:
-            print(f"Removing {len(invalid_subjects)} invalid subjects from the dataset (less than {min_subject_sample_number} samples each).")
+        
+        if len(invalid_subjects) > 0:
+            print("Invalid subjects found in the dataset, removing them ...")
             for subject in invalid_subjects:
-                self.subject_list.remove(subject)
+                self.subjects_for_personalization.remove(subject)
                 del self.index_by_subject_id[subject]
+                del self.subject_adjacent_samples[subject]
 
     def before_pickle(self):
-        """Closes LMDB environment and transaction before pickling."""
-        # This method is crucial if you are using DataLoader with num_workers > 0
-        # as it will be called by multiprocessing to prepare the object for pickling
-        # before being sent to worker processes.
-        if self.lmdbtxn:
-            self.lmdbtxn.abort()
-            self.lmdbtxn = None
-        if self.lmdbenv:
-            self.lmdbenv.close()
-            self.lmdbenv = None
+        self.lmdbenv = None
+        self.lmdbtxn = None
 
-    # This __len__ is for the OnlinePhysioDataset itself, representing total samples if treated flatly
-    # It's not directly used by ContinualLearningDataset, but kept for consistency if needed elsewhere.
     def __len__(self):
         """Returns the total number of samples across all subjects available in the dataset."""
-        return sum(len(keys) for keys in self.index_by_subject_id.values())
+        return len(self.index_by_sample_id)
 
-    def _get_sample_by_key(self, lmdb_key: str): # Renamed to avoid conflicts and signify internal use
-        """
-        Retrieves a sample from LMDB using its direct LMDB key string.
-
-        Args:
-            lmdb_key (str): The specific key string (e.g., "subject_id_window_idx") for the sample.
-
-        Returns:
-            dict: A dictionary containing loaded signals, annotations, and validity flags.
-        """
+    def __getitem__(self, index):
         sample = dict()
 
-        # Load raw ABP (always saved) and validity flags (always saved)
-        # These are used for analysis/plotting purposes, even if processed signals are None
-        sample['abp_raw'] = np.frombuffer(self.lmdbtxn.get(f"{lmdb_key}-abp_raw".encode()), dtype="float32")
-        sample['ppg_valid'] = bool(np.frombuffer(self.lmdbtxn.get(f"{lmdb_key}-ppg_valid".encode()), dtype="int8"))
-        sample['ecg_valid'] = bool(np.frombuffer(self.lmdbtxn.get(f"{lmdb_key}-ecg_valid".encode()), dtype="int8"))
-        sample['abp_valid'] = bool(np.frombuffer(self.lmdbtxn.get(f"{lmdb_key}-abp_valid".encode()), dtype="int8"))
-
-        # Load processed input signals (might be None if invalid during preprocessing, or if not configured)
-        # We check for existence of the key in LMDB before trying to load
-        processed_ppg = None
-        ppg_bytes = self.lmdbtxn.get(f"{lmdb_key}-ppg".encode())
-        if ppg_bytes: processed_ppg = np.frombuffer(ppg_bytes, dtype="float32")
-
-        processed_ecg = None
-        ecg_bytes = self.lmdbtxn.get(f"{lmdb_key}-ecg".encode())
-        if ecg_bytes: processed_ecg = np.frombuffer(ecg_bytes, dtype="float32")
-
-        processed_resp = None
-        resp_bytes = self.lmdbtxn.get(f"{lmdb_key}-resp".encode())
-        if resp_bytes: processed_resp = np.frombuffer(resp_bytes, dtype="float32")
-
-        processed_vpg = None
-        vpg_bytes = self.lmdbtxn.get(f"{lmdb_key}-vpg".encode())
-        if vpg_bytes: processed_vpg = np.frombuffer(vpg_bytes, dtype="float32")
-
-        processed_apg = None
-        apg_bytes = self.lmdbtxn.get(f"{lmdb_key}-apg".encode())
-        if apg_bytes: processed_apg = np.frombuffer(apg_bytes, dtype="float32")
-
-        processed_imfs = None
-        imfs_bytes = self.lmdbtxn.get(f"{lmdb_key}-imfs".encode())
-        if imfs_bytes: processed_imfs = np.frombuffer(imfs_bytes, dtype="float32").reshape((4, self.sample_length_in_samples)).T
-
-        processed_ppg_freqs = None
-        ppg_freqs_bytes = self.lmdbtxn.get(f"{lmdb_key}-ppg_freqs".encode())
-        if ppg_freqs_bytes: processed_ppg_freqs = np.frombuffer(ppg_freqs_bytes, dtype="float32").reshape((16, self.sample_length_in_samples)).T
-
-        # Assemble `sig` based on configuration and available processed signals
-        signals_list = []
-        if self.ppg_emd and processed_imfs is not None:
-            signals_list = [np.expand_dims(processed_imfs[:, i], axis=-1) for i in range(processed_imfs.shape[1])]
-        elif self.ppg_freqs and processed_ppg_freqs is not None:
-            signals_list = [np.expand_dims(processed_ppg_freqs[:, i], axis=-1) for i in range(processed_ppg_freqs.shape[1])]
-        elif self.ppg_derivatives and processed_ppg is not None and processed_vpg is not None and processed_apg is not None:
-            signals_list = [np.expand_dims(processed_ppg, axis=-1), np.expand_dims(processed_vpg, axis=-1), np.expand_dims(processed_apg, axis=-1)]
-        elif self.ecg and processed_ppg is not None and processed_ecg is not None:
-            signals_list.append(np.expand_dims(processed_ppg, axis=-1))
-            signals_list.append(np.expand_dims(processed_ecg, axis=-1))
-            if self.resp and processed_resp is not None:
-                signals_list.append(np.expand_dims(processed_resp, axis=-1))
-        elif processed_ppg is not None: # Default to PPG only if no other specific config matches and PPG is available
-            signals_list.append(np.expand_dims(processed_ppg, axis=-1))
-
-        if signals_list:
-            sample['sig'] = np.concatenate(signals_list, axis=-1)
+        # Input data        
+        if self.ecg:
+            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
+            sample['ecg'] = np.frombuffer(self.lmdbtxn.get("{}-ecg".format(index).encode()), dtype="float32")
+            
+            sample['sig'] = np.concatenate(
+                (
+                    np.expand_dims(sample['ppg'], axis=-1), 
+                    np.expand_dims(sample['ecg'], axis=-1)
+                ), 
+                axis=-1)
         else:
-            # If no valid input signals were found for the chosen configuration or it's a completely bad window
-            sample['sig'] = np.zeros((self.sample_length_in_samples, 1), dtype=np.float32) # Placeholder zero array
-
-        # Load annotation: processed ABP or SBP/DBP
-        abp_processed_bytes = self.lmdbtxn.get(f"{lmdb_key}-abp".encode())
+            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
+            
+            sample['sig'] = sample['ppg']
+            
+        # Annotation
         if self.sig2sig:
-            # If processed ABP exists, use it; otherwise, use NaN-filled array for placeholder
-            sample['abp_processed'] = np.squeeze(np.frombuffer(abp_processed_bytes, dtype="float32")) if abp_processed_bytes else np.full_like(sample['abp_raw'], np.nan)
-            sample['sbp'] = np.nan # Not applicable for sig2sig output
-            sample['dbp'] = np.nan # Not applicable for sig2sig output
-        else:
-            sample['sbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{lmdb_key}-sbp".encode()), dtype="float32"))
-            sample['dbp'] = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{lmdb_key}-dbp".encode()), dtype="float32"))
-            sample['abp_processed'] = np.full_like(sample['abp_raw'], np.nan) # Not applicable for BP estimation output
-
-
-        # Store the LMDB key in the returned sample dictionary for easy access
-        sample['lmdb_key'] = lmdb_key
-
-        # Ensure all numpy arrays are writeable
-        for k in sample:
-            if isinstance(sample[k], np.ndarray):
+            sample['abp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
+            
+            # Ensure arrays are writeable
+            for k in sample:
                 sample[k] = np.require(sample[k], requirements=['O', 'W'])
                 sample[k].setflags(write=1)
-
-        # Cast to torch tensor for primary output signals and annotations
-        sample['sig_tensor'] = torch.tensor(sample['sig'], dtype=torch.float32)
-        if self.sig2sig:
-            sample['annotation_tensor'] = torch.tensor(sample['abp_processed'], dtype=torch.float32)
+            
+            # Cast to torch tensor
+            signals = torch.tensor(sample['sig'])
+            abp = torch.tensor(sample['abp'])
+            
+            return signals, abp
+        
         else:
-            # For DataLoader, it's often better to return a single tensor if possible,
-            # so concatenate SBP and DBP into one tensor.
-            sample['annotation_tensor'] = torch.tensor([sample['sbp'], sample['dbp']], dtype=torch.float32)
+            # Regression mode: return SBP/DBP/MAP
+            sample['sbp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
+            sample['dbp'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
+            sample['map'] = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
+            
+            for k in sample:
+                sample[k] = np.require(sample[k], requirements=['O', 'W'])
+                sample[k].setflags(write=1)
+            
+            signals = torch.tensor(sample['sig'])
+            sbp_val = torch.tensor(sample['sbp'])
+            dbp_val = torch.tensor(sample['dbp'])
+            map_val = torch.tensor(sample['map'])
+            
+            return signals, torch.stack([sbp_val, dbp_val, map_val], dim=-1)
+        
 
-        return sample
+class OnlineSubjectDataset(OnlineDatasetBase):
+    def __init__(self, min_run_length, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
+        # Build mapping between "internal index" and "real subject_id"
+        self.subject_idx2id = {i: sid for i, sid in enumerate(self.subjects_for_personalization)}
 
-class ContinualLearningDataset(Dataset): # Correctly inherits from torch.utils.data.Dataset
-    def __init__(self, online_physio_dataset_instance: OnlinePhysioDataset):
+        self.active_subject = None
+        self.active_subject_samples = []
+        self.sample_pointer = 0
+        
+        self.min_run_length = min_run_length
+        
+        self.filter_short_runs(self.min_run_length)
+
+    def get_subject_id(self, subj_idx: int):
+        """Map internal index [0..N-1] -> real subject_id."""
+        return self.subject_idx2id[subj_idx]
+
+    def get_subject_idx(self, subject_id: int):
+        """Map real subject_id -> internal index [0..N-1]."""
+        return self.subject_id2idx[subject_id]
+
+    def set_active_subject(self, subject_identifier):
         """
-        Initializes the ContinualLearningDataset for subject-specific online learning.
-
-        Args:
-            online_physio_dataset_instance (OnlinePhysioDataset): An *already initialized*
-                                                            instance of OnlinePhysioDataset.
+        Set active subject either by:
+          - subject index in [0..N-1] (int)
         """
-        super().__init__() # Call parent constructor for Dataset
-        # We hold a reference to the already-opened OnlinePhysioDataset
-        # This instance already has the LMDB environment and transaction open.
-        self.base_dataset = online_physio_dataset_instance
+        if subject_identifier in self.subject_idx2id:
+            subject_id = self.subject_idx2id[subject_identifier]
+        else:
+            raise ValueError(f"Invalid subject identifier: {subject_identifier}")
 
-        self.active_subject_id = None
-        self.active_subject_keys = []  # List of LMDB key strings for the current active subject, in temporal order
-        # current_sample_idx is no longer needed here as DataLoader manages iteration
-        self.current_epoch_samples = [] # Cache of samples for the current epoch/pass over a subject for analysis/plotting
-
-        print(f"{self.__class__.__name__} initialized for continual learning.")
-
-    def set_active_subject(self, subject_id: int):
-        """
-        Sets the active subject for online learning and loads their sample keys.
-        Resets the internal sample pointer.
-
-        Args:
-            subject_id (int): The ID of the subject to set as active.
-        """
-        # Access subject_list and index_by_subject_id from the base_dataset instance
-        if subject_id not in self.base_dataset.subject_list:
-            raise ValueError(f"Subject {subject_id} not found in the dataset.")
-
-        self.active_subject_id = subject_id
-
-        # Retrieve all LMDB keys for this subject and sort them to ensure temporal order.
-        unsorted_keys = self.base_dataset.index_by_subject_id[subject_id]
-        self.active_subject_keys = sorted(
-            unsorted_keys,
-            key=lambda k: int(k.split('_')[-1])
-        )
-        self.current_epoch_samples = [] # Clear cache for new subject or new pass
-
-        print(f"Active subject set to {subject_id}. Total samples: {len(self.active_subject_keys)}")
+        self.active_subject = subject_id
+        self.active_subject_samples = self.subject_adjacent_samples[subject_id]
+        
+        self.sample_pointer = 0
 
     def __len__(self):
+        if self.active_subject is None:
+            return 0
+        return len(self.active_subject_samples)
+
+    def find_consecutive_runs(self, sample_list):
         """
-        Returns the total number of samples for the currently active subject.
-        This is crucial for DataLoader to know the size of the dataset for the current subject.
+        Find runs of consecutive values in a list of sample indices.
         """
-        return len(self.active_subject_keys)
+        if not sample_list:
+            return []
 
-    def __getitem__(self, idx: int):
+        runs = []
+        start_idx = 0
+
+        for i in range(1, len(sample_list)):
+            if sample_list[i] != sample_list[i - 1] + 1:
+                run_values = sample_list[start_idx:i]
+                runs.append({
+                    "start_idx": start_idx,
+                    "end_idx": i - 1,
+                    "values": run_values,
+                    "length": len(run_values)
+                })
+                start_idx = i
+
+        run_values = sample_list[start_idx:]
+        runs.append({
+            "start_idx": start_idx,
+            "end_idx": len(sample_list) - 1,
+            "values": run_values,
+            "length": len(run_values)
+        })
+
+        return runs
+
+    def filter_short_runs(self, min_run_length: int):
+        r"""
+        Filter subject_adjacent_samples so that only runs of consecutive windows
+        with length >= min_run_length are kept. Synchronizes index_by_subject_id
+        accordingly by removing samples at the same positions.
+
+        Parameters
+        ------------
+        min_run_length: int
+            Minimum run length to keep. Runs shorter than this are removed.
+
+        Returns
+        ------------
+        None (updates self.subject_adjacent_samples and self.index_by_subject_id in place)
         """
-        Retrieves a single sample by its index within the active subject's data.
-        This method is called by the DataLoader.
+        for subj in self.subjects_for_personalization:
+            sample_list = self.subject_adjacent_samples[subj]
+            index_list = self.index_by_subject_id[subj]
 
-        Args:
-            idx (int): The index of the sample to retrieve within the active_subject_keys list.
+            runs = self.find_consecutive_runs(sample_list)
 
-        Returns:
-            dict: A dictionary containing the loaded sample data (signals, annotations, flags, etc.).
+            # Collect indices of valid runs
+            keep_positions = []
+            for r in runs:
+                if r["length"] >= min_run_length:
+                    keep_positions.extend(range(r["start_idx"], r["end_idx"] + 1))
+
+            # Filter both lists consistently
+            self.subject_adjacent_samples[subj] = [sample_list[i] for i in keep_positions]
+            self.index_by_subject_id[subj] = [index_list[i] for i in keep_positions]
+
+
+    def get_subject_runs(self, subject_id: int, training_samples: int = 8):
+        r"""
+        Get runs of adjacent samples for a subject, ensuring runs are longer than min_run_length.
+        Each run is divided into training (first 8 samples) and testing (remaining samples).
+        The returned indices correspond to self.index_by_subject_id, not subject_adjacent_samples.
+
+        Parameters
+        ------------
+        subject_id : int
+            Subject identifier (internal idx that has to be mapped to the subject ID from dataset).
+        training_samples : int, optional
+            Minimum number of samples for training per run (default=8).
+
+        Returns
+        ------------
+        runs : list of dict
+            Each dict has:
+              - "train": list of sample IDs for training (first 8)
+              - "test": list of sample IDs for testing (remaining)
+              - "all": list of all sample IDs in the run
         """
-        if self.active_subject_id is None:
-            raise RuntimeError("No active subject set. Call set_active_subject() first.")
-        if idx >= len(self.active_subject_keys):
-            raise IndexError(f"Index {idx} out of bounds for active subject's samples (0 to {len(self.active_subject_keys) - 1})")
+        sample_list = self.subject_adjacent_samples[self.subject_idx2id[subject_id]]
+        index_list = self.index_by_subject_id[self.subject_idx2id[subject_id]]
 
-        lmdb_key = self.active_subject_keys[idx]
+        runs = self.find_consecutive_runs(sample_list)
+        subject_runs = []
 
-        # Use the base_dataset's _get_sample_by_key to load the full sample dictionary
-        sample_data = self.base_dataset._get_sample_by_key(lmdb_key)
+        for r in runs:
+            if r["length"] >= training_samples:
+                # Translate run positions to sample IDs via index_by_subject_id
+                run_positions = range(r["start_idx"], r["end_idx"] + 1)
+                run_samples = [index_list[i] for i in run_positions]
 
-        # Cache the sample data for later analysis/plotting.
-        # Note: If DataLoader uses multiple workers, caching might be tricky.
-        # For simplicity in this example, we'll append. For large datasets with many workers,
-        # you might need a more sophisticated caching mechanism or collect during inference.
-        # For now, this will work correctly if `num_workers=0`.
-        self.current_epoch_samples.append(sample_data)
+                subject_runs.append({
+                    "train": run_samples[:training_samples],   # first training_samples for personalization
+                    "test": run_samples[training_samples:],    # rest for evaluation
+                    "all": run_samples
+                })
 
-        return sample_data
-
-    def analyze_and_plot_active_subject_sequences(self, savepath: str):
-        """
-        Analyzes and plots sequence validity for the currently active subject
-        based on the samples collected in the current epoch/pass (`self.current_epoch_samples`).
-        """
-        if self.active_subject_id is None:
-            print("No active subject set for analysis.")
-            return
-        if not self.current_epoch_samples:
-            print(f"No samples collected for Subject {self.active_subject_id} in the current pass for analysis.")
-            return
-
-        print(f"\nAnalyzing sequences for Subject {self.active_subject_id} from cached samples...")
-
-        subject_windows_for_analysis = self.current_epoch_samples
-
-        supervised_sequence_lengths = []
-        unlabeled_sequence_lengths = []
-        ppg_ecg_any_abp_sequence_lengths = []
-
-        current_supervised_sequence_length = 0
-        current_unlabeled_sequence_length = 0
-        current_ppg_ecg_any_abp_sequence_length = 0
-
-        min_supervised_len_info = {'len': float('inf'), 'start_key': None, 'end_key': None}
-        max_supervised_len_info = {'len': 0, 'start_key': None, 'end_key': None}
-        min_unlabeled_len_info = {'len': float('inf'), 'start_key': None, 'end_key': None}
-        max_unlabeled_len_info = {'len': 0, 'start_key': None, 'end_key': None}
-        min_any_abp_len_info = {'len': float('inf'), 'start_key': None, 'end_key': None}
-        max_any_abp_len_info = {'len': 0, 'start_key': None, 'end_key': None}
-
-        current_supervised_start_key = None
-        current_unlabeled_start_key = None
-        current_any_abp_start_key = None
-
-        for i, window_data in enumerate(subject_windows_for_analysis):
-            ppg_valid = window_data['ppg_valid']
-            ecg_valid = window_data['ecg_valid']
-            abp_valid = window_data['abp_valid']
-            current_key = window_data['lmdb_key'] # Get the LMDB key from the stored sample data itself
-
-            # Supervised sequences
-            if ppg_valid and ecg_valid and abp_valid:
-                if current_supervised_sequence_length == 0:
-                    current_supervised_start_key = current_key
-                current_supervised_sequence_length += 1
-
-                if current_unlabeled_sequence_length > 0:
-                    unlabeled_sequence_lengths.append(current_unlabeled_sequence_length)
-                    if current_unlabeled_sequence_length < min_unlabeled_len_info['len']:
-                        min_unlabeled_len_info['len'] = current_unlabeled_sequence_length
-                        min_unlabeled_len_info['start_key'] = current_unlabeled_start_key
-                        min_unlabeled_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    if current_unlabeled_sequence_length > max_unlabeled_len_info['len']:
-                        max_unlabeled_len_info['len'] = current_unlabeled_sequence_length
-                        max_unlabeled_len_info['start_key'] = current_unlabeled_start_key
-                        max_unlabeled_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    current_unlabeled_sequence_length = 0
-            else:
-                if current_supervised_sequence_length > 0:
-                    supervised_sequence_lengths.append(current_supervised_sequence_length)
-                    if current_supervised_sequence_length < min_supervised_len_info['len']:
-                        min_supervised_len_info['len'] = current_supervised_sequence_length
-                        min_supervised_len_info['start_key'] = current_supervised_start_key
-                        min_supervised_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    if current_supervised_sequence_length > max_supervised_len_info['len']:
-                        max_supervised_len_info['len'] = current_supervised_sequence_length
-                        max_supervised_len_info['start_key'] = current_supervised_start_key
-                        max_supervised_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    current_supervised_sequence_length = 0
-
-            # Unlabeled (pseudo-labeling candidate) sequences
-            if ppg_valid and ecg_valid and not abp_valid:
-                if current_unlabeled_sequence_length == 0:
-                    current_unlabeled_start_key = current_key
-                current_unlabeled_sequence_length += 1
-            else:
-                if current_unlabeled_sequence_length > 0:
-                    unlabeled_sequence_lengths.append(current_unlabeled_sequence_length)
-                    if current_unlabeled_sequence_length < min_unlabeled_len_info['len']:
-                        min_unlabeled_len_info['len'] = current_unlabeled_sequence_length
-                        min_unlabeled_len_info['start_key'] = current_unlabeled_start_key
-                        min_unlabeled_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    if current_unlabeled_sequence_length > max_unlabeled_len_info['len']:
-                        max_unlabeled_len_info['len'] = current_unlabeled_sequence_length
-                        max_unlabeled_len_info['start_key'] = current_unlabeled_start_key
-                        max_unlabeled_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    current_unlabeled_sequence_length = 0
-
-            # PPG and ECG valid (any ABP) sequences
-            if ppg_valid and ecg_valid:
-                if current_ppg_ecg_any_abp_sequence_length == 0:
-                    current_any_abp_start_key = current_key
-                current_ppg_ecg_any_abp_sequence_length += 1
-            else:
-                if current_ppg_ecg_any_abp_sequence_length > 0:
-                    ppg_ecg_any_abp_sequence_lengths.append(current_ppg_ecg_any_abp_sequence_length)
-                    if current_ppg_ecg_any_abp_sequence_length < min_any_abp_len_info['len']:
-                        min_any_abp_len_info['len'] = current_ppg_ecg_any_abp_sequence_length
-                        min_any_abp_len_info['start_key'] = current_any_abp_start_key
-                        min_any_abp_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    if current_ppg_ecg_any_abp_sequence_length > max_any_abp_len_info['len']:
-                        max_any_abp_len_info['len'] = current_ppg_ecg_any_abp_sequence_length
-                        max_any_abp_len_info['start_key'] = current_any_abp_start_key
-                        max_any_abp_len_info['end_key'] = subject_windows_for_analysis[i-1]['lmdb_key']
-                    current_ppg_ecg_any_abp_sequence_length = 0
-
-        # Handle remaining sequences at the end of the subject data
-        if current_supervised_sequence_length > 0:
-            supervised_sequence_lengths.append(current_supervised_sequence_length)
-            if current_supervised_sequence_length < min_supervised_len_info['len']:
-                min_supervised_len_info['len'] = current_supervised_sequence_length
-                min_supervised_len_info['start_key'] = current_supervised_start_key
-                min_supervised_len_info['end_key'] = subject_windows_for_analysis[-1]['lmdb_key']
-            if current_supervised_sequence_length > max_supervised_len_info['len']:
-                max_supervised_len_info['len'] = current_supervised_sequence_length
-                max_supervised_len_info['start_key'] = current_supervised_start_key
-                max_supervised_len_info['end_key'] = subject_windows_for_analysis[-1]['lmdb_key']
-
-        if current_unlabeled_sequence_length > 0:
-            unlabeled_sequence_lengths.append(current_unlabeled_sequence_length)
-            if current_unlabeled_sequence_length < min_unlabeled_len_info['len']:
-                min_unlabeled_len_info['len'] = current_unlabeled_sequence_length
-                min_unlabeled_len_info['start_key'] = current_unlabeled_start_key
-                min_unlabeled_len_info['end_key'] = subject_windows_for_analysis[-1]['lmdb_key']
-            if current_unlabeled_sequence_length > max_unlabeled_len_info['len']:
-                max_unlabeled_len_info['len'] = current_unlabeled_sequence_length
-                max_unlabeled_len_info['start_key'] = current_unlabeled_start_key
-                max_unlabeled_len_info['end_key'] = subject_windows_for_analysis[-1]['lmdb_key']
-
-        if current_ppg_ecg_any_abp_sequence_length > 0:
-            ppg_ecg_any_abp_sequence_lengths.append(current_ppg_ecg_any_abp_sequence_length)
-            if current_ppg_ecg_any_abp_sequence_length < min_any_abp_len_info['len']:
-                min_any_abp_len_info['len'] = current_ppg_ecg_any_abp_sequence_length
-                min_any_abp_len_info['start_key'] = current_any_abp_start_key
-                min_any_abp_len_info['end_key'] = subject_windows_for_analysis[-1]['lmdb_key']
-            if current_ppg_ecg_any_abp_sequence_length > max_any_abp_len_info['len']:
-                max_any_abp_len_info['len'] = current_ppg_ecg_any_abp_sequence_length
-                max_any_abp_len_info['start_key'] = current_any_abp_start_key
-                max_any_abp_len_info['end_key'] = subject_windows_for_analysis[-1]['lmdb_key']
-
-        print(f"\n--- Subject {self.active_subject_id} Sequence Analysis ---")
-        if supervised_sequence_lengths:
-            print(f"Supervised Sequences (PPG, ECG, ABP Valid):")
-            print(f"  Min Length: {min_supervised_len_info['len']} windows ({min_supervised_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {min_supervised_len_info['start_key']}, End Key: {min_supervised_len_info['end_key']}")
-            print(f"  Max Length: {max_supervised_len_info['len']} windows ({max_supervised_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {max_supervised_len_info['start_key']}, End Key: {max_supervised_len_info['end_key']}")
-            print(f"  Mean Length: {np.mean(supervised_sequence_lengths):.2f} windows")
-        else:
-            print("No supervised sequences found for this subject.")
-
-        if unlabeled_sequence_lengths:
-            print(f"Unlabeled Sequences (PPG, ECG Valid, ABP Invalid):")
-            print(f"  Min Length: {min_unlabeled_len_info['len']} windows ({min_unlabeled_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {min_unlabeled_len_info['start_key']}, End Key: {min_unlabeled_len_info['end_key']}")
-            print(f"  Max Length: {max_unlabeled_len_info['len']} windows ({max_unlabeled_len_info['len'] * self.base_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {max_unlabeled_len_info['start_key']}, End Key: {max_unlabeled_len_info['end_key']}")
-            print(f"  Mean Length: {np.mean(unlabeled_sequence_lengths):.2f} windows")
-        else:
-            print("No unlabeled (pseudo-labeling candidate) sequences found for this subject.")
-
-        if ppg_ecg_any_abp_sequence_lengths:
-            print(f"PPG and ECG Valid (regardless of ABP) Sequences:")
-            print(f"  Min Length: {min_any_abp_len_info['len']} windows ({min_any_abp_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {min_any_abp_len_info['start_key']}, End Key: {min_any_abp_len_info['end_key']}")
-            print(f"  Max Length: {max_any_abp_len_info['len']} windows ({max_any_abp_len_info['len'] * self.base_dataset.input_seq_len_s} s), Start Key: {max_any_abp_len_info['start_key']}, End Key: {max_any_abp_len_info['end_key']}")
-            print(f"  Mean Length: {np.mean(ppg_ecg_any_abp_sequence_lengths):.2f} windows")
-        else:
-            print("No sequences found where PPG and ECG were valid for this subject.")
-
-        print(f"\nPlotting validity for Subject {self.active_subject_id} to {savepath}")
-        plot_subject_validity_over_time(
-            self.active_subject_id,
-            self.current_epoch_samples, # Use the cached full sample data for plotting
-            self.base_dataset.input_seq_len_s,
-            self.base_dataset.fs,
-            savepath
-        )
+        return subject_runs
 
 
 def parseargs():
@@ -463,19 +304,12 @@ def parseargs():
     parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--pretraining_ratio', default=0.8, type=float, help='pretraining ratio of the whole dataset')
-    parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
-    parser.add_argument('--personalization_sample_number', default=50, type=int, help='number of samples to take for personalization')
     parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
+    parser.add_argument('--min_run_length', default=0, type=int, help='minimum number of samples per subject to consider it valid for doing online learning, 0 means no limit')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
-    parser.add_argument('--resp', default='False', type=lambda x: bool(strtobool(x)), help='whether to load also resp with ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--ppg_derivatives', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg derivatives or not')
-    parser.add_argument('--ppg_emd', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg imfs or not')
-    parser.add_argument('--ppg_freqs', default='False', type=lambda x: bool(strtobool(x)), help='whether to load ppg freqs or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
-    parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     args = parser.parse_args()
@@ -483,94 +317,47 @@ def parseargs():
 
 
 if __name__ == "__main__":
-    global args
+
     args = parseargs()
-
-    # RESP is loaded only if ECG is also loaded
-    if args.resp and not args.ecg:
-        raise ValueError('RESP can be loaded only along with ECG')
-
-    # PPG derivatives/PPG EMD/PPG freqs are loaded only if ecg (and optionally resp) are not present
-    if (args.ppg_derivatives or args.ppg_emd or args.ppg_freqs) and args.ecg:
-        raise ValueError('PPG derivatives/emd/scalogram can be loaded only without ECG (and optionally RESP)')
 
     root_figs_folder = os.path.join(args.save_path, args.name)
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
 
     # Instantiate OnlinePhysioDataset (the base for continual learning)
-    online_physio_dataset_base = OnlinePhysioDataset(
+    online_physio_dataset = OnlineSubjectDataset(
+        seed=args.seed,
         lmdb_folder=os.path.join(args.dataset_folder, args.name),
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
+        min_run_length=args.min_run_length,
         ecg=args.ecg,
-        resp=args.resp,
         sig2sig=args.sig2sig,
-        ppg_derivatives=args.ppg_derivatives,
-        ppg_emd=args.ppg_emd,
-        ppg_freqs=args.ppg_freqs,
-        min_subject_sample_number=0 # Keep 0 for now as it doesn't affect data loading
+        savepath=root_figs_folder
     )
+    
+    # Sucjet id
+    subject_id = 12
+    print(f"Subject selected {subject_id}")
+    online_physio_dataset.set_active_subject(subject_id)
+    
+    # Compute runs first
+    all_runs = []
+    for subj in online_physio_dataset.subjects_for_personalization:
+        runs = online_physio_dataset.find_consecutive_runs(online_physio_dataset.subject_adjacent_samples[subj])
+        all_runs.append(runs)
 
-    # --- Continual Learning Setup ---
-    # ContinualLearningDataset now WRAPS OnlinePhysioDataset
-    continual_ds = ContinualLearningDataset(online_physio_dataset_base)
+    # Plot distribution across all subjects
+    plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if args.min_run_length == 0 else f'all_subjects_run_lengths_{args.min_run_length}.jpg'))
 
-    # Example: Select a subject for online learning (e.g., the first subject in the list)
-    if continual_ds.base_dataset.subject_list: # Access subject_list through the base_dataset instance
-        online_subject_id = continual_ds.base_dataset.subject_list[0] # Using index 0 for demonstration
-    else:
-        print("No subjects available in the dataset for online learning.")
-        sys.exit(1)
+    # Plot the Annotation statistics for the runs
+    runs = online_physio_dataset.get_subject_runs(subject_id, training_samples=8)
+    for run_idx, run in enumerate(runs):
+        print(f"Run {run_idx}: total={len(run['all'])}, "
+            f"train={len(run['train'])}, test={len(run['test'])}")
+        print("Train IDs:", run["train"])
+        print("Test IDs:", run["test"])
+        
+    runs = online_physio_dataset.get_subject_runs(subject_id)
 
-    continual_ds.set_active_subject(online_subject_id)
-
-    # --- Simulate Online Training Loop for a Subject using DataLoader ---
-    print(f"\nStarting simulated online learning for Subject S{online_subject_id} using DataLoader...")
-    # Create a DataLoader for the current subject
-    # num_workers > 0 will require the _get_sample_by_key method to be callable from new processes.
-    # LMDB handles this by reopening the env in each worker, but it's important that _get_sample_by_key
-    # doesn't rely on a *shared* transaction, but rather one opened *per process*.
-    # The `before_pickle` method in OnlinePhysioDataset helps here.
-    subject_dataloader = DataLoader(continual_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.loader_worker)
-
-    sample_count = 0
-    for batch_idx, sample_data_batch in enumerate(subject_dataloader):
-        signals_batch = sample_data_batch['sig_tensor']
-        annotation_batch = sample_data_batch['annotation_tensor']
-        abp_valid_batch = sample_data_batch['abp_valid']
-        ppg_valid_batch = sample_data_batch['ppg_valid']
-        ecg_valid_batch = sample_data_batch['ecg_valid']
-        lmdb_keys_batch = sample_data_batch['lmdb_key'] # LMDB keys will be a list of strings if not batched as tensors
-
-        # Here's where your online learning logic goes:
-        # 1. Feed `signals_batch` (torch.Tensor) to your pre-trained model.
-        # 2. Filter valid samples within the batch if needed (already done in personalization.py)
-        # 3. If `abp_valid_batch` indicates valid samples:
-        #    This is a labeled batch. Use `signals_batch` and `annotation_batch` for supervised fine-tuning.
-        # 4. If `abp_valid_batch` indicates invalid samples:
-        #    This is an unlabeled batch. Generate pseudo-labels for `signals_batch` using your model.
-        #    Use `signals_batch` and the pseudo-labels for semi-supervised training.
-        # 5. Apply continual learning strategies (e.g., experience replay, regularization)
-        #    based on the sample's type (labeled/unlabeled) and your chosen method.
-
-        print(f"Processing batch {batch_idx}: "
-              f"Signals batch shape: {signals_batch.shape}, "
-              f"Batch size: {signals_batch.size(0)}, "
-              f"First LMDB Key: {lmdb_keys_batch[0] if len(lmdb_keys_batch) > 0 else 'N/A'}")
-
-        sample_count += signals_batch.size(0)
-        # Add a break for demonstration purposes to avoid infinite loop on very long recordings
-        # if sample_count >= 1000: # Process first 1000 samples for example
-        #    break
-
-    print(f"Finished processing {sample_count} samples for Subject {online_subject_id}.")
-
-    # --- Call analysis and plotting AFTER the loop ---
-    # This ensures `current_epoch_samples` has all data for the subject.
-    # Note: If `num_workers > 0`, `current_epoch_samples` will only contain samples
-    # from the main process worker (worker 0). For full plotting, you might need
-    # to collect all samples from the DataLoader loop and pass them to this function.
-    # For now, this will work correctly if `num_workers=0`.
-    print(f"\nPerforming analysis and plotting for Subject S{online_subject_id}...")
-    continual_ds.analyze_and_plot_active_subject_sequences(root_figs_folder)
+    plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"))

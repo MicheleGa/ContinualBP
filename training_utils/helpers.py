@@ -7,6 +7,7 @@ import argparse
 from distutils.util import strtobool
 import time
 import yaml
+import math
 import numpy as np
 import random
 import torch
@@ -35,7 +36,7 @@ def parseargs():
     # Optimization Setup
     parser.add_argument('--smoothl1loss_beta', default=5, type=int, help='beta for SmoothL1Loss')
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
-    parser.add_argument('--l2norm', default=0.001, type=float, help='L2 regularization')
+    parser.add_argument('--l2norm', default=0.0001, type=float, help='L2 regularization')
     parser.add_argument('--sgd_momentum', default=0.9, type=float, help='Momentum for SGD optimizer')
     parser.add_argument('--lrsched_step', default="5, 10, 15, 20, 40", type=str, help='learning rate scheduler steps')
     parser.add_argument('--lrsched_gamma', default=0.5, type=float, help='learning rate scheduler gamma')
@@ -73,10 +74,11 @@ def parseargs():
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     
     # Personalization Setup
-    parser.add_argument('--personalization_sample_number', default=100, type=float, help='number of samples to take for personalization (-1.0 to use all samples)')
+    parser.add_argument('--training_samples', default=8, type=float, help='number of samples to take for personalization')
+    parser.add_argument('--min_run_length', default=10, type=float, help='number of samples to take for trainng and testing personalization must be greater than training_samples')
     parser.add_argument('--num_personalization_subjects', default=100, type=int, help='number of subjects to for personalization')
-    parser.add_argument('--num_passes', default=3, type=int, help='number of passes on the same batch during personalization')
-    parser.add_argument('--tune', default='all', type=str, help='which part of the model to training during pretraining')
+    parser.add_argument('--personalization_steps', default=5, type=int, help='number of gradient steps for personalization')
+    parser.add_argument('--personalization_lr', default=5e-3, type=float, help='learning rate for personalization')
 
     # Self-supervision Setup
     parser.add_argument('--apply_masking', default='False', type=lambda x: bool(strtobool(x)), help='whether to apply masking for self-supervision or not')
@@ -93,9 +95,9 @@ def parseargs():
     parser.add_argument('--ft_stage2_epochs', default=50, type=int, help='epochs for full/unfrozen fine-tuning')
     parser.add_argument('--warmup_epochs_stage1', default=3, type=int, help='warmup epochs for stage1')
     parser.add_argument('--warmup_epochs_stage2', default=5, type=int, help='warmup epochs for stage2')
-    parser.add_argument('--base_lr', default=3e-4, type=float, help='learning rate for new heads')
+    parser.add_argument('--pre_train_lr', default=3e-4, type=float, help='learning rate for new heads')
     parser.add_argument('--backbone_lr_multiplier', default=0.05, type=float, help='multiplier for backbone lr')
-    parser.add_argument('--weight_decay', default=1e-2, type=float, help='weight decay for optimizer')
+    parser.add_argument('--weight_decay', default=1e-4, type=float, help='weight decay for optimizer')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping')
     parser.add_argument('--freeze_backbone_first', default=True, type=lambda x: bool(strtobool(x)), help='if True start with backbone frozen')
     parser.add_argument('--unfreeze_last_k_layers', default=0, type=int, help='if >0, only unfreeze last k transformer blocks in stage2')
@@ -103,33 +105,44 @@ def parseargs():
     # Meta-learning Setup
     parser.add_argument('--meta_learning', default='False', type=lambda x: bool(strtobool(x)), help='whether to do meta-learning or not')
     parser.add_argument('--meta_algorithm', default='maml', type=str, choices=['maml', 'mann', 'reptile'], help='meta-learning algorithm type')
-    
-    parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
-    parser.add_argument('--inner_steps', default=12, type=int, help='number of inner steps for meta-learning (increased for ANIL)')
-    parser.add_argument('--lr_inner', default=1e-2, type=float, help='inner learning rate for meta-learning')
-    parser.add_argument('--inner_adapt', default='all', type=str, help='ANIL: adapt only head parameters in inner loop')
-    parser.add_argument('--inner_opt', default='adam', type=str, help='inner loop optimizer type')
-    parser.add_argument('--inner_head_lr_mult', default=3.0, type=float, help='learning rate multiplier for head parameters in inner loop')
-    parser.add_argument('--inner_backbone_lr_mult', default=0.1, type=float, help='learning rate multiplier for backbone parameters')
-    parser.add_argument('--inner_lr_min', default=5e-3, type=float, help='minimum inner learning rate (increased for ANIL stability)')
-    parser.add_argument('--inner_steps_max', default=20, type=int, help='maximum inner steps for adaptive schedule')
-    parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'step', 'exponential'], help='meta-learning learning rate schedule type')
-    parser.add_argument('--inner_lr_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner learning rate schedule type (simplified for ANIL)')
-    parser.add_argument('--inner_steps_schedule', default='constant', type=str, choices=['constant', 'increasing'], help='inner steps schedule type (simplified for ANIL)')
-    parser.add_argument('--meta_lr_decay', default=0.95, type=float, help='meta-learning learning rate decay factor for exponential schedule')
-    parser.add_argument('--meta_lr_steps', default=[50, 100, 150], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
-    parser.add_argument('--meta_lr_gamma', default=0.5, type=float, help='meta-learning learning rate gamma for step decay')    
-    
+    parser.add_argument('--max_meta_epochs', default=800, type=int, help='maximum number of meta epochs')
     parser.add_argument('--meta_val_tasks', default=100, type=int, help='number of tasks for meta-validation')
     parser.add_argument('--meta_test_tasks', default=200, type=int, help='number of tasks for meta-validation')
     parser.add_argument('--meta_log_step', default=50, type=int, help='how often to log meta-learning metrics (reduced for better monitoring)')
-    parser.add_argument('--k_support', type=int, default=10, help='number of support samples in meta-learning')
-    parser.add_argument('--k_query', type=int, default=10, help='number of query samples in meta-learning')
-    parser.add_argument('--meta_batch_size', type=int, default=16, help='meta batch size')
-    parser.add_argument('--first_order_reptile', default=False, type=lambda x: bool(strtobool(x)), help='use first-order approximation for Reptile (faster)')
-    
+    parser.add_argument('--k_support', type=int, default=8, help='number of support samples in meta-learning')
+    parser.add_argument('--k_query', type=int, default=8, help='number of query samples in meta-learning')
+    parser.add_argument('--meta_batch_size', type=int, default=8, help='meta batch size')
+    parser.add_argument('--first_order_reptile', default=False, type=lambda x: bool(strtobool(x)), help='use first-order approximation for Reptile (faster)') 
     parser.add_argument('--use_pure_functional', default=False, type=lambda x: bool(strtobool(x)), help='use pure functional for MAML (True for memory efficiency)')
     parser.add_argument('--second_order_maml', default=False, type=lambda x: bool(strtobool(x)), help='use second-order derivative for MAML')
+    
+    parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
+    parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'cosine_wr'], help='meta-learning learning rate schedule type')
+    parser.add_argument('--meta_lr_decay', default=0.95, type=float, help='meta-learning learning rate decay factor for exponential schedule')
+    parser.add_argument('--meta_lr_steps', default=[50, 100, 150], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
+    parser.add_argument('--meta_lr_gamma', default=0.5, type=float, help='meta-learning learning rate gamma for step decay')   
+    parser.add_argument('--meta_lr_scheduler_T0', default=100, type=int, help='cosine wr scheduler T0 parmeter')   
+    parser.add_argument('--meta_lr_scheduler_T_mult', default=1.5, type=float, help='cosine wr scheduler T mult parmeter')   
+    parser.add_argument('--meta_lr_scheduler_eta_min', default=0.00001, type=float, help='cosine wr scheduler eta min parmeter')
+    parser.add_argument('--meta_lr_scheduler_gamma', default=0.00001, type=float, help='cosine wr scheduler eta min parmeter')
+    parser.add_argument('--meta_lr_scheduler_min_gamma', default=0.00001, type=float, help='cosine wr scheduler eta min gamma')
+    parser.add_argument('--meta_lr_scheduler_max_cycles', default=3, type=int, help='cosine wr number of cycless')
+    parser.add_argument('--meta_lr_scheduler_tail', default='cosine', type=str, help='meta learning rate schedule for the end of training')
+    parser.add_argument('--meta_lr_scheduler_eta_floor', default=0.00001, type=float, help='cosine wr scheduler eta floor')
+    
+    parser.add_argument('--inner_adapt', default='head', type=str, help='ANIL: adapt only head parameters in inner loop')
+    parser.add_argument('--inner_opt', default='adam', type=str, help='inner loop optimizer type')
+    parser.add_argument('--inner_lr', default=1e-2, type=float, help='inner learning rate for meta-learning')
+    parser.add_argument('--inner_lr_min', default=1e-3, type=float, help='minimum inner learning rate (increased for ANIL stability)')
+    parser.add_argument('--inner_lr_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner learning rate schedule type (simplified for ANIL)')
+    parser.add_argument('--inner_head_lr_mult', default=1.0, type=float, help='learning rate multiplier for head parameters in inner loop')
+    parser.add_argument('--inner_backbone_lr_mult', default=0.1, type=float, help='learning rate multiplier for backbone parameters')
+    parser.add_argument('--inner_steps', default=4, type=int, help='number of inner steps for meta-learning (increased for ANIL)')
+    parser.add_argument('--inner_steps_max', default=8, type=int, help='maximum inner steps for cosine schedule')
+    parser.add_argument('--inner_steps_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner steps schedule type (simplified for ANIL)')
+    
+    parser.add_argument('--eval_lr', default=5e-3, type=float, help='inner learning rate for meta-learning evaluation')
+    parser.add_argument('--eval_steps', default=5, type=int, help='inner steps for meta-learning evaluation')
     
     # Model Setup
     parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
@@ -1224,3 +1237,167 @@ def get_model_architecture(config):
         raise ValueError("Invalid model name ...")
     
     return model
+
+
+    
+def get_meta_lr(epoch, config):
+    
+    meta_lr_schedule = config['meta_lr_schedule']
+    meta_epochs = config['max_meta_epochs']
+    base_meta_lr = config['meta_lr']
+
+    if meta_lr_schedule == 'constant':
+        return base_meta_lr
+    elif meta_lr_schedule == 'cosine':
+        return base_meta_lr * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
+    elif meta_lr_schedule == 'cosine_wr':
+        # Extended version with decaying peaks and optional tail
+        T0      = int(config.get('meta_lr_scheduler_T0'))
+        T_mult  = float(config.get('meta_lr_scheduler_T_mult'))
+        eta_min0 = float(config.get('meta_lr_scheduler_eta_min'))
+        gamma   = float(config.get('meta_lr_scheduler_gamma'))
+        min_gamma = float(config.get('meta_lr_scheduler_min_gamma'))
+        max_cycles = config.get('meta_lr_scheduler_max_cycles')
+        tail_mode  = config.get('meta_lr_scheduler_tail')
+        eta_floor  = float(config.get('meta_lr_scheduler_eta_floor'))
+
+        cycle = 0
+        length = T0
+        e = epoch
+        while e >= length:
+            e -= length
+            cycle += 1
+            length = int(length * T_mult)
+
+        if (max_cycles is not None) and (cycle >= int(max_cycles)):
+            # compute how many epochs since last cycle finished
+            rem = epoch
+            length = T0
+            for _ in range(int(max_cycles)):
+                rem -= length
+                length = int(length * T_mult)
+            tail_epoch = max(0, rem)
+            total_epochs = int(config['max_meta_epochs'])
+            last_cycle_peak = base_meta_lr * (gamma ** (int(max_cycles)-1))
+
+            if tail_mode == 'linear':
+                progress = min(1.0, tail_epoch / max(1, total_epochs))
+                return eta_floor + (last_cycle_peak - eta_floor) * (1.0 - progress)
+            else:
+                phase = min(1.0, tail_epoch / max(1, total_epochs))
+                return eta_floor + 0.5 * (last_cycle_peak - eta_floor) * (1 + math.cos(math.pi * phase))
+
+        eta_max_cycle = base_meta_lr * (gamma ** cycle)
+        eta_min_cycle = eta_min0 * (min_gamma ** cycle)
+        return eta_min_cycle + 0.5 * (eta_max_cycle - eta_min_cycle) * (1 + math.cos(math.pi * e / max(1, length)))
+    else:
+        return base_meta_lr
+
+
+def get_inner_lr(epoch, config):
+    
+    schedule = config['inner_lr_schedule']
+    meta_epochs = config['max_meta_epochs']
+    base_inner_lr = config['inner_lr']
+    inner_lr_min = config['inner_lr_min']
+    
+    if schedule == 'constant':
+        return base_inner_lr
+    elif schedule == 'cosine':
+        return inner_lr_min + (base_inner_lr - inner_lr_min) * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
+    else:
+        return base_inner_lr
+
+
+def get_inner_steps(epoch, config):
+    
+    meta_epochs = config['max_meta_epochs']
+    schedule = config['inner_steps_schedule']
+    base_steps = config['inner_steps']
+    max_steps = config['inner_steps_max']
+    
+    if schedule == 'constant':
+        return base_steps
+    elif schedule == 'cosine':
+        progress = epoch / meta_epochs
+        return int(round(base_steps + 0.5 * (1 - math.cos(math.pi * progress)) * (max_steps - base_steps)))
+    else:
+        return base_steps
+    
+    
+def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
+    """
+    Build inner optimizer for meta-learning algorithms.
+    Behaviors:
+    - inner_adapt='all'  : adapt backbone + regressor
+    - inner_adapt='head' : freeze backbone, adapt only regressor
+    Also supports per-group LR multipliers and opt type.
+    """
+    mode = config.get('inner_adapt')   
+    opt_type = config.get('inner_opt').lower()  
+    head_mult = float(config.get('inner_head_lr_mult'))
+    weight_decay = float(config.get('weight_decay'))
+    
+    # Decide which params to adapt
+    backbone_params = [p for p in adapted_model.parameters()
+                       if p.is_floating_point() or p.is_complex()]
+    head_params = [p for p in adapted_regressor.parameters()
+                   if p.is_floating_point() or p.is_complex()]
+
+    if mode == 'head':
+        # freeze backbone
+        for p in backbone_params:
+            p.requires_grad = False
+        params = [
+            {'params': head_params, 'lr': base_lr * head_mult},
+        ]
+    elif mode == 'all':    
+        bb_mult   = float(config.get('inner_backbone_lr_mult'))
+        # train both
+        for p in backbone_params:
+            p.requires_grad = True
+        for p in head_params:
+            p.requires_grad = True
+        params = [
+            {'params': backbone_params, 'lr': base_lr * bb_mult},
+            {'params': head_params,     'lr': base_lr * head_mult},
+        ]
+    else:
+        raise ValueError("config['inner_adapt'] must be 'all' or 'head'")
+
+    # Build optimizer
+    if opt_type == 'adam':
+        inner_opt = torch.optim.Adam(params, lr=base_lr, weight_decay=weight_decay)
+    elif opt_type == 'sgd':
+        momentum = float(config.get('sgd_momentum'))
+        inner_opt = torch.optim.SGD(params, lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+    else:
+        raise ValueError("config['inner_opt'] must be 'adam' or 'sgd'")
+
+    return inner_opt
+    
+
+def get_backbone_and_head_params(model, regressor):
+        backbone_params, head_params = [], []
+        for _, p in model.named_parameters():
+            backbone_params.append(p)
+        for _, p in regressor.named_parameters():
+            head_params.append(p)
+        return backbone_params, head_params
+    
+
+def linear_warmup(current_epoch, warmup_epochs, base_lr):
+    if current_epoch >= warmup_epochs:
+        return base_lr
+    return base_lr * (0.1 + 0.9 * (current_epoch / warmup_epochs))
+
+
+def set_requires_grad_safe(module, req, original_trainable, name_prefix=""):
+        """Toggle requires_grad but respect original_trainable mask when unfreezing."""
+        for n, p in module.named_parameters():
+            full_name = f"{name_prefix}.{n}" if name_prefix else n
+            if not req:  # freezing
+                p.requires_grad = False
+            else:        # unfreezing
+                if original_trainable.get(full_name, True):
+                    p.requires_grad = True
