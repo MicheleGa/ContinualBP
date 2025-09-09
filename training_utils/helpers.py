@@ -11,6 +11,7 @@ import math
 import numpy as np
 import random
 import torch
+import torch.nn.functional as F
 from models import ResGRUNet, PhysioFormer, SSLUNet, UNet, GRU, Transformer, EUNet, SSLEUNet, BIOT, SSLBIOT
 from models.UNet import AttentionGate1D, SelfAttentionBlock1D
 
@@ -74,11 +75,16 @@ def parseargs():
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     
     # Personalization Setup
-    parser.add_argument('--training_samples', default=8, type=float, help='number of samples to take for personalization')
+    parser.add_argument('--use_ratio', default='False', type=lambda x: bool(strtobool(x)), help='whether to split personalization batches into training/testing after a ratio or to take a fixed number of samples')
+    parser.add_argument('--training_samples', default=8, type=int, help='number of samples to take for personalization')
+    parser.add_argument('--training_ratio', default=0.5, type=float, help='number of samples to take for personalization as ratio')
     parser.add_argument('--min_run_length', default=10, type=float, help='number of samples to take for trainng and testing personalization must be greater than training_samples')
     parser.add_argument('--num_personalization_subjects', default=100, type=int, help='number of subjects to for personalization')
     parser.add_argument('--personalization_steps', default=5, type=int, help='number of gradient steps for personalization')
     parser.add_argument('--personalization_lr', default=5e-3, type=float, help='learning rate for personalization')
+    parser.add_argument('--plot_personalization', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot the subject annotation over the total windows or not')
+    parser.add_argument('--personalization_batch_size', default=32, type=int, help='batch size for personalization')
+    parser.add_argument('--setup_type', default='drift', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
 
     # Self-supervision Setup
     parser.add_argument('--apply_masking', default='False', type=lambda x: bool(strtobool(x)), help='whether to apply masking for self-supervision or not')
@@ -117,10 +123,10 @@ def parseargs():
     parser.add_argument('--second_order_maml', default=False, type=lambda x: bool(strtobool(x)), help='use second-order derivative for MAML')
     
     parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
-    parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'cosine_wr'], help='meta-learning learning rate schedule type')
+    parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'cosine_wr', 'multistep'], help='meta-learning learning rate schedule type')
     parser.add_argument('--meta_lr_decay', default=0.95, type=float, help='meta-learning learning rate decay factor for exponential schedule')
-    parser.add_argument('--meta_lr_steps', default=[50, 100, 150], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
-    parser.add_argument('--meta_lr_gamma', default=0.5, type=float, help='meta-learning learning rate gamma for step decay')   
+    parser.add_argument('--meta_lr_steps', default=[20, 40, 60, 80, 100], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
+    parser.add_argument('--meta_lr_gamma', default=0.1, type=float, help='meta-learning learning rate gamma for step decay')   
     parser.add_argument('--meta_lr_scheduler_T0', default=100, type=int, help='cosine wr scheduler T0 parmeter')   
     parser.add_argument('--meta_lr_scheduler_T_mult', default=1.5, type=float, help='cosine wr scheduler T mult parmeter')   
     parser.add_argument('--meta_lr_scheduler_eta_min', default=0.00001, type=float, help='cosine wr scheduler eta min parmeter')
@@ -1290,6 +1296,16 @@ def get_meta_lr(epoch, config):
         eta_max_cycle = base_meta_lr * (gamma ** cycle)
         eta_min_cycle = eta_min0 * (min_gamma ** cycle)
         return eta_min_cycle + 0.5 * (eta_max_cycle - eta_min_cycle) * (1 + math.cos(math.pi * e / max(1, length)))
+    elif meta_lr_schedule == 'multistep':
+        # MultiStep LR: piecewise decay at specified milestones
+        milestones = config.get("meta_lr_steps")  # epochs where decay happens
+        gamma = float(config.get("meta_lr_gamma")) # decay factor
+        lr = base_meta_lr
+        for m in milestones:
+            if epoch >= m:
+                lr *= gamma
+        return lr
+
     else:
         return base_meta_lr
 
@@ -1393,11 +1409,96 @@ def linear_warmup(current_epoch, warmup_epochs, base_lr):
 
 
 def set_requires_grad_safe(module, req, original_trainable, name_prefix=""):
-        """Toggle requires_grad but respect original_trainable mask when unfreezing."""
-        for n, p in module.named_parameters():
-            full_name = f"{name_prefix}.{n}" if name_prefix else n
-            if not req:  # freezing
-                p.requires_grad = False
-            else:        # unfreezing
-                if original_trainable.get(full_name, True):
-                    p.requires_grad = True
+    """Toggle requires_grad but respect original_trainable mask when unfreezing."""
+    for n, p in module.named_parameters():
+        full_name = f"{name_prefix}.{n}" if name_prefix else n
+        if not req:  # freezing
+            p.requires_grad = False
+        else:        # unfreezing
+            if original_trainable.get(full_name, True):
+                p.requires_grad = True
+                
+                
+def supcon_loss(features, config, labels=None, mask=None):
+    """
+    Improved Supervised Contrastive Loss / SimCLR Loss
+    """
+    device = features.device
+    
+    if len(features.shape) < 3:
+        raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                        'at least 3 dimensions are required')
+    if len(features.shape) > 3:
+        features = features.view(features.shape[0], features.shape[1], -1)
+
+    batch_size = features.shape[0]
+    contrast_count = features.shape[1]  # Should be 2 for SimCLR
+    
+    # Reshape: [batch_size * n_views, embedding_dim]
+    contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+    
+    # Normalize embeddings (crucial for contrastive learning)
+    contrast_feature = F.normalize(contrast_feature, dim=1)
+    
+    # Compute cosine similarity matrix
+    cos_sim = torch.matmul(contrast_feature, contrast_feature.T)
+
+    # Create self-mask to exclude self-comparisons
+    self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=device)
+
+    # Create positive pair mask
+    if labels is not None:
+        # Supervised case: Use labels to create positive pairs
+        labels = labels.contiguous().view(-1, 1)
+        if labels.shape[0] != batch_size:
+            raise ValueError('Num of labels does not match num of features')
+        labels = torch.cat([labels] * contrast_count, dim=0)
+        pos_mask = torch.eq(labels, labels.T).float().to(device)
+        # Remove self-comparisons from positive mask
+        pos_mask = pos_mask * (~self_mask).float()
+    else:
+        # Unsupervised SimCLR case: Create positive pairs for augmentations
+        pos_mask = torch.zeros((batch_size * contrast_count, batch_size * contrast_count), dtype=torch.float, device=device)
+        
+        # For each original sample, its augmentations form positive pairs
+        for i in range(batch_size):
+            for j in range(contrast_count):
+                for k in range(contrast_count):
+                    if j != k:  # Different augmentations of same sample
+                        pos_mask[i * contrast_count + j, i * contrast_count + k] = 1.0
+
+    # Scale by temperature
+    logits = cos_sim / config['temperature']
+    
+    # For numerical stability, subtract max
+    logits_max = torch.max(logits, dim=1, keepdim=True)[0]
+    logits = logits - logits_max.detach()
+
+    # Create negative mask (all except self-comparisons)
+    neg_mask = (~self_mask).float()
+
+    # Compute exp(logits) only for valid negatives
+    exp_logits = torch.exp(logits) * neg_mask
+
+    # Compute log probabilities
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Compute mean log probability over positive pairs
+    pos_pairs_per_sample = pos_mask.sum(dim=1)
+    
+    # Handle case where no positive pairs exist (shouldn't happen in proper SimCLR)
+    valid_samples = pos_pairs_per_sample > 0
+    
+    if valid_samples.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), cos_sim, pos_mask
+    
+    # Average log prob over positive pairs for each sample
+    mean_log_prob_pos = (pos_mask * log_prob).sum(dim=1) / (pos_pairs_per_sample + 1e-8)
+    
+    # Only consider samples with positive pairs
+    mean_log_prob_pos = mean_log_prob_pos[valid_samples]
+    
+    # Final loss (negative log likelihood)
+    loss = -mean_log_prob_pos.mean()
+
+    return loss, cos_sim, pos_mask

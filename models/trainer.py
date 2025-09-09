@@ -5,44 +5,39 @@ for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import copy
 import numpy as np
+from sklearn.metrics import silhouette_score
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from data.dataset import PhysioDataset
+from data.meta_dataloaders import build_meta_splits_and_loaders
 from BIOT import MAMLLearner, BPRegressor
-from training_utils.helpers import save_status, load_status, set_trainable_parameters, get_model_architecture, get_meta_lr, get_inner_lr, get_inner_steps, build_inner_optimizer, get_backbone_and_head_params, linear_warmup, set_requires_grad_safe
+from training_utils.helpers import save_status, load_status, set_trainable_parameters, get_model_architecture, get_meta_lr, get_inner_lr, get_inner_steps, build_inner_optimizer, get_backbone_and_head_params, linear_warmup, set_requires_grad_safe, supcon_loss
 from training_utils.metrics import AverageMeter, get_metric_values, call_metric
 
 
-def pretraining_training_validation_testing(save_name, checkpoint_path, tensorboard_path, model_name, dataloaders, config, device):
+def pretraining_training_validation_testing(save_name, checkpoint_path, tensorboard_path, model_name, config, device):
 
-    # Dataloaders
-    train_dataloader = dataloaders['train']
-    val_dataloader = dataloaders['val']
-    test_dataloader = dataloaders['test']
 
     # Logging to TensorBoard Summary Writer
     writer = SummaryWriter(log_dir=tensorboard_path)
     
     if config['meta_learning']:
         if config['meta_algorithm'] == 'maml':
-            pre_training(
-                save_name,
-                checkpoint_path,
-                writer,
-                model_name,
-                config,
-                device
-            )
+            #pre_training(
+            #    save_name,
+            #    checkpoint_path,
+            #    writer,
+            #    model_name,
+            #    config,
+            #    device
+            #)
             maml_meta_training(
                 save_name,
                 checkpoint_path,
                 writer,
                 model_name,
-                train_dataloader,
-                val_dataloader,
-                test_dataloader,
                 config,
                 device
             )
@@ -88,7 +83,6 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     model = model.to(device)
     
     # ---- Pre-training task ----
-    
     pretrain_ds = PhysioDataset(
         seed=config['seed'],
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
@@ -99,6 +93,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
         ecg=config['ecg'],
         sig2sig=config['sig2sig'],
         min_subject_sample_number=config['min_subject_sample_number'],
+        contrastive=False
     )
     
     (pre_train_sampler, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
@@ -174,7 +169,6 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             outputs = bp_regressor(feats)
 
             loss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
-            loss *= config.get('lambda_supervised')
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -215,10 +209,31 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             save_status(None, epoch, model_name + "regressor_ft_stage1", save_name, bp_regressor, optimizer_stage1, scheduler_stage1, val_losses, checkpoint_path, config)
             
             best_val = val_losses.avg
-
+        
     print(f"[Pretraining] ==== Stage 1 completed ====")
     print(f"\t- Best val loss {best_val}")
 
+    # ====== Stage 2: Backbone + Head ======
+    # Instantiate the dataset again, but this time with the contrastive flag
+    pretrain_ds = PhysioDataset(
+        seed=config['seed'],
+        lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+        pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
+        fs=config['fs'],
+        input_seq_len_s=config['input_seq_len_s'],
+        ecg=config['ecg'],
+        sig2sig=config['sig2sig'],
+        min_subject_sample_number=config['min_subject_sample_number'],
+        contrastive=(config['lambda_contrastive'] > 0.0)
+    )
+        
+    (pre_train_sampler, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
+    
+    pre_train_dataloader = DataLoader(pretrain_ds, sampler=pre_train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
+    pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+    pre_test_dataloader = DataLoader(pretrain_ds, sampler=pre_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
+    
     # Load best model
     model = get_model_architecture(config)
     load_status(None, model_name + "encoder_ft_stage1", save_name, model, None, None, checkpoint_path, config)
@@ -232,7 +247,6 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     bp_regressor = bp_regressor.to(device)
     print(f"[Pretraining] Loaded regressor pretrained weights after pre-training stage 1")
     
-    # ====== Stage 2: Backbone + Head ======
     lr_backbone = base_lr * backbone_lr_mul
     set_requires_grad_safe(model.encoder, True, original_trainable, name_prefix="encoder")
     set_requires_grad_safe(model.channel_proj, True, original_trainable, name_prefix="channel_proj")
@@ -255,43 +269,95 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     print(f"\t- Scheduler: CosineAnnealingLR")
     
     best_val = float("+inf")    
+    sup_loss_weight = config.get('lambda_supervised')
+    con_loss_weight = config.get('lambda_contrastive')
+
     for epoch in range(stage2_epochs):
         model.train()
         bp_regressor.train()
         
-        # Warmup
+        # Warmup LRs
         for i, pg in enumerate(optimizer_stage2.param_groups):
             target_lr = base_lr if i == 1 else lr_backbone
             pg['lr'] = linear_warmup(epoch, warmup_stage2, target_lr)
 
         train_losses = AverageMeter(name='pre_train_stage_2/train_loss')
         for batch_idx, batch in enumerate(pre_train_dataloader):
-            signals, targets = batch
-            signals = signals.to(device)
-            if len(signals.shape) == 2:
-                signals = signals.unsqueeze(-1)
-            targets = targets.to(device)
+            
+            if con_loss_weight > 0.0:
+                # Since pos_signals/annotation are the signals/annotations of another sample from the same subject, the subject_ids are the same
+                (signals, targets, bp_cats_anchor), (pos_signals, pos_targets, bp_cats_pos) = batch
+                
+                # Move to device
+                signals = signals.to(device)
+                pos_signals = pos_signals.to(device)
+                bp_cats_anchor = bp_cats_anchor.to(device)
+                
+                targets = targets.to(device)
+                pos_targets = pos_targets.to(device)
+                
+                # Handle dimensions
+                if len(signals.shape) == 2:
+                    signals = signals.unsqueeze(-1)
+                if len(pos_signals.shape) == 2:
+                    pos_signals = pos_signals.unsqueeze(-1)
+                
+            else:
+                signals, targets = batch
+                signals = signals.to(device)
+                targets = targets.to(device)
+                
+                if len(signals.shape) == 2:
+                    signals = signals.unsqueeze(-1)
 
             optimizer_stage2.zero_grad()
             
-            feats = model(signals)
-            outputs = bp_regressor(feats)
+            if con_loss_weight > 0.0:
+                # Forward pass for both anchor and positive samples
+                feats_anchor = model(signals)           # [B, D]
+                feats_positive = model(pos_signals)     # [B, D]
+                
+                # Stack features for contrastive learning: [B, 2, D]
+                feats_contrastive = torch.stack([feats_anchor, feats_positive], dim=1)
+                
+                # Use anchor features for regression
+                outputs = bp_regressor(feats_anchor)    # [B, 3]
+                
+                # --- Supervised regression loss ---
+                sup_loss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
+                sup_loss = sup_loss * sup_loss_weight
+                
+                # --- Supervised contrastive loss ---
+                con_loss, _, _ = supcon_loss(feats_contrastive, config, labels=bp_cats_anchor)
+                con_loss = con_loss * con_loss_weight
+                
+            else:
+                # Standard forward pass without contrastive learning
+                feats = model(signals)                  # [B, D]
+                outputs = bp_regressor(feats)           # [B, 3]
+                
+                # --- Supervised regression loss ---
+                sup_loss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
+                sup_loss = sup_loss * sup_loss_weight
+                con_loss = 0.0
             
-            loss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
-            loss *= config.get('lambda_supervised')
-            
-            loss.backward()
+            # Total loss
+            total_loss = sup_loss + con_loss
+
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             torch.nn.utils.clip_grad_norm_(bp_regressor.parameters(), max_norm=grad_clip)
             optimizer_stage2.step()
 
-            train_losses.update(loss.item(), signals.size(0))
-            writer.add_scalar('pre_train_stage_2/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
-
+            train_losses.update(total_loss.item(), signals.size(0))
+            writer.add_scalar('pre_train_stage_2/train_loss', total_loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
+            if con_loss_weight > 0.0:
+                writer.add_scalar('pre_train_stage_2/supervised_loss', sup_loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
+                writer.add_scalar('pre_train_stage_2/contrastive_loss', con_loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
         writer.add_scalar('pre_train_stage_2/train_loss_epoch', train_losses.avg, epoch)
         scheduler_stage2.step()
 
-        # Validation
+        # --- Validation (NO contrastive loss, no subject_ids) ---
         model.eval()
         bp_regressor.eval()
         val_losses = AverageMeter(name='pre_train_stage_2/val_loss')
@@ -307,11 +373,11 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
                 outputs = bp_regressor(feats)
                 
                 vloss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
-                
                 val_losses.update(vloss.item(), signals.size(0))
 
         writer.add_scalar('pre_train_stage_2/val_loss_epoch', val_losses.avg, epoch)
-        print(f"[Pretraining][Stage 2] Epoch {epoch+1}/{stage2_epochs} - Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
+        print(f"[Pretraining][Stage 2] Epoch {epoch+1}/{stage2_epochs} "
+            f"- Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
 
         if val_losses.avg < best_val:
             print(f"[Pretraining][Stage 2] New best validation loss ✅: {val_losses.avg:.6f}")
@@ -357,13 +423,25 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     else:
         all_test_outputs = np.empty((0, 3), dtype=float) # Assuming SBP/DBP/MAP output shape is 3
         all_test_targets = np.empty((0, 3), dtype=float)
-        
+    
+    if config['lambda_contrastive'] > 0.0:
+        # Record features and bp categories for silhouette score
+        all_feats = np.empty((0, feat_dim), dtype=float)
+        all_bp_cats = np.empty((0, 1), dtype=float)
+    
     model.eval()
     bp_regressor.eval()
     with torch.no_grad():
         for batch_idx, batch in enumerate(pre_test_dataloader):
             
-            signals, targets = batch
+            if config['lambda_contrastive'] > 0.0:
+                # Since pos_signals/annotation are the signals/annotations of another sample from the same subject, the subject_ids are the same
+                signals, targets, bp_cats = batch
+                
+                bp_cats = bp_cats.to(device)
+            else:
+                signals, targets = batch 
+            
             signals = signals.to(device)
             
             if len(signals.shape) == 2:
@@ -380,6 +458,11 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             # Record predictions and ground truths
             all_test_outputs = np.concatenate((all_test_outputs, outputs.detach().cpu().numpy()), axis=0)
             all_test_targets = np.concatenate((all_test_targets, targets.detach().cpu().numpy()), axis=0)
+            
+            if config['lambda_contrastive'] > 0.0:
+                # Record normalized features and bp categories for silhouette score
+                all_feats = np.concatenate((all_feats, F.normalize(feats, dim=1).detach().cpu().numpy()), axis=0) # Normalized embeddings
+                all_bp_cats = np.concatenate((all_bp_cats, bp_cats.unsqueeze(-1).detach().cpu().numpy()), axis=0)
 
             # Log metrics
             metric_values = get_metric_values(test_loss, outputs, targets, config)
@@ -398,7 +481,6 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             test_dbp_me_stds.update(metric_values['dbp_me_std'], signals.size(0))
             test_map_me_stds.update(metric_values['map_me_std'], signals.size(0))
 
-
     # Log test metrics
     # Note: `epoch` here is the last epoch of training, not ideal for test summary
     writer.add_scalar('pre_train_test/loss_final', test_losses.avg, config['ft_stage2_epochs'])
@@ -415,24 +497,28 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     writer.add_scalar('pre_train_test/dbp_me_std_final', test_dbp_me_stds.avg, config['ft_stage2_epochs'])
     writer.add_scalar('pre_train_test/map_me_std_final', test_map_me_stds.avg, config['ft_stage2_epochs'])
     
+    if config['lambda_contrastive'] > 0.0:
+        sil_score = silhouette_score(all_feats, all_bp_cats.squeeze())
+        print(f"[Pretraining][Stage 2] Embedding Silhouette Score by BP phenotype: {sil_score:.4f}")
+    
     # Log test metrics (optionally, plot them) and return loss for validation
     _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'pretraining_supervised_stage'), plot=True)    
     
-    print(f"[Pretraining] ==== Stage 3 completed ====")
+    print(f"[Pretraining] ==== Stage 3 completed ====")          
+    
 
-
-def maml_meta_training(save_name, checkpoint_path, writer, model_name, train_dataloader, val_dataloader, test_dataloader, config, device):
+def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, device):
     
     # Load best model after pre-training
     model = get_model_architecture(config)
-    load_status(None, model_name + "encoder_ft_stage2", save_name, model, None, None, checkpoint_path, config)
+    #load_status(None, model_name + "encoder_ft_stage2", save_name, model, None, None, checkpoint_path, config)
     model = model.to(device)
     print(f"[MAML] Loaded encoder pretrained weights after pre-training stage 2")
     
     feat_dim = model.embed_dim
     output_dim = 3  # SBP, DBP, MAP
     bp_regressor = BPRegressor(feat_dim, output_dim)
-    load_status(None, model_name + "regressor_ft_stage2", save_name, bp_regressor, None, None, checkpoint_path, config)
+    #load_status(None, model_name + "regressor_ft_stage2", save_name, bp_regressor, None, None, checkpoint_path, config)
     bp_regressor = bp_regressor.to(device)
     print(f"[MAML] Loaded regressor pretrained weights after pre-training stage 2")
     
@@ -445,6 +531,21 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, train_dat
     # ==== Meta-learning (MAML) Stage ====
     
     # ---- Setup ----
+    
+    _, train_dataloader, val_dataloader, test_dataloader, _ = build_meta_splits_and_loaders(
+        lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+        seed=config['seed'],
+        fs=config['fs'],
+        input_seq_len_s=config['input_seq_len_s'],
+        ecg=config['ecg'],
+        sig2sig=config['sig2sig'],
+        pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
+        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects, must be False
+        k_support=config['k_support'],
+        k_query=config['k_query'],
+        meta_batch_size=config['meta_batch_size'],
+        contrastive=False # To avoid loading the positive pair for a subject
+    )
     
     # Hyperparams / defaults
     meta_epochs = config.get('max_meta_epochs')

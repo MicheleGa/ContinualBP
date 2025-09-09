@@ -5,63 +5,9 @@ for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import pprint
 import torch
-from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from data.dataset import PhysioDataset
-from data.dataset_ssl import PhysioDatasetSSL
-from data.meta_dataloaders import build_meta_splits_and_loaders
 from models.trainer import pretraining_training_validation_testing
 from training_utils.helpers import fixseed, generate_runname, parseargs
-from training_utils.metrics import call_metric
-
-
-def pretraining(save_name, model_name, dataset, checkpoint_path, tensorboard_path, config, device):
-    r"""
-    Pretrains a neural network model for Blood Pressure Estimation from PPG and ECG data with supervision or self-supervision.
-
-    Parameters
-    ------------
-    
-    save_name (str): 
-        Name of the experiment/run, used for saving checkpoints and logs.
-    model_name (str): 
-        Name of the model name to run.
-    dataset: 
-        Pytorch  DataLoader to split the pretraining dataset into 'train', 'val', and 'test'.
-    checkpoint_path (str): 
-        Path to the directory where checkpoints should be saved.
-    tensorboard_path (str): 
-        Path to the directory where TensorBoard logs should be saved.
-    config (dict): 
-        Configuration dictionary containing hyperparameters and training settings
-    """
-    
-    # Get train/val/test samplers and build the dataloaders
-    if not config['meta_learning']:
-        (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
-        
-        train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
-        valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
-        test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
-    else:
-        _, train_dataloader, valid_dataloader, test_dataloader, _ = dataset
-
-    pretraining_training_validation_testing(
-        save_name=save_name,
-        checkpoint_path=checkpoint_path,
-        tensorboard_path=tensorboard_path,
-        model_name=model_name,
-        dataloaders={
-            'train': train_dataloader,
-            'val': valid_dataloader,
-            'test': test_dataloader
-        },
-        config=config,
-        device=device
-    )  
-    
-    # Save the best model and configuration after training
-    print(f"Pretraining completed, best model and configuration saved in {checkpoint_path}")
 
 
 if __name__ == "__main__":
@@ -108,54 +54,16 @@ if __name__ == "__main__":
     # Seed everything
     fixseed(config['seed'])
     pl.seed_everything(config['seed'])
-    
-    ## Build dataset
-    
-    # RESP is loaded only if ECG is also loaded
-    if config['resp'] and not config['ecg']:
-        raise ValueError('RESP can be loaded only along with ECG')
-    
-    if not config['ssl']:
-        # Load data and annotation
-        if not config['meta_learning']:
-            dataset = PhysioDataset(
-                seed=config['seed'],
-                lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-                pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-                mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
-                fs=config['fs'],
-                input_seq_len_s=config['input_seq_len_s'],
-                ecg=config['ecg'],
-                sig2sig=config['sig2sig'],
-                min_subject_sample_number=config['min_subject_sample_number']
-            )
-        else:
-            dataset = build_meta_splits_and_loaders(
-                lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-                seed=config['seed'],
-                fs=config['fs'],
-                input_seq_len_s=config['input_seq_len_s'],
-                ecg=config['ecg'],
-                sig2sig=config['sig2sig'],
-                pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-                mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects, must be False
-                k_support=config['k_support'],
-                k_query=config['k_query'],
-                meta_batch_size=config['meta_batch_size']
-            )
-    else:
-        # Load data
-        dataset = PhysioDatasetSSL(
-            seed=config['seed'],
-            lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-            pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-            mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
-            fs=config['fs'],
-            input_seq_len_s=config['input_seq_len_s'],
-            ecg=config['ecg'],
-            sig2sig=config['sig2sig'],
-            min_subject_sample_number=config['min_subject_sample_number']
-        )
         
     ## Pretraining
-    pretraining(args.expname, model_name, dataset, checkpoint_path, tensorboard_path, config, device)
+    pretraining_training_validation_testing(
+        save_name=args.expname,
+        checkpoint_path=checkpoint_path,
+        tensorboard_path=tensorboard_path,
+        model_name=model_name,
+        config=config,
+        device=device
+    )  
+    
+    # Save the best model and configuration after training
+    print(f"Pretraining completed, best model and configuration saved in {checkpoint_path}")

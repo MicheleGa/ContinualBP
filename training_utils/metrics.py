@@ -350,12 +350,16 @@ def get_metric_values(loss, outputs, targets, config):
             'loss': loss.item(),
             'sbp_mae': torch.mean(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
             'dbp_mae': torch.mean(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
+            'map_mae': torch.mean(torch.abs(outputs[:, 2] - targets[:, 2])).item(),
             'sbp_me': torch.mean(outputs[:, 0] - targets[:, 0]).item(),
             'dbp_me': torch.mean(outputs[:, 1] - targets[:, 1]).item(),
+            'map_me': torch.mean(outputs[:, 2] - targets[:, 2]).item(),
             'sbp_mae_std': torch.std(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
             'dbp_mae_std': torch.std(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
+            'map_mae_std': torch.std(torch.abs(outputs[:, 2] - targets[:, 2])).item(),
             'sbp_me_std': torch.std(outputs[:, 0] - targets[:, 0]).item(),
             'dbp_me_std': torch.std(outputs[:, 1] - targets[:, 1]).item(),
+            'map_me_std': torch.std(outputs[:, 2] - targets[:, 2]).item(),
         }
     return metric_values
 

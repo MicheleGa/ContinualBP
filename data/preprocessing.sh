@@ -16,4 +16,4 @@
 # Vital DB Preprocessing
 #python vital_db_preprocessing.py --name vital_db --num_threads 10 --fs 125 --window_length 10 --window_overlap 5 --percentile True > ./data_logs/vital_db.log
 #python vital_db_preprocessing.py --name vital_db --num_threads 1 --fs 125 --window_length 10 --window_overlap 5 --percentile True --plot True 
-python online_dataset.py --name vital_db --ecg True --sig2sig False --input_seq_len_s 10 --fs 125 --plot True --min_run_length 10
+python online_dataset.py --name vital_db --ecg True --sig2sig False --input_seq_len_s 10 --fs 125 --plot True --min_run_length 200 --batch_size 32 --plot True

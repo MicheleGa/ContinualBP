@@ -26,6 +26,7 @@ class PhysioDataset(Dataset):
                  ecg=False, 
                  sig2sig=False,
                  min_subject_sample_number=0, 
+                 contrastive=False,
                  plot=False, 
                  savepath='./figs'):
         super(PhysioDataset, self).__init__()
@@ -50,6 +51,7 @@ class PhysioDataset(Dataset):
         self.sig2sig = sig2sig
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
+        self.contrastive = contrastive
         
         # Plot arguments
         self.plot = plot
@@ -74,6 +76,27 @@ class PhysioDataset(Dataset):
                 "Total Samples": len(self.index_by_sample_id)
             }
         )
+        
+        # ---------------------------------------------------------
+        # === Precompute BP categories and build index for contrastive sampling
+        # ---------------------------------------------------------
+        # Since its required only for training, we will nedd the sample ids for trianing
+        pretraining_train_sample_ids, _, _ = self.get_pretraining_samplers()
+
+        self.index_by_bp_category = {0: [], 1: [], 2: [], 3: [], 4: []}
+
+        for sample_id in pretraining_train_sample_ids:
+            sbp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{sample_id}-sbp".encode()), dtype="float32"))
+            dbp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{sample_id}-dbp".encode()), dtype="float32"))
+            
+            cat = self.bp_to_category(sbp, dbp)
+            self.index_by_bp_category[cat].append(sample_id)
+
+        print("Built BP category index:")
+        for cat, ids in self.index_by_bp_category.items():
+            print(f"\tCategory {cat}: {len(ids)} samples")
     
     def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
@@ -188,65 +211,190 @@ class PhysioDataset(Dataset):
     def before_pickle(self):
         self.lmdbenv = None
         self.lmdbtxn = None
+        
+    def bp_to_category(self, sbp, dbp):
+        """
+        Categorize BP based on American Heart Association (AHA) guidelines:
+        Source: https://www.heart.org/en/health-topics/high-blood-pressure/understanding-blood-pressure-readings
+        
+        - Category 0: Normal
+            SBP < 120 mmHg AND DBP < 80 mmHg
+        - Category 1: Elevated
+            SBP 120 - 129 mmHg AND DBP < 80 mmHg
+        - Category 2: Hypertension Stage 1
+            SBP 130 - 139 mmHg OR DBP 80 - 89 mmHg
+        - Category 3: Hypertension Stage 2
+            SBP 140 - 180 mmHg OR DBP 90 - 120 mmHg
+        - Category 4: Hypertensive Crisis
+            SBP > 180 mmHg AND/OR DBP > 120 mmHg
+        """
+        if sbp < 120 and dbp < 80:
+            return 0
+        elif 120 <= sbp < 130 and dbp < 80:
+            return 1
+        elif (130 <= sbp < 140) or (80 <= dbp < 90):
+            return 2
+        elif (140 <= sbp <= 180) or (90 <= dbp <= 120):
+            return 3
+        else:
+            return 4
 
     def __len__(self):
         return len(self.index_by_sample_id)
     
     def __getitem__(self, index):
-        sample = dict()
-
-        # Input data        
+        # ---------------------------------------------------------
+        # === Load raw input signals (PPG or PPG+ECG) ===
+        # ---------------------------------------------------------
         if self.ecg:
-            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
-            sample['ecg'] = np.frombuffer(self.lmdbtxn.get("{}-ecg".format(index).encode()), dtype="float32")
-            
-            sample['sig'] = np.concatenate(
-                (
-                    np.expand_dims(sample['ppg'], axis=-1), 
-                    np.expand_dims(sample['ecg'], axis=-1)
-                ), 
-                axis=-1)
+            ppg = np.frombuffer(
+                self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32")
+            ecg = np.frombuffer(
+                self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32")
+
+            # Shape: [time, 2]  (PPG, ECG)
+            sig = np.stack((ppg, ecg), axis=-1)
         else:
-            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
+            sig = np.frombuffer(
+                self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32")
+
+        # Make arrays writable
+        sig = np.require(sig, requirements=['O', 'W'])
+        sig.setflags(write=1)
+        
+        # Cast to torch tensor
+        signals = torch.tensor(sig)
             
-            sample['sig'] = sample['ppg']
-            
-        # Annotation
+        # ---------------------------------------------------------
+        # === Load annotations ===
+        #   - If sig2sig=True: full ABP waveform
+        #   - Else: scalar SBP, DBP, MAP values
+        # ---------------------------------------------------------
         if self.sig2sig:
-            sample['abp'] = np.squeeze(np.frombuffer(
+            abp = np.squeeze(np.frombuffer(
                 self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
             
-            # Ensure arrays are writeable
-            for k in sample:
-                sample[k] = np.require(sample[k], requirements=['O', 'W'])
-                sample[k].setflags(write=1)
+            # Make arrays writable
+            abp = np.require(abp, requirements=['O', 'W'])
+            abp.setflags(write=1)
             
             # Cast to torch tensor
-            signals = torch.tensor(sample['sig'])
-            abp = torch.tensor(sample['abp'])
-            
-            return signals, abp
-        
+            annotation = torch.tensor(abp)
         else:
-            # Regression mode: return SBP/DBP/MAP
-            sample['sbp'] = np.squeeze(np.frombuffer(
+            sbp = np.squeeze(np.frombuffer(
                 self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
-            sample['dbp'] = np.squeeze(np.frombuffer(
+            dbp = np.squeeze(np.frombuffer(
                 self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
-            sample['map'] = np.squeeze(np.frombuffer(
+            map = np.squeeze(np.frombuffer(
                 self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
             
-            for k in sample:
-                sample[k] = np.require(sample[k], requirements=['O', 'W'])
-                sample[k].setflags(write=1)
+            # Make arrays writable
+            sbp = np.require(sbp, requirements=['O', 'W'])
+            sbp.setflags(write=1)
+            dbp = np.require(dbp, requirements=['O', 'W'])
+            dbp.setflags(write=1)
+            map = np.require(map, requirements=['O', 'W'])
+            map.setflags(write=1)
             
-            signals = torch.tensor(sample['sig'])
-            sbp_val = torch.tensor(sample['sbp'])
-            dbp_val = torch.tensor(sample['dbp'])
-            map_val = torch.tensor(sample['map'])
+            # Cast to torch tensor
+            annotation = torch.stack([
+                torch.tensor(sbp), 
+                torch.tensor(dbp), 
+                torch.tensor(map)
+            ], dim=-1)
+
+        # ---------------------------------------------------------
+        # === Default return (val/test or no contrastive mode) ===
+        # ---------------------------------------------------------
+        if not self.contrastive:
+            return signals, annotation
+        
+        # ---------------------------------------------------------
+        # === Guardrails for contrastive mode ===
+        # ---------------------------------------------------------
+        if self.contrastive and self.mix_pretraining_subject_samples:
+            raise ValueError("Contrastive learning not possible "
+                            "when pretraining samples are mixed among subjects.")
+
+        # -----------------------------------------------------------------
+        # === Build positive pair (get sample of the same BP phenotype) ===
+        # -----------------------------------------------------------------
+        # Get anchor BP category
+        anchor_sbp = annotation[0].item()
+        anchor_dbp = annotation[1].item()
+        bp_cat = self.bp_to_category(anchor_sbp, anchor_dbp)
+
+        subject_id, _ = self.index_by_sample_id[index]
+        
+        # If subject is not in training set, skip contrastive
+        # In test mode, may useful to get BP category distribution
+        if subject_id in self.pretraining_val_subjects:
+            return signals, annotation
+        if subject_id in self.pretraining_test_subjects:
+            return signals, annotation, bp_cat
+        if subject_id not in self.pretraining_train_subjects:
+            raise ValueError("Subject ID not found in train/val/test splits.")
+
+        # Sample a positive from same BP category
+        pos_candidates = self.index_by_bp_category[bp_cat]
+        pos_index = random.choice(pos_candidates)
+        while pos_index == index:
+            pos_index = random.choice(pos_candidates)
+
+        pos_ppg = np.frombuffer(self.lmdbtxn.get(f"{pos_index}-ppg".encode()), dtype="float32")
+        if self.ecg:
+            pos_ecg = np.frombuffer(self.lmdbtxn.get(f"{pos_index}-ecg".encode()), dtype="float32")
+            pos_sig = np.stack((pos_ppg, pos_ecg), axis=-1)
+        else:
+            pos_sig = pos_ppg
+        
+        # Make arrays writable
+        pos_sig = np.require(pos_sig, requirements=['O', 'W'])
+        pos_sig.setflags(write=1)
+        
+        # Cast to torch tensor
+        pos_signals = torch.tensor(pos_sig)
+       
+        if self.sig2sig:
+            pos_abp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{pos_index}-abp".encode()), dtype="float32"))
             
-            return signals, torch.stack([sbp_val, dbp_val, map_val], dim=-1)
-    
+            # Make arrays writable
+            pos_abp = np.require(pos_abp, requirements=['O', 'W'])
+            pos_abp.setflags(write=1)
+            
+             # Cast to torch tensor
+            pos_annotation = torch.tensor(pos_abp)
+        else:
+            pos_sbp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{pos_index}-sbp".encode()), dtype="float32"))
+            pos_dbp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{pos_index}-dbp".encode()), dtype="float32"))
+            pos_map = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{pos_index}-map".encode()), dtype="float32"))
+            
+            # Make arrays writable
+            pos_sbp = np.require(pos_sbp, requirements=['O', 'W'])
+            pos_sbp.setflags(write=1)
+            pos_dbp = np.require(pos_dbp, requirements=['O', 'W'])
+            pos_dbp.setflags(write=1)
+            pos_map = np.require(pos_map, requirements=['O', 'W'])
+            pos_map.setflags(write=1)
+            
+            # Cast to torch tensor
+            pos_annotation = torch.stack([
+                torch.tensor(pos_sbp), 
+                torch.tensor(pos_dbp), 
+                torch.tensor(pos_map)
+            ], dim=-1)
+        
+        # ---------------------------------------------------------
+        # === Return original and positive pair ===
+        # Contrastive loss will treat all embeddings
+        # from the same subject_id as positives
+        # ---------------------------------------------------------
+        return (signals, annotation, bp_cat), (pos_signals, pos_annotation, bp_cat)
+
 
 def parseargs():
     parser = argparse.ArgumentParser(description="Dataset overview")
@@ -263,6 +411,7 @@ def parseargs():
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--contrastive', default='False', type=lambda x: bool(strtobool(x)), help='whether to load the positive pair of a subject sample or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
@@ -287,6 +436,7 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         sig2sig=args.sig2sig,
+        contrastive=args.contrastive,
         min_subject_sample_number=args.min_subject_sample_number,
         plot=args.plot, 
         savepath=root_figs_folder
@@ -315,9 +465,14 @@ if __name__ == "__main__":
     input_batch = next(iter(train_dataloader))
     sig = input_batch[0]
     sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
-    annotation = input_batch[1]
-    
     idx = np.random.randint(0, sig.shape[0])
+    
+    annotation = input_batch[1]
+    subject_ids = input_batch[2]
+    
+    print(f"Input batch shape: {sig.shape}, Annotation batch shape: {annotation.shape}, Subject IDs shape: {subject_ids.shape}")
+    print(f"Subject ID: {subject_ids[idx]}, Input signal shape: {sig[idx].shape}, Annotation shape: {annotation[idx].shape}")
+    
     if args.sig2sig:
         sig = sig[idx, :, :].squeeze().numpy()
         abp = annotation[idx, :].squeeze().numpy()

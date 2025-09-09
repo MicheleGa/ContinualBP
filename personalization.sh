@@ -22,9 +22,15 @@ python personalization.py \
     --pretrained_path ./checkpoints/pretrained_biot_encoder/EEG-six-datasets-18-channels.ckpt \
     --ecg True \
     --pretrained_model_checkpoint ./checkpoints/biot_maml/biot_maml-BIOT-2025_09_01-17_13_16/biot_maml_best_maml \
-    --min_run_length 10 \
-    --training_samples 8 \
+    --min_run_length 200 \
+    --use_ratio False \
+    --training_ratio 0.2 \
     --criterion 'SmoothL1Loss' \
+    --personalization_lr 0.005 \
     --personalization_steps 5 \
+    --personalization_batch_size 32 \
     --grad_clip 10.0 \
-    > "./logs/$experiment_name/${experiment_name}_personalization.log"
+    --num_personalization_subjects 10 \
+    --plot_personalization True \
+    --setup_type 'drift' \
+    > "./logs/$experiment_name/${experiment_name}_personalization_training.log"

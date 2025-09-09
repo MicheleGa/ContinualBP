@@ -4,11 +4,12 @@ from distutils.util import strtobool
 import pickle
 import pprint
 import numpy as np
+import random
 import sys
 import lmdb
 import torch
 from torch.utils.data import Dataset, DataLoader # Keep Dataset import for clarity and potential future base datasets
-from preprocessing_utils.data_visualization import plot_subject_sample_distribution, plot_consecutive_runs_subject, plot_consecutive_runs_all, plot_subject_annotation_runs
+from preprocessing_utils.data_visualization import plot_subject_sample_distribution, plot_consecutive_runs_all, plot_subject_annotation_runs, plot_run_length_statistics
 
 
 class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid openinng the LMDB environment two times (would raise errors)
@@ -152,34 +153,16 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         super().__init__(*args, **kwargs)
 
         # Build mapping between "internal index" and "real subject_id"
-        self.subject_idx2id = {i: sid for i, sid in enumerate(self.subjects_for_personalization)}
-
         self.active_subject = None
         self.active_subject_samples = []
         self.sample_pointer = 0
         
         self.min_run_length = min_run_length
         
-        self.filter_short_runs(self.min_run_length)
+        self.filter_subjects_by_min_run_length(self.min_run_length)
 
-    def get_subject_id(self, subj_idx: int):
-        """Map internal index [0..N-1] -> real subject_id."""
-        return self.subject_idx2id[subj_idx]
-
-    def get_subject_idx(self, subject_id: int):
-        """Map real subject_id -> internal index [0..N-1]."""
-        return self.subject_id2idx[subject_id]
-
-    def set_active_subject(self, subject_identifier):
-        """
-        Set active subject either by:
-          - subject index in [0..N-1] (int)
-        """
-        if subject_identifier in self.subject_idx2id:
-            subject_id = self.subject_idx2id[subject_identifier]
-        else:
-            raise ValueError(f"Invalid subject identifier: {subject_identifier}")
-
+    def set_active_subject(self, subject_id):
+        
         self.active_subject = subject_id
         self.active_subject_samples = self.subject_adjacent_samples[subject_id]
         
@@ -221,22 +204,24 @@ class OnlineSubjectDataset(OnlineDatasetBase):
 
         return runs
 
-    def filter_short_runs(self, min_run_length: int):
-        r"""
-        Filter subject_adjacent_samples so that only runs of consecutive windows
-        with length >= min_run_length are kept. Synchronizes index_by_subject_id
-        accordingly by removing samples at the same positions.
+    def filter_subjects_by_min_run_length(self, min_run_length: int):
+        """
+        Filter subjects so that only runs of length >= min_run_length are kept.
+        Subjects without any valid runs are removed entirely.
+
+        Updates:
+            - self.subject_adjacent_samples
+            - self.index_by_subject_id
+            - self.subjects_for_personalization
 
         Parameters
-        ------------
-        min_run_length: int
-            Minimum run length to keep. Runs shorter than this are removed.
-
-        Returns
-        ------------
-        None (updates self.subject_adjacent_samples and self.index_by_subject_id in place)
+        ----------
+        min_run_length : int
+            Minimum run length to keep.
         """
-        for subj in self.subjects_for_personalization:
+        subjects_to_remove = []
+
+        for subj in list(self.subjects_for_personalization):
             sample_list = self.subject_adjacent_samples[subj]
             index_list = self.index_by_subject_id[subj]
 
@@ -248,49 +233,79 @@ class OnlineSubjectDataset(OnlineDatasetBase):
                 if r["length"] >= min_run_length:
                     keep_positions.extend(range(r["start_idx"], r["end_idx"] + 1))
 
-            # Filter both lists consistently
-            self.subject_adjacent_samples[subj] = [sample_list[i] for i in keep_positions]
-            self.index_by_subject_id[subj] = [index_list[i] for i in keep_positions]
+            if keep_positions:
+                # Keep only valid samples for this subject
+                self.subject_adjacent_samples[subj] = [sample_list[i] for i in keep_positions]
+                self.index_by_subject_id[subj] = [index_list[i] for i in keep_positions]
+            else:
+                # Mark subject for removal
+                subjects_to_remove.append(subj)
+
+        # Remove subjects with no valid runs
+        for subj in subjects_to_remove:
+            del self.subject_adjacent_samples[subj]
+            del self.index_by_subject_id[subj]
+            self.subjects_for_personalization.remove(subj)
+
+        print(f"Filtered dataset: {len(self.subjects_for_personalization)} subjects remain "
+            f"(removed {len(subjects_to_remove)} subjects with no runs ≥ {min_run_length})")
 
 
-    def get_subject_runs(self, subject_id: int, training_samples: int = 8):
+    def get_subject_runs(self, subject_id: int, adapt_size: int = 32, val_size: int = 32, min_block_length: int = 200):
         r"""
-        Get runs of adjacent samples for a subject, ensuring runs are longer than min_run_length.
-        Each run is divided into training (first 8 samples) and testing (remaining samples).
-        The returned indices correspond to self.index_by_subject_id, not subject_adjacent_samples.
+        Build subject runs using fixed interleaved adaptation/validation windows.
 
         Parameters
-        ------------
+        ----------
         subject_id : int
-            Subject identifier (internal idx that has to be mapped to the subject ID from dataset).
-        training_samples : int, optional
-            Minimum number of samples for training per run (default=8).
+            Subject identifier from the dataset.
+        adapt_size : int, optional
+            Number of windows per adaptation (train) block. Default=32.
+        val_size : int, optional
+            Number of windows per validation (test) block. Default=32.
+        min_block_length : int, optional
+            Minimum number of windows in a run to be considered. Default=200.
 
         Returns
-        ------------
+        -------
         runs : list of dict
             Each dict has:
-              - "train": list of sample IDs for training (first 8)
-              - "test": list of sample IDs for testing (remaining)
-              - "all": list of all sample IDs in the run
+            - "train": list of sample IDs for adaptation
+            - "test": list of sample IDs for validation
+            - "all": list of all sample IDs in the block (train + test)
         """
-        sample_list = self.subject_adjacent_samples[self.subject_idx2id[subject_id]]
-        index_list = self.index_by_subject_id[self.subject_idx2id[subject_id]]
+        sample_list = self.subject_adjacent_samples[subject_id]
+        index_list = self.index_by_subject_id[subject_id]
 
         runs = self.find_consecutive_runs(sample_list)
         subject_runs = []
 
-        for r in runs:
-            if r["length"] >= training_samples:
-                # Translate run positions to sample IDs via index_by_subject_id
-                run_positions = range(r["start_idx"], r["end_idx"] + 1)
-                run_samples = [index_list[i] for i in run_positions]
+        for r_idx, r in enumerate(runs):
+            run_positions = range(r["start_idx"], r["end_idx"] + 1)
+            run_samples = [index_list[i] for i in run_positions]
+            run_len = len(run_samples)
 
-                subject_runs.append({
-                    "train": run_samples[:training_samples],   # first training_samples for personalization
-                    "test": run_samples[training_samples:],    # rest for evaluation
-                    "all": run_samples
-                })
+            # Skip runs shorter than required minimum
+            if run_len < min_block_length:
+                raise ValueError(f"Run length {run_len} is shorter than minimum required {min_block_length}")
+
+            # Segment into interleaved adaptation/testing blocks
+            block_size = adapt_size + val_size
+            n_blocks = run_len // block_size
+
+            for b in range(n_blocks):
+                start = b * block_size
+                train_segment = run_samples[start : start + adapt_size]
+                test_segment = run_samples[start + adapt_size : start + block_size]
+
+                if len(train_segment) == adapt_size and len(test_segment) == val_size:
+                    subject_runs.append({
+                        "r_idx": r_idx,
+                        "b_idx": b,
+                        "train": train_segment,
+                        "test": test_segment,
+                        "all": train_segment + test_segment
+                    })
 
         return subject_runs
 
@@ -309,7 +324,7 @@ def parseargs():
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--batch_size', default=256, type=int, help='batch size')
+    parser.add_argument('--batch_size', default=32, type=int, help='batch size')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     args = parser.parse_args()
@@ -337,7 +352,7 @@ if __name__ == "__main__":
     )
     
     # Sucjet id
-    subject_id = 12
+    subject_id = 570 # alternatively also 2100 has enough windows
     print(f"Subject selected {subject_id}")
     online_physio_dataset.set_active_subject(subject_id)
     
@@ -351,13 +366,9 @@ if __name__ == "__main__":
     plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if args.min_run_length == 0 else f'all_subjects_run_lengths_{args.min_run_length}.jpg'))
 
     # Plot the Annotation statistics for the runs
-    runs = online_physio_dataset.get_subject_runs(subject_id, training_samples=8)
-    for run_idx, run in enumerate(runs):
-        print(f"Run {run_idx}: total={len(run['all'])}, "
-            f"train={len(run['train'])}, test={len(run['test'])}")
-        print("Train IDs:", run["train"])
-        print("Test IDs:", run["test"])
-        
-    runs = online_physio_dataset.get_subject_runs(subject_id)
-
-    plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"))
+    runs = online_physio_dataset.get_subject_runs(subject_id, adapt_size=args.batch_size, val_size=args.batch_size, min_block_length=args.min_run_length)
+    
+    plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"), show_bp_plot=args.plot)
+    
+    # Plot run length statistics across subjects
+    plot_run_length_statistics(online_physio_dataset, savepath=root_figs_folder, keep_longest=False)
