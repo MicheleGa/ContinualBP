@@ -125,7 +125,7 @@ def parseargs():
     parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
     parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'cosine_wr', 'multistep'], help='meta-learning learning rate schedule type')
     parser.add_argument('--meta_lr_decay', default=0.95, type=float, help='meta-learning learning rate decay factor for exponential schedule')
-    parser.add_argument('--meta_lr_steps', default=[20, 40, 60, 80, 100], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
+    parser.add_argument('--meta_lr_steps', default=[100, 200, 300, 400], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
     parser.add_argument('--meta_lr_gamma', default=0.1, type=float, help='meta-learning learning rate gamma for step decay')   
     parser.add_argument('--meta_lr_scheduler_T0', default=100, type=int, help='cosine wr scheduler T0 parmeter')   
     parser.add_argument('--meta_lr_scheduler_T_mult', default=1.5, type=float, help='cosine wr scheduler T mult parmeter')   

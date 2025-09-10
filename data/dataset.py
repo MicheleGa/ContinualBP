@@ -1,526 +1,341 @@
+from collections import defaultdict
 import os 
 import argparse
 from distutils.util import strtobool
-import pickle
-import pprint
+import argparse
 import numpy as np
-import random
-import sys
-import lmdb
+from typing import List, Tuple, Optional
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.sampler import SubsetRandomSampler
-from sklearn.model_selection import train_test_split
-from preprocessing_utils.data_visualization import plot_signals, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std, plot_bp_pattern_distribution
-from preprocessing_utils.split import split_train_val_test
+from dataset import PhysioDataset  
 
 
-class PhysioDataset(Dataset):
-    def __init__(self,
-                 seed, 
-                 lmdb_folder, 
-                 pretraining_split_ratio=[0.7, 0.1, 0.2], 
-                 mix_pretraining_subject_samples=False, 
-                 fs=125, 
-                 input_seq_len_s=5, 
-                 ecg=False, 
-                 sig2sig=False,
-                 min_subject_sample_number=0, 
-                 contrastive=False,
-                 plot=False, 
-                 savepath='./figs'):
-        super(PhysioDataset, self).__init__()
-
-        # Generic arguments
-        LMDB_MAP_SIZE = 1000 * 1000 * 1000 * 1000 # 1T
-
-        self.seed = seed
-        self.dataset_folder = lmdb_folder
-        self.min_subject_sample_number = min_subject_sample_number
-        self.lmdbenv = lmdb.open(lmdb_folder, map_size=LMDB_MAP_SIZE)
-        self.lmdbtxn = self.lmdbenv.begin()
-
-        # Subject/Sample lists/dicts
-        self.subjects_for_pretraining:list = pickle.loads(self.lmdbtxn.get("subject_list".encode()))
-        self.index_by_subject_id:dict = pickle.loads(self.lmdbtxn.get("index_by_subject_id".encode()))
-        self.index_by_sample_id = pickle.loads(self.lmdbtxn.get("index_by_sample_id".encode()))
-        self.check_subjects_list(min_subject_sample_number=min_subject_sample_number)
-                
-        # Which input data to load (PPG or PPG + ECG), PPG is always loaded
-        self.ecg = ecg
-        self.sig2sig = sig2sig
-        self.fs = fs
-        self.input_seq_len_s = input_seq_len_s
-        self.contrastive = contrastive
-        
-        # Plot arguments
-        self.plot = plot
-        self.savepath = savepath
-
-        # Dataset split
-        self.total_subject_n = len(self.subjects_for_pretraining)
-        self.pretraining_split_ratio = pretraining_split_ratio # To divide pretraining from personalization, and then to divide the pretraining dataset
-        self.mix_pretraining_subject_samples = mix_pretraining_subject_samples # Whether to split train/val/test during pretraining subjectwise or not
-        
-        
-        if self.plot:
-            if self.min_subject_sample_number > 0:
-                plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, f'pretraining_subject_sample_distribution_min_sample_{self.min_subject_sample_number}.jpg'))
-            else:
-                plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, 'pretraining_subject_sample_distribution.jpg'))
-        
-        print("{:s} initialized with following configuration:".format(self.__class__.__name__))
-        pprint.pprint(
-            {
-                "Total Subjects": len(self.subjects_for_pretraining),
-                "Total Samples": len(self.index_by_sample_id)
-            }
-        )
-        
-        # ---------------------------------------------------------
-        # === Precompute BP categories and build index for contrastive sampling
-        # ---------------------------------------------------------
-        # Since its required only for training, we will nedd the sample ids for trianing
-        pretraining_train_sample_ids, _, _ = self.get_pretraining_samplers()
-
-        self.index_by_bp_category = {0: [], 1: [], 2: [], 3: [], 4: []}
-
-        for sample_id in pretraining_train_sample_ids:
-            sbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{sample_id}-sbp".encode()), dtype="float32"))
-            dbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{sample_id}-dbp".encode()), dtype="float32"))
-            
-            cat = self.bp_to_category(sbp, dbp)
-            self.index_by_bp_category[cat].append(sample_id)
-
-        print("Built BP category index:")
-        for cat, ids in self.index_by_bp_category.items():
-            print(f"\tCategory {cat}: {len(ids)} samples")
+def _stack_batch(batch):
+    """
+    Normalize (X, Y) pairs into tensors with shapes:
+      - X: (B, C, T)
+      - Y: (B, T)   for sig2sig=True
+      - Y: list [SBP:(B,1), DBP:(B,1)] for sig2sig=False
+    """
+    xs = [b[0] for b in batch]
+    ys = [b[1] for b in batch]
     
-    def check_subjects_list(self, min_subject_sample_number=0):
-        # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
-        # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
-        # with lmdbenv.begin(write=True) as txn: deos not make this check
-        invalid_subjects = list()
-        for subject in self.subjects_for_pretraining:
-            if len(self.index_by_subject_id[subject]) <= min_subject_sample_number:
-                invalid_subjects.append(subject)
-        
-        if len(invalid_subjects) > 0:
-            print("Invalid subjects found in the dataset, removing them ...")
-            for subject in invalid_subjects:
-                self.subjects_for_pretraining.remove(subject)
-                del self.index_by_subject_id[subject]
-
-        # Shorten each subject list to min_subject_sample_number
-        if min_subject_sample_number > 0:
-            for subject in self.subjects_for_pretraining:
-                if len(self.index_by_subject_id[subject]) > min_subject_sample_number:
-                    self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
+    # Handle input X
+    # If PhysioDataset gives (T, C), permute -> (C, T)
+    x_tensors = []
+    for x in xs:
+        x = torch.as_tensor(x, dtype=torch.float32)
+        if x.ndim == 2 and x.shape[0] == 1250:  # (T, C)
+            x = x.permute(1, 0)                  # -> (C, T)
+        x_tensors.append(x)
+    X = torch.stack(x_tensors, dim=0)  # (B, C, T)
     
-    def get_pretraining_samplers(self):
+    y_tensors = []
+    for y in ys:
+        y = torch.as_tensor(y, dtype=torch.float32)
+        if y.ndim == 2 and y.shape[0] == 1:  # (1, T)
+            y = y.squeeze(0)                 # -> (T,)
+        y_tensors.append(y)
+    Y = torch.stack(y_tensors, dim=0)       # (B, T)
+   
+    return X, Y
+
+
+class MetaTaskDataset(Dataset):
+    """
+    Each __getitem__ returns ONE TASK for meta-learning:
+        - Pick a patient (domain)
+        - Sample K support windows and Q query windows from that patient
+        - Return ((X_s, Y_s), (X_q, Y_q), patient_id)
+
+    It wraps an existing PhysioDataset (so it fully reuses your LMDB layout and __getitem__).
+    """
+    def __init__(
+        self,
+        base_dataset: PhysioDataset,
+        patient_ids: List[str],
+        k_support: int = 8,
+        k_query: int = 8,
+        allow_replacement: bool = False,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.ds = base_dataset
+        self.patient_ids = list(patient_ids)
+        self.k_support = k_support
+        self.k_query = k_query
+        self.allow_replacement = allow_replacement
+        self.rng = np.random.default_rng(seed)
+
+        # We rely on ds.index_by_subject_id to map patient -> list of sample_ids.
+        # ds.__getitem__(sample_id) already pulls the right signals/targets from LMDB.
+        self.index_by_subject_id = self.ds.index_by_subject_id
+        self.bp_to_category = self.ds.bp_to_category
         
-        print("{:s} {:s}".format(self.__class__.__name__, sys._getframe().f_code.co_name))
+        self._build_patient_bp_index()
         
-        if self.mix_pretraining_subject_samples:
-        
-            print("Pretraining train/val/test sets samples are sampled from the same subject set")
-            
-            pretraining_train_sample_ids = []
-            pretraining_val_sample_ids = []
-            pretraining_test_sample_ids = []
-            
-            # Loop over subjects for pretraining
-            for subject in self.subjects_for_pretraining:
-                
-                # Get all samples of a subject
-                subject_sample_ids = self.index_by_subject_id[subject]
-                
-                # First X% samples for training, next Y% for valid, and remaining for test
-                train_idx, valid_idx, test_idx = split_train_val_test(subject_sample_ids, split_ratio=self.pretraining_split_ratio, shuffle=True)
-                
-                # Add to the training/val/test list: note that each subject is contributing equally ot he split in this way
-                pretraining_train_sample_ids.extend(train_idx) 
-                pretraining_val_sample_ids.extend(valid_idx)
-                pretraining_test_sample_ids.extend(test_idx)
-            
-        else:
-            
-            print("Pretraining train/val/test sets samples are sampled from different subject sets")
-            
-            # Split pretraining subjects into train/val/test
-            _, val_ratio, test_ratio = self.pretraining_split_ratio
-            
-            self.pretraining_train_subjects, pretraining_val_test_subjects = train_test_split(
-                self.subjects_for_pretraining, 
-                test_size=(val_ratio + test_ratio), 
-                random_state=self.seed
-                ) 
-
-            self.pretraining_val_subjects, self.pretraining_test_subjects = train_test_split(
-                pretraining_val_test_subjects, 
-                test_size=(test_ratio / (val_ratio + test_ratio)), 
-                random_state=self.seed
-                ) 
-
-            print("Pretraining Set Split:")
-            print(f"Number of pretraining training IDs: {len(self.pretraining_train_subjects)}")
-            print(f"Number of pretraining validation IDs: {len(self.pretraining_val_subjects)}")
-            print(f"Number of pretraining test IDs: {len(self.pretraining_test_subjects)}")
-            
-            pretraining_train_sample_ids = []
-            for subject_id in self.pretraining_train_subjects:
-                pretraining_train_sample_ids.extend(self.index_by_subject_id[subject_id])
-
-            pretraining_val_sample_ids = []
-            for subject_id in self.pretraining_val_subjects:
-                pretraining_val_sample_ids.extend(self.index_by_subject_id[subject_id])
-
-            pretraining_test_sample_ids = []
-            for subject_id in self.pretraining_test_subjects:
-                pretraining_test_sample_ids.extend(self.index_by_subject_id[subject_id])
-
-        # Shuffle train partition (seed set in the fixseed function in utils)
-        random.shuffle(pretraining_train_sample_ids)
-
-        pprint.pprint(
-            {
-                "Pretraining Samples (# per split)":
-                {
-                    "Train": len(pretraining_train_sample_ids),
-                    "Valid": len(pretraining_val_sample_ids),
-                    "Test": len(pretraining_test_sample_ids)
-                }
-            }
-        )
-        
-        # Plot
-        if self.plot:
-            plot_name = 'pretraining_dataset_overview_mixed.jpg' if self.mix_pretraining_subject_samples else 'pretraining_dataset_overview_non_mixed.jpg'
-            plot_train_val_test_samples_distribution(
-                pretraining_train_sample_ids, 
-                pretraining_val_sample_ids, 
-                pretraining_test_sample_ids, 
-                title=f'Pretraining Dataset Sample Distribution (From {len(self.subjects_for_pretraining)} subjects)', 
-                savepath=os.path.join(self.savepath, plot_name)
-                )
-
-        return (SubsetRandomSampler(pretraining_train_sample_ids), SubsetRandomSampler(pretraining_val_sample_ids), SubsetRandomSampler(pretraining_test_sample_ids))    
-        
-    def before_pickle(self):
-        self.lmdbenv = None
-        self.lmdbtxn = None
-        
-    def bp_to_category(self, sbp, dbp):
-        """
-        Categorize BP based on American Heart Association (AHA) guidelines:
-        Source: https://www.heart.org/en/health-topics/high-blood-pressure/understanding-blood-pressure-readings
-        
-        - Category 0: Normal
-            SBP < 120 mmHg AND DBP < 80 mmHg
-        - Category 1: Elevated
-            SBP 120 - 129 mmHg AND DBP < 80 mmHg
-        - Category 2: Hypertension Stage 1
-            SBP 130 - 139 mmHg OR DBP 80 - 89 mmHg
-        - Category 3: Hypertension Stage 2
-            SBP 140 - 180 mmHg OR DBP 90 - 120 mmHg
-        - Category 4: Hypertensive Crisis
-            SBP > 180 mmHg AND/OR DBP > 120 mmHg
-        """
-        if sbp < 120 and dbp < 80:
-            return 0
-        elif 120 <= sbp < 130 and dbp < 80:
-            return 1
-        elif (130 <= sbp < 140) or (80 <= dbp < 90):
-            return 2
-        elif (140 <= sbp <= 180) or (90 <= dbp <= 120):
-            return 3
-        else:
-            return 4
-
     def __len__(self):
-        return len(self.index_by_sample_id)
+        # Length is "virtual": number of tasks you want per epoch.
+        # You can set it to len(patient_ids) to iterate each patient once per epoch,
+        # or any multiple thereof. We'll do one task per patient by default.
+        return len(self.patient_ids)
     
-    def __getitem__(self, index):
-        # ---------------------------------------------------------
-        # === Load raw input signals (PPG or PPG+ECG) ===
-        # ---------------------------------------------------------
-        if self.ecg:
-            ppg = np.frombuffer(
-                self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32")
-            ecg = np.frombuffer(
-                self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32")
+    def _build_patient_bp_index(self):
+        """
+        Build phenotype-aware index: for each patient, group sample_ids by BP category.
+        """
+        self.patient_bp_index = {}
+        for pid in self.patient_ids:
+            sample_ids = self.index_by_subject_id[pid]
+            self.patient_bp_index[pid] = defaultdict(list)
+            for sid in sample_ids:
+                sbp = np.squeeze(np.frombuffer(
+                    self.ds.lmdbtxn.get(f"{sid}-sbp".encode()), dtype="float32"))
+                dbp = np.squeeze(np.frombuffer(
+                    self.ds.lmdbtxn.get(f"{sid}-dbp".encode()), dtype="float32"))
+                cat = self.bp_to_category(sbp, dbp)  # from PhysioDataset
+                self.patient_bp_index[pid][cat].append(sid)
 
-            # Shape: [time, 2]  (PPG, ECG)
-            sig = np.stack((ppg, ecg), axis=-1)
-        else:
-            sig = np.frombuffer(
-                self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32")
 
-        # Make arrays writable
-        sig = np.require(sig, requirements=['O', 'W'])
-        sig.setflags(write=1)
+    def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
+        """
+        Sample support/query windows for one patient,
+        encouraging phenotype diversity.
+        """
+        total_needed = self.k_support + self.k_query
+        sample_ids = self.index_by_subject_id[pid]
+
+        if self.allow_replacement or total_needed > len(sample_ids):
+            # Fallback: sample with replacement
+            chosen = self.rng.choice(sample_ids, size=total_needed, replace=True)
+            return list(chosen[:self.k_support]), list(chosen[self.k_support:])
+
+        # Phenotype-aware sampling
+        support_ids, query_ids = [], []
+        bp_index = self.patient_bp_index[pid]
+
+        # Flatten categories sorted by availability
+        cats_sorted = sorted(bp_index.keys(), key=lambda c: -len(bp_index[c]))
+
+        # Step 1: fill support with diverse categories
+        while len(support_ids) < self.k_support and cats_sorted:
+            for cat in list(cats_sorted):  # iterate over categories
+                if len(support_ids) >= self.k_support:
+                    break
+                if bp_index[cat]:
+                    sid = self.rng.choice(bp_index[cat])
+                    support_ids.append(sid)
+                    bp_index[cat].remove(sid)
+                else:
+                    cats_sorted.remove(cat)
+
+        # Step 2: fill query with remaining, still try to diversify
+        cats_sorted = sorted(bp_index.keys(), key=lambda c: -len(bp_index[c]))
+        while len(query_ids) < self.k_query and cats_sorted:
+            for cat in list(cats_sorted):
+                if len(query_ids) >= self.k_query:
+                    break
+                if bp_index[cat]:
+                    sid = self.rng.choice(bp_index[cat])
+                    query_ids.append(sid)
+                    bp_index[cat].remove(sid)
+                else:
+                    cats_sorted.remove(cat)
+
+        # Step 3: If still not enough, backfill randomly
+        remaining = [sid for sids in bp_index.values() for sid in sids]
+        while len(support_ids) < self.k_support:
+            support_ids.append(self.rng.choice(remaining))
+        while len(query_ids) < self.k_query:
+            query_ids.append(self.rng.choice(remaining))
+
+        return support_ids, query_ids
+
+
+    def __getitem__(self, idx):
+        pid = self.patient_ids[idx % len(self.patient_ids)]
+        support_ids, query_ids = self._sample_indices_for_patient(pid)
+
+        # Pull (x,y) using the base dataset's __getitem__(sample_id)
+        support_batch = [self.ds[s_id] for s_id in support_ids]
+        query_batch   = [self.ds[q_id] for q_id in query_ids]
         
-        # Cast to torch tensor
-        signals = torch.tensor(sig)
-            
-        # ---------------------------------------------------------
-        # === Load annotations ===
-        #   - If sig2sig=True: full ABP waveform
-        #   - Else: scalar SBP, DBP, MAP values
-        # ---------------------------------------------------------
-        if self.sig2sig:
-            abp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
-            
-            # Make arrays writable
-            abp = np.require(abp, requirements=['O', 'W'])
-            abp.setflags(write=1)
-            
-            # Cast to torch tensor
-            annotation = torch.tensor(abp)
-        else:
-            sbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
-            dbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
-            map = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
-            
-            # Make arrays writable
-            sbp = np.require(sbp, requirements=['O', 'W'])
-            sbp.setflags(write=1)
-            dbp = np.require(dbp, requirements=['O', 'W'])
-            dbp.setflags(write=1)
-            map = np.require(map, requirements=['O', 'W'])
-            map.setflags(write=1)
-            
-            # Cast to torch tensor
-            annotation = torch.stack([
-                torch.tensor(sbp), 
-                torch.tensor(dbp), 
-                torch.tensor(map)
-            ], dim=-1)
-
-        # ---------------------------------------------------------
-        # === Default return (val/test or no contrastive mode) ===
-        # ---------------------------------------------------------
-        if not self.contrastive:
-            return signals, annotation
+        Xs, Ys = _stack_batch(support_batch)
+        Xq, Yq = _stack_batch(query_batch)
         
-        # ---------------------------------------------------------
-        # === Guardrails for contrastive mode ===
-        # ---------------------------------------------------------
-        if self.contrastive and self.mix_pretraining_subject_samples:
-            raise ValueError("Contrastive learning not possible "
-                            "when pretraining samples are mixed among subjects.")
+        return (Xs, Ys), (Xq, Yq), pid
 
-        # -----------------------------------------------------------------
-        # === Build positive pair (get sample of the same BP phenotype) ===
-        # -----------------------------------------------------------------
-        # Get anchor BP category
-        anchor_sbp = annotation[0].item()
-        anchor_dbp = annotation[1].item()
-        bp_cat = self.bp_to_category(anchor_sbp, anchor_dbp)
 
-        subject_id, _ = self.index_by_sample_id[index]
-        
-        # If subject is not in training set, skip contrastive
-        # In test mode, may useful to get BP category distribution
-        if subject_id in self.pretraining_val_subjects:
-            return signals, annotation
-        if subject_id in self.pretraining_test_subjects:
-            return signals, annotation, bp_cat
-        if subject_id not in self.pretraining_train_subjects:
-            raise ValueError("Subject ID not found in train/val/test splits.")
+def build_meta_splits_and_loaders(
+    lmdb_folder: str,
+    seed: int = 42,
+    fs: int = 125,
+    input_seq_len_s: int = 10,
+    ecg: bool = False,
+    sig2sig: bool = False,
+    contrastive: bool = False, 
+    pretraining_split_ratio=(0.7, 0.1, 0.2),
+    mix_pretraining_subject_samples: bool = False,
+    min_subject_sample_number: int = 0,
+    loader_workers: int = 4,
+    # meta/task params
+    k_support: int = 8,
+    k_query: int = 8,
+    meta_batch_size: int = 16,
+    tasks_per_epoch_train: Optional[int] = None,
+    tasks_per_epoch_val: Optional[int] = None,
+    tasks_per_epoch_test: Optional[int] = None,
+):
+    """
+    Returns:
+        base_dataset, meta_train_loader, meta_val_loader, meta_test_loader, split_ids
+    """
 
-        # Sample a positive from same BP category
-        pos_candidates = self.index_by_bp_category[bp_cat]
-        pos_index = random.choice(pos_candidates)
-        while pos_index == index:
-            pos_index = random.choice(pos_candidates)
+    # 1) Instantiate existing PhysioDataset (reusing all its behaviors)
+    base_ds = PhysioDataset(
+        seed=seed,
+        lmdb_folder=lmdb_folder,
+        pretraining_split_ratio=list(pretraining_split_ratio),
+        mix_pretraining_subject_samples=mix_pretraining_subject_samples,
+        fs=fs,
+        input_seq_len_s=input_seq_len_s,
+        ecg=ecg,
+        sig2sig=sig2sig,
+        contrastive=contrastive,
+        min_subject_sample_number=min_subject_sample_number,
+        plot=False,
+        savepath="./figs"
+    )
 
-        pos_ppg = np.frombuffer(self.lmdbtxn.get(f"{pos_index}-ppg".encode()), dtype="float32")
-        if self.ecg:
-            pos_ecg = np.frombuffer(self.lmdbtxn.get(f"{pos_index}-ecg".encode()), dtype="float32")
-            pos_sig = np.stack((pos_ppg, pos_ecg), axis=-1)
-        else:
-            pos_sig = pos_ppg
-        
-        # Make arrays writable
-        pos_sig = np.require(pos_sig, requirements=['O', 'W'])
-        pos_sig.setflags(write=1)
-        
-        # Cast to torch tensor
-        pos_signals = torch.tensor(pos_sig)
-       
-        if self.sig2sig:
-            pos_abp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{pos_index}-abp".encode()), dtype="float32"))
-            
-            # Make arrays writable
-            pos_abp = np.require(pos_abp, requirements=['O', 'W'])
-            pos_abp.setflags(write=1)
-            
-             # Cast to torch tensor
-            pos_annotation = torch.tensor(pos_abp)
-        else:
-            pos_sbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{pos_index}-sbp".encode()), dtype="float32"))
-            pos_dbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{pos_index}-dbp".encode()), dtype="float32"))
-            pos_map = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{pos_index}-map".encode()), dtype="float32"))
-            
-            # Make arrays writable
-            pos_sbp = np.require(pos_sbp, requirements=['O', 'W'])
-            pos_sbp.setflags(write=1)
-            pos_dbp = np.require(pos_dbp, requirements=['O', 'W'])
-            pos_dbp.setflags(write=1)
-            pos_map = np.require(pos_map, requirements=['O', 'W'])
-            pos_map.setflags(write=1)
-            
-            # Cast to torch tensor
-            pos_annotation = torch.stack([
-                torch.tensor(pos_sbp), 
-                torch.tensor(pos_dbp), 
-                torch.tensor(pos_map)
-            ], dim=-1)
-        
-        # ---------------------------------------------------------
-        # === Return original and positive pair ===
-        # Contrastive loss will treat all embeddings
-        # from the same subject_id as positives
-        # ---------------------------------------------------------
-        return (signals, annotation, bp_cat), (pos_signals, pos_annotation, bp_cat)
+    # 2) Use its split function to partition subjects (domain split). This fills:
+    #    self.pretraining_train_subjects / val / test (when mix_pretraining_subject_samples=False)
+    _ = base_ds.get_pretraining_samplers()
+
+    if mix_pretraining_subject_samples:
+        raise ValueError(
+            "For meta-learning you should set mix_pretraining_subject_samples=False "
+            "so that each split uses different SUBJECTS (domains)."
+        )
+
+    train_ids = base_ds.pretraining_train_subjects
+    val_ids = base_ds.pretraining_val_subjects
+    test_ids = base_ds.pretraining_test_subjects
+
+    # 3) Create MetaTaskDatasets for each split
+    meta_train_ds = MetaTaskDataset(
+        base_dataset=base_ds,
+        patient_ids=train_ids,
+        k_support=k_support,
+        k_query=k_query,
+        allow_replacement=False,
+        seed=seed,
+    )
+    meta_val_ds = MetaTaskDataset(
+        base_dataset=base_ds,
+        patient_ids=val_ids,
+        k_support=k_support,
+        k_query=k_query,
+        allow_replacement=False,
+        seed=seed,
+    )
+    meta_test_ds = MetaTaskDataset(
+        base_dataset=base_ds,
+        patient_ids=test_ids,
+        k_support=k_support,
+        k_query=k_query,
+        allow_replacement=False,
+        seed=seed,
+    )
+
+    # 4) DataLoaders: each batch = 1 task (support, query, pid).
+    #    Set batch_size=1; number of tasks per epoch = len(dataset) by default (one per patient).
+    def _mk_loader(ds, tasks_per_epoch, batch_size=1):
+        # To cap per-epoch tasks, we can wrap the dataset so __len__ reports a custom size.
+        if tasks_per_epoch is not None:
+            class _LenWrap(Dataset):
+                def __init__(self, base, length):
+                    self.base = base; self.length = length
+                def __len__(self): return self.length
+                def __getitem__(self, i): return self.base[i]
+            ds = _LenWrap(ds, tasks_per_epoch)
+        return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=loader_workers, pin_memory=True)
+
+    meta_train_loader = _mk_loader(meta_train_ds, tasks_per_epoch_train, batch_size=meta_batch_size)
+    meta_val_loader   = _mk_loader(meta_val_ds, tasks_per_epoch_val, batch_size=1)  # keep =1 for adaptation
+    meta_test_loader  = _mk_loader(meta_test_ds, tasks_per_epoch_test, batch_size=1)
+
+    split_ids = {
+        "train_ids": train_ids,
+        "val_ids": val_ids,
+        "test_ids": test_ids,
+    }
+    return base_ds, meta_train_loader, meta_val_loader, meta_test_loader, split_ids
 
 
 def parseargs():
-    parser = argparse.ArgumentParser(description="Dataset overview")
-
+    parser = argparse.ArgumentParser()
+    
     parser.add_argument('--dataset_folder', default='./lmdb', type=str, help='path to the dataset to analyze')
-    parser.add_argument('--name', default='test', type=str, help='name of the processed dataset')
-    parser.add_argument('--save_path', default='./data_figs', type=str, help='where to save graphs from dataset analysis')
-    parser.add_argument('--seed', default=42, type=int, help='random seed')
-    parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
-    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
-    parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit')
-    parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
-    parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
+    parser.add_argument('--dataset_name', default='test', type=str, help='name of the processed dataset')
+    parser.add_argument('--seed', type=int, default=42, help='seed')
+    parser.add_argument('--fs', type=int, default=125, help='signals frequency')
+    parser.add_argument('--input_seq_len_s', type=int, default=10, help='single window duration')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--contrastive', default='False', type=lambda x: bool(strtobool(x)), help='whether to load the positive pair of a subject sample or not')
-    parser.add_argument('--batch_size', default=256, type=int, help='batch size')
-    parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
-    parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
-
-    args = parser.parse_args()
-    return args
-
-
+    parser.add_argument('--contrastive', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--k_support', type=int, default=8, help='meta-learning support set size')
+    parser.add_argument('--k_query', type=int, default=8, help='meta-learning query set size')
+    parser.add_argument('--meta_batch_size', type=int, default=16, help='meta batch size')
+    parser.add_argument('--workers', type=int, default=2, help='parallel data loaders')
+    
+    return parser.parse_args()
+    
 if __name__ == "__main__":
-    args = parseargs()  
     
-    root_figs_folder = os.path.join(args.save_path, args.name) 
-    if not os.path.exists(root_figs_folder):
-        os.makedirs(root_figs_folder)
-    
-    dataset = PhysioDataset(
+    args = parseargs()
+
+    base_ds, train_loader, val_loader, test_loader, splits = build_meta_splits_and_loaders(
+        lmdb_folder=os.path.join(args.dataset_folder, args.dataset_name),
         seed=args.seed,
-        lmdb_folder=os.path.join(args.dataset_folder, args.name),
-        pretraining_split_ratio=list(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
-        mix_pretraining_subject_samples=args.mix_pretraining_subject_samples,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         sig2sig=args.sig2sig,
         contrastive=args.contrastive,
-        min_subject_sample_number=args.min_subject_sample_number,
-        plot=args.plot, 
-        savepath=root_figs_folder
+        pretraining_split_ratio=(0.7, 0.1, 0.2),
+        mix_pretraining_subject_samples=False,     # IMPORTANT for meta-learning to test on unseen subjects
+        k_support=args.k_support,
+        k_query=args.k_query,
+        meta_batch_size=args.meta_batch_size,
+        loader_workers=args.workers,
     )
-    
-    # Pretraining & personalization datasets statistics
-    (train_sampler, val_sampler, test_sampler) = dataset.get_pretraining_samplers()
-    
-    train_dataloader = DataLoader(dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)    
-    valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
-    test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
-    
-    if args.mix_pretraining_subject_samples:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-            savepath=root_figs_folder
-            ) 
+
+    print(f"#Patients: train={len(splits['train_ids'])}, val={len(splits['val_ids'])}, test={len(splits['test_ids'])}")
+
+    # --- Pull ONE TASK from train_loader and print shapes/values ---
+    task_batch = next(iter(train_loader))
+    # Because batch_size=1, dataloader adds a leading dimension of 1. Unwrap it.
+    (Xs, Ys), (Xq, Yq), pid = task_batch
+    pid = pid[0] if isinstance(pid, list) or isinstance(pid, tuple) else pid
+
+    # Remove outer batch dim of size 1
+    Xs = Xs[0]; Xq = Xq[0]
+    if isinstance(Ys, list):
+        # Classification/regression of SBP/DBP case (sig2sig=False)
+        Ys = [y[0] for y in Ys]
+        Yq = [y[0] for y in Yq]
     else:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-            savepath=root_figs_folder
-            )
-    
-    input_batch = next(iter(train_dataloader))
-    sig = input_batch[0]
-    sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
-    idx = np.random.randint(0, sig.shape[0])
-    
-    annotation = input_batch[1]
-    subject_ids = input_batch[2]
-    
-    print(f"Input batch shape: {sig.shape}, Annotation batch shape: {annotation.shape}, Subject IDs shape: {subject_ids.shape}")
-    print(f"Subject ID: {subject_ids[idx]}, Input signal shape: {sig[idx].shape}, Annotation shape: {annotation[idx].shape}")
-    
-    if args.sig2sig:
-        sig = sig[idx, :, :].squeeze().numpy()
-        abp = annotation[idx, :].squeeze().numpy()
+        Ys = Ys[0]; Yq = Yq[0]
+
+    print(f"[Task patient id] {pid}")
+    print(f"Support X shape: {tuple(Xs.shape)}")
+    if isinstance(Ys, list):
+        print(f"Support SBP shape: {tuple(Ys[0].shape)}, DBP shape: {tuple(Ys[1].shape)}")
     else:
-        sbp_val = annotation[idx, 0].squeeze().numpy()
-        dbp_val = annotation[idx, 1].squeeze().numpy()
-        map_val = annotation[idx, 2].squeeze().numpy()
-    
-    # Note that the train_dataloader will already return the required signals specified by the conditions
-    if args.ecg:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'ABP'], 
-                title=f'Input: PPG + ECG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'mmHg']
-            )
-        else:
-            plot_signals(
-                sig[idx, :, :].T, fs=args.fs, 
-                labels=['PPG', 'ECG'], 
-                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV']
-                )
-            
+        print(f"Support Y (ABP waveform) shape: {tuple(Ys.shape)}")
+
+    print(f"Query   X shape: {tuple(Xq.shape)}")
+    if isinstance(Yq, list):
+        print(f"Query   SBP shape: {tuple(Yq[0].shape)}, DBP shape: {tuple(Yq[1].shape)}")
     else:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ABP'], 
-                title=f'Input: PPG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mmHg']
-            )
-        else:
-            plot_signals(
-                sig[idx, :, :].T, 
-                fs=args.fs,
-                labels=['PPG'], 
-                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.']
-                )
+        print(f"Query   Y (ABP waveform) shape: {tuple(Yq.shape)}")

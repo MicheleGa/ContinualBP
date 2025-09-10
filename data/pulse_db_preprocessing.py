@@ -32,22 +32,24 @@ def process_subject(subject_info, args, result_queue=None, savepath=''):
             abp = data["signals"][segment_idx, 2]  # ABP
             sbp = data["sbp"][segment_idx]
             dbp = data["dbp"][segment_idx]
+            map = dbp + (sbp - dbp) / 3
 
             # Ensure signals are in floating point format
             sig = sig.astype(np.float32)
             abp = abp.astype(np.float32)
             sbp = np.array([sbp]).astype(np.float32)
             dbp = np.array([dbp]).astype(np.float32)
+            map = np.array([map]).astype(np.float32)
             
             # The pulse_db data is already windowed
-            subject_data.append((sig, abp, sbp, dbp))
+            subject_data.append((sig, abp, sbp, dbp, map))
             
             if args.plot:
                 plot_signals(
                     [sig[0], sig[1], abp], 
                     fs=args.fs,
                     labels=['ECG', 'PPG', 'ABP'], 
-                    title=f'Sample Signals for {subject_id} Segment {segment_idx} with SBP {sbp} and DBP {dbp}', 
+                    title=f'Sample Signals for {subject_id} Segment {segment_idx} with SBP {sbp}, DBP {dbp}, and MAP {map}', 
                     savepath=savepath, 
                     ylabels=['mV', 'a.u.', 'mmHg']
                 )
@@ -57,7 +59,7 @@ def process_subject(subject_info, args, result_queue=None, savepath=''):
             print(f"Error processing {subject_id} segment {segment_idx}: {e}")
             continue
 
-    print(f'Completed {subject_id}')
+    print(f'Completed {subject_id}', flush=True)
     if result_queue:
         result_queue.put((subject_id, subject_data))
 
@@ -123,12 +125,13 @@ def preprocess_dataset(args):
             index_by_subject_id[subject_id] = []
             subject_n_recording = 0
             
-            for window_sig, window_abp, window_sbp, window_dbp in subject_data:
+            for window_sig, window_abp, window_sbp, window_dbp, window_map in subject_data:
                 txn.put(key="{}-ecg".format(sample_id).encode(), value=window_sig[0].tobytes()) # ECG is the first channel
                 txn.put(key="{}-ppg".format(sample_id).encode(), value=window_sig[1].tobytes()) # PPG is the second channel
                 txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
                 txn.put(key="{}-sbp".format(sample_id).encode(), value=window_sbp.tobytes())
                 txn.put(key="{}-dbp".format(sample_id).encode(), value=window_dbp.tobytes())
+                txn.put(key="{}-map".format(sample_id).encode(), value=window_map.tobytes())
                 
                 index_by_sample_id.append((subject_id, subject_n_recording))
                 index_by_subject_id[subject_id].append(sample_id)
@@ -139,7 +142,7 @@ def preprocess_dataset(args):
         txn.put(key="index_by_subject_id".encode(), value=pickle.dumps(index_by_subject_id))
         txn.put(key="subject_list".encode(), value=pickle.dumps(subject_id_list))
 
-    print('Preprocessing completed successfully')
+    print('Preprocessing completed successfully', flush=True)
     
 def parseargs():
     parser = argparse.ArgumentParser(description="PulseDB Preprocessing Pipeline")

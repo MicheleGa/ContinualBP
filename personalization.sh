@@ -32,5 +32,5 @@ python personalization.py \
     --grad_clip 10.0 \
     --num_personalization_subjects 10 \
     --plot_personalization True \
-    --setup_type 'drift' \
+    --setup_type 'fixed' \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
