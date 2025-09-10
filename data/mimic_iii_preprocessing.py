@@ -98,10 +98,13 @@ def process_windows(abp, ppg, ecg, subject_id, segment, fs, window_length, windo
                             
                 # No need to do the preprocessing of all subjects when plot true
                 return
-    if len(segment_data) > 0:
-        return segment_data
-    else:
-        return None
+            
+    # Return segment data (check if empty first)
+    if len(segment_data) == 0:
+        print(f"Warning: No valid windows found for subject {subject_id}, segment {segment}")
+        return []
+    
+    return segment_data
 
 
 def process_subject(subject_id, args, savepath, result_queue=None):
@@ -145,7 +148,9 @@ def process_subject(subject_id, args, savepath, result_queue=None):
         if args.plot:
             return
         
-        subject_data.extend(segment_data)
+        # Extend subject_data with segment data
+        if segment_data:  # Only extend if segment_data is not empty
+            subject_data.extend(segment_data)
     
     print(f'Completed {subject_id}')
     result_queue.put((int(subject_id[1:]), subject_data)) # subject id is integer
@@ -191,7 +196,7 @@ def preprocess_dataset(args):
 
     # Use joblib for parallel processing
     Parallel(n_jobs=num_threads)(
-        delayed(process_subject)(subject_id, args, savepath, result_queue) for subject_id in subjects_ids[:10]
+        delayed(process_subject)(subject_id, args, savepath, result_queue) for subject_id in subjects_ids
     )
     
     index_by_sample_id = list()
@@ -203,8 +208,8 @@ def preprocess_dataset(args):
         while not result_queue.empty():
             subject_id, subject_data = result_queue.get()
             
-            if len(subject_data) == 0:
-                print(f"Skipping {subject_id} as no valid data found")
+            if subject_data is None or len(subject_data) == 0:
+                print(f"Warning: No data found for subject {subject_id}, skipping...")
                 continue
             
             subject_id_list.append(subject_id)
