@@ -298,10 +298,7 @@ def personalization(dataset, tensorboard_path, config, device):
     model = get_model_architecture(config)
     feat_dim = model.embed_dim
 
-    if config['sig2sig']:
-        out_shape = config['input_seq_len_s'] * config['fs']  # Full waveform
-    else:
-        out_shape = 3  # SBP/DBP/MAP
+    out_shape = config['input_seq_len_s'] * config['fs'] if config['sig2sig'] else 3  # Full waveform or SBP/DBP/MAP
     bp_regressor = BPRegressor(feat_dim, out_shape)
 
     learner = MAMLLearner(model, bp_regressor)

@@ -160,79 +160,107 @@ class BPRegressor(torch.nn.Module):
         return self.regressor(x)
 
 
+class BIOTPredictionHead(nn.Module):
+    """
+    Wrapper head that selects the appropriate prediction head.
+    - If output_dim == 3 → BPRegressor
+    - Else → BPWaveformDecoder
+    """
+    def __init__(self, emb_size, output_dim, depth=4, heads=8):
+        super().__init__()
+        
+        if output_dim == 3:
+            # BPRegressor expects input_dim → emb_size
+            self.head = BPRegressor(input_dim=emb_size, output_dim=output_dim)
+        else:
+            # BPWaveformDecoder requires output_len
+            self.head = BPWaveformDecoder(emb_size, output_dim, depth=depth, heads=heads)
+
+    def forward(self, x):
+        return self.head(x)
+
+
 class MAMLLearner(nn.Module):
     """
-    Learner wrapper that cleanly supports MAML-style functional forward using
-    torch.nn.utils.stateless.functional_call for both the BIOT encoder and the
-    BPRegressor head. This avoids in-place param swapping and shape/order bugs.
+    Learner wrapper for MAML-style functional forward using torch.func.functional_call.
+    Supports both the BIOT encoder and a flexible prediction head (BPRegressor or BPWaveformDecoder).
     """
-    def __init__(self, model, regressor):
+    def __init__(self, model, head: nn.Module):
         super().__init__()
         self.model = model
-        self.regressor = regressor
+        self.head = head  # can be BPRegressor or BPWaveformDecoder
 
-        # Capture parameter names in a deterministic order (matches .parameters())
+        # Capture parameter names in deterministic order
         self.model_named_params = list(self.model.named_parameters())
-        self.reg_named_params = list(self.regressor.named_parameters())
+        self.head_named_params = list(self.head.named_parameters())
 
-        # Keep a flattened list of parameters with the same order as learner.parameters()
-        self._flattened_params = list(p for _, p in self.model_named_params if p.is_floating_point() or p.is_complex())
-        self._flattened_params += list(p for _, p in self.reg_named_params if p.is_floating_point() or p.is_complex())
+        # Flattened list of parameters (order must match .parameters())
+        self._flattened_params = [p for _, p in self.model_named_params if p.is_floating_point() or p.is_complex()]
+        self._flattened_params += [p for _, p in self.head_named_params if p.is_floating_point() or p.is_complex()]
         
-        # Save names in the same order (to reconstruct dicts quickly)
+        # Save names for reconstruction of param dicts
         self._model_names_in_order = [n for n, _ in self.model_named_params]
-        self._reg_names_in_order = [n for n, _ in self.reg_named_params]
+        self._head_names_in_order = [n for n, _ in self.head_named_params]
 
-        # Guardrail: the BPRegressor expects 256-dim embeddings as input.
-        self.expected_feat_dim = None
-        try:
-            if hasattr(self.model, "embed_dim"):
-                self.expected_feat_dim = int(self.model.embed_dim)
-        except Exception:
-            self.expected_feat_dim = None
+        # Guardrail: expected embedding size from encoder
+        self.expected_feat_dim = getattr(self.model, "embed_dim", None)
+
+        # Track which type of head we’re using
+        self.is_regressor = isinstance(self.head, BPRegressor)
+        self.is_decoder   = isinstance(self.head, BPWaveformDecoder)
 
     def _split_vars_to_dicts(self, vars_list):
         """
-        Split a flat list of tensors into two param dicts matching model and regressor.
-        The ordering *must* match how we created fast_weights.
+        Split a flat list of tensors into two param dicts matching model and head.
         """
         n_model = len(self._model_names_in_order)
         model_vars = vars_list[:n_model]
-        reg_vars = vars_list[n_model:]
+        head_vars = vars_list[n_model:]
 
         model_param_dict = {name: tensor for name, tensor in zip(self._model_names_in_order, model_vars)}
-        reg_param_dict = {name: tensor for name, tensor in zip(self._reg_names_in_order, reg_vars)}
-        return model_param_dict, reg_param_dict
+        head_param_dict = {name: tensor for name, tensor in zip(self._head_names_in_order, head_vars)}
+        return model_param_dict, head_param_dict
 
     def forward(self, x, vars=None):
         """
-        If vars is None -> regular forward (encoder -> head).
-        If vars is not None -> functional forward using provided weights (MAML inner loop).
+        If vars is None -> standard forward.
+        If vars is not None -> functional forward with provided fast weights.
         """
         if vars is None:
-            feats = self.model(x)            # Expect [B, 256] from BIOT
-            assert feats.dim() == 2, f"Encoder output must be [B, D], got {list(feats.shape)}"
-            if self.expected_feat_dim is not None:
-                assert feats.shape[-1] == self.expected_feat_dim, f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
-            out = self.regressor(feats)      # [B, 3]
-            return out
+            feats = self.model(x)
 
-        model_param_dict, reg_param_dict = self._split_vars_to_dicts(vars)
+            if self.is_regressor:
+                # Expect [B, D]
+                assert feats.dim() == 2, f"Regressor head expects [B, D], got {list(feats.shape)}"
+                if self.expected_feat_dim is not None:
+                    assert feats.shape[-1] == self.expected_feat_dim, (
+                        f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+                    )
+            elif self.is_decoder:
+                # Expect [B, T, D]
+                assert feats.dim() == 3, f"Decoder head expects [B, T, D], got {list(feats.shape)}"
 
-        # Run encoder with provided params
+            return self.head(feats)
+
+        # ---- Functional forward (MAML inner loop) ----
+        model_param_dict, head_param_dict = self._split_vars_to_dicts(vars)
+
         feats = torch.func.functional_call(self.model, model_param_dict, (x,))
 
-        # Sanity checks to catch shape issues early
-        if feats.dim() == 3 and feats.shape[1] != feats.shape[-1]:
-            # If accidentally a sequence [B, T, C] got returned without pooling, try to pool
-            feats = feats.mean(dim=1)
+        if self.is_regressor:
+            # Guard against accidental sequence output
+            if feats.dim() == 3:
+                feats = feats.mean(dim=1)
+            assert feats.dim() == 2, f"Regressor head expects [B, D], got {list(feats.shape)}"
+            if self.expected_feat_dim is not None:
+                assert feats.shape[-1] == self.expected_feat_dim, (
+                    f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+                )
 
-        assert feats.dim() == 2, f"Encoder output must be [B, D]; got {list(feats.shape)}"
-        if self.expected_feat_dim is not None:
-            assert feats.shape[-1] == self.expected_feat_dim, f"Encoder features mismatch: expected {self.expected_feat_dim}, got {feats.shape[-1]}"
+        elif self.is_decoder:
+            assert feats.dim() == 3, f"Decoder head expects [B, T, D], got {list(feats.shape)}"
 
-        # Run head with provided params
-        out = torch.func.functional_call(self.regressor, reg_param_dict, (feats,))
+        out = torch.func.functional_call(self.head, head_param_dict, (feats,))
         return out
 
 

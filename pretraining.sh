@@ -2,7 +2,7 @@
 
 # Meta-learning Setup
 # MAML BIOT
-experiment_name="biot_maml"
+experiment_name="biot_maml_pretraining"
 mkdir "logs/$experiment_name"
 cd ./models
 python BIOT.py \
@@ -24,30 +24,26 @@ python pretraining.py \
     --ecg True \
     --batch_size 128 \
     --mix_pretraining_subject_samples False \
-    --freeze_backbone_first True \
     --pre_train_lr 0.001 \
-    --backbone_lr_multiplier 1.0 \
     --weight_decay 0.0001 \
-    --grad_clip 10.0 \
-    --ft_stage1_epochs 10 \
-    --ft_stage2_epochs 25 \
-    --warmup_epochs_stage1 3 \
-    --warmup_epochs_stage2 5 \
+    --ft_stage1_epochs 300 \
+    --ft_stage2_epochs 150 \
     --criterion "SmoothL1Loss" \
-    --lambda_supervised 0.5 \
-    --lambda_contrastive 1.0 \
     --temperature 0.07 \
     --meta_learning True \
     --meta_algorithm 'maml' \
     --max_meta_epochs 150 \
+    --grad_clip 10.0 \
     --k_support 5 \
     --k_query 10 \
-    --meta_batch_size 4 \
+    --meta_batch_size 8 \
     --use_pure_functional True \
     --second_order_maml True \
-    --meta_lr_schedule 'multistep' \
+    --meta_lr_schedule 'cosine' \
     --meta_lr 0.001 \
-    --meta_lr_gamma 0.7 \
+    --derivative_order_anneal_epoch 80 \
+    --msl_anneal_epochs 80 \
+    --msl_include_pre False \
     --inner_adapt 'head' \
     --inner_opt 'adam' \
     --inner_head_lr_mult 1.0 \

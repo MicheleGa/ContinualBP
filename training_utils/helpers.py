@@ -121,6 +121,10 @@ def parseargs():
     parser.add_argument('--first_order_reptile', default=False, type=lambda x: bool(strtobool(x)), help='use first-order approximation for Reptile (faster)') 
     parser.add_argument('--use_pure_functional', default=False, type=lambda x: bool(strtobool(x)), help='use pure functional for MAML (True for memory efficiency)')
     parser.add_argument('--second_order_maml', default=False, type=lambda x: bool(strtobool(x)), help='use second-order derivative for MAML')
+    parser.add_argument('--derivative_order_anneal_epoch', default=10, type=int, help='number of epochs after which to switch from first to second order')   
+    parser.add_argument('--msl_anneal_epochs', default=20, type=int, help='how many epochs until full MSL anneal (later inner steps get more weight)')   
+    parser.add_argument('--msl_include_pre', default=False, type=lambda x: bool(strtobool(x)), help='whether to include the pre-adaptation (step-0) query loss into the meta-loss')
+    parser.add_argument('--msl_pre_base_weight', default=0.5, type=float, help='base weight for pre-adaptation loss if included')
     
     parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
     parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'cosine_wr', 'multistep'], help='meta-learning learning rate schedule type')
@@ -304,7 +308,10 @@ def save_status(subject_id, epoch, model_name, save_name, model, optimizer, sche
         to_save['optimizer'] = optimizer.state_dict()
     if scheduler is not None:
         to_save['lr_scheduler'] = scheduler.state_dict()
-    to_save['val_loss'] = meter.avg
+    if isinstance(meter, np.float32):
+        to_save['val_loss'] = meter
+    else:
+        to_save['val_loss'] = meter.avg
 
     if subject_id is not None:
         out_path = os.path.join(checkpoint_path, save_name, str(subject_id), 'ckpt') 
@@ -1502,3 +1509,66 @@ def supcon_loss(features, config, labels=None, mask=None):
     loss = -mean_log_prob_pos.mean()
 
     return loss, cos_sim, pos_mask
+
+
+# ---------- Helpers for MSL and derivative annealing in MAML ----------
+def get_msl_weights(epoch, config, num_inner_steps, include_pre=False):
+    """
+    Returns a list of weights (length num_inner_steps [+1 if include_pre]),
+    normalized to sum to 1. The weights are annealed over epochs so later
+    inner steps get more weight as training proceeds.
+    """
+    # anneal control: 0 -> no anneal (uniform), 1 -> full anneal (linear bias to later steps)
+    anneal_epochs = config.get('msl_anneal_epochs')
+    anneal_factor = float(min(epoch, anneal_epochs)) / max(1.0, anneal_epochs)
+
+    # baseline: uniform on the post-update steps
+    steps_idx = list(range(1, num_inner_steps + 1))  # 1..S
+    # Raw weight for step s = 1 + anneal_factor * s  (so later steps get higher weight)
+    raw = [1.0 + anneal_factor * float(s) for s in steps_idx]
+
+    if include_pre:
+        # give pre-adapt a small base weight (0.5) that also decays when anneal grows
+        pre_base = config.get('msl_pre_base_weight')
+        raw = [pre_base] + raw
+
+    # Normalize
+    total = sum(raw)
+    weights = [r / total for r in raw]
+    return weights
+
+
+def should_use_second_order(epoch, config):
+    """
+    Decide whether to use second-order gradients this epoch.
+    If 'derivative_order_anneal_epoch' not set, fallback to config['second_order_maml'].
+    """
+    da_epoch = config.get('derivative_order_anneal_epoch')
+    if da_epoch is None:
+        return bool(config.get('second_order_maml'))
+    return epoch >= int(da_epoch)
+
+
+def compute_embedding_stats(model, dataloader, device):
+    """
+    Compute mean and std of embeddings over a dataloader.
+    If max_batches is set, only use that many batches for speed.
+    """
+    model.eval()
+    all_embs = []
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            (Xs, _), (_, _), _ = batch
+            
+            meta_batch = Xs.shape[0]
+            
+            for t in range(meta_batch):
+                sX = Xs[t].to(device).float()
+                z = model(sX)
+                all_embs.append(z.detach().cpu().numpy())
+            
+    all_embs = np.concatenate(all_embs, axis=0)
+    mean = np.mean(all_embs, axis=0)
+    std = np.std(all_embs, axis=0)
+    std[std == 0] = np.finfo(np.float32).eps
+    return mean, std
