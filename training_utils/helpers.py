@@ -97,11 +97,12 @@ def parseargs():
     
     # Pre-training with pretrained backbone Setup
     parser.add_argument('--pretrained_path', default=None, type=str)
-    parser.add_argument('--ft_stage1_epochs', default=10, type=int, help='epochs training head only')
-    parser.add_argument('--ft_stage2_epochs', default=50, type=int, help='epochs for full/unfrozen fine-tuning')
+    parser.add_argument('--stage1_epochs', default=10, type=int, help='epochs training head only')
+    parser.add_argument('--stage1_freeze_epochs', default=30, type=int, help='epochs training head only')
+    parser.add_argument('--stage2_epochs', default=50, type=int, help='epochs for full/unfrozen fine-tuning')
     parser.add_argument('--warmup_epochs_stage1', default=3, type=int, help='warmup epochs for stage1')
-    parser.add_argument('--warmup_epochs_stage2', default=5, type=int, help='warmup epochs for stage2')
-    parser.add_argument('--pre_train_lr', default=3e-4, type=float, help='learning rate for new heads')
+    parser.add_argument('--ssl_pre_train_lr', default=5e-4, type=float, help='learning rate for new heads')
+    parser.add_argument('--pre_train_lr', default=1e-3, type=float, help='learning rate for new heads')
     parser.add_argument('--backbone_lr_multiplier', default=0.05, type=float, help='multiplier for backbone lr')
     parser.add_argument('--weight_decay', default=1e-4, type=float, help='weight decay for optimizer')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping')

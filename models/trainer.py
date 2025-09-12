@@ -29,22 +29,10 @@ def pretraining_training_validation_testing(save_name, checkpoint_path, tensorbo
     
     if config['meta_learning']:
         if config['meta_algorithm'] == 'maml':
-            pre_training(
-                save_name,
-                checkpoint_path,
-                writer,
-                model_name,
-                config,
-                device
-            )
-            maml_meta_training(
-                save_name,
-                checkpoint_path,
-                writer,
-                model_name,
-                config,
-                device
-            )
+            # Contrastive + Supervised Pre-training Stage for Initialization of MAML
+            pre_training(save_name, checkpoint_path, writer, model_name, config, device)
+            # Pre-training with MAML
+            maml_meta_training(save_name, checkpoint_path, writer, model_name, config, device)
         else:
             raise ValueError('Unsupported Meta-Learning algorithm')
     else:
@@ -95,27 +83,32 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     pre_test_dataloader = DataLoader(pretrain_ds, sampler=pre_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     
-    # ====== Common config ======
-    base_lr = config.get('pre_train_lr')
+    # ====== Stage 1 config ======
+    ssl_lr = config.get('ssl_pre_train_lr')
     weight_decay = config.get('weight_decay')
-
-    stage1_epochs = config.get('ft_stage1_epochs')
-    stage2_epochs = config.get('ft_stage2_epochs')
+    stage1_epochs = config.get('stage1_epochs')
+    freeze_epochs = config.get('stage1_freeze_epochs')
 
     # ====== Stage 1: Backbone only ======
     # Some models like transformers may have an index for the positional embedding that is not a parameter and may raise an error if set to requires_grad
-    backbone_trainable_params = [p for p in model.parameters() if (p.is_floating_point() or p.is_complex())]
-    for p in backbone_trainable_params:
-        p.requires_grad = True
+    # Freeze encoder initially
+    if config['model_name'] == 'BIOT':
+        # Only BIOT is a transformer model that can have a pre-trained checkpoint requiring the adpater
+        # Freeze encoder, keep adapter trainable
+        for name, param in model.named_parameters():
+            if (param.is_floating_point() or param.is_complex()):
+                if "channel_proj" in name.lower():   # adapter
+                    param.requires_grad = True
+                else:                          # encoder + everything else
+                    param.requires_grad = False
     
     # Pass only backbone parameters
-    optimizer_stage1 = torch.optim.AdamW(backbone_trainable_params, lr=base_lr, weight_decay=weight_decay)
-    scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=max(1, stage1_epochs))
+    optimizer_stage1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=ssl_lr, weight_decay=weight_decay)
 
     print(f"[Pretraining] ==== Stage 1 ====")
     print(f"\t- Update: encoder only")
     print(f"\t- Stage 1 epochs: {stage1_epochs}")
-    print(f"\t- Base LR: {base_lr}")
+    print(f"\t- Base LR: {ssl_lr}")
     print(f"\t- Scheduler: CosineAnnealingLR")
     
     # Define feat_dim before validation silhouette computation
@@ -123,8 +116,17 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     train_losses = AverageMeter(name='pre_train_stage_1/train_loss')
     best_val = -1.0 # Silhouette score is the worse when it is close to -1 and good when it is close to +1 
     for epoch in range(stage1_epochs):
-        model.train()
 
+        # Unfreeze encoder after freeze_epochs (this is only for pre-trained BIOT)
+        if epoch == freeze_epochs and config['model_name'] == 'BIOT':
+            print(f"[Pretraining] Epoch {epoch}: unfreezing encoder ✅")
+            for name, param in model.named_parameters():
+                if (param.is_floating_point() or param.is_complex()):
+                    param.requires_grad = True
+                    
+            optimizer_stage1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=ssl_lr, weight_decay=weight_decay)
+        
+        model.train()
         train_losses.reset()
         for batch_idx, batch in enumerate(pre_train_dataloader):
             # Since signals_anchor/signals_pos are the same window fo PPG/ECG, the bp_cats_anchor/bp_cats_pos are the same
@@ -143,8 +145,8 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             optimizer_stage1.zero_grad()
 
             # Forward pass for both anchor and positive samples
-            feats_anchor = model(signals_anchor)           # [B, D]
-            feats_positive = model(signals_pos)     # [B, D]
+            feats_anchor = model(signals_anchor)   
+            feats_positive = model(signals_pos)    
             
             # Stack features for contrastive learning: [B, 2, D]
             feats_contrastive = torch.stack([feats_anchor, feats_positive], dim=1)
@@ -159,9 +161,6 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
             train_losses.update(loss.item(), signals_anchor.size(0))
             writer.add_scalar('pre_train_stage_1/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
-
-        # Scheduler step
-        scheduler_stage1.step()
         
         # Log loss
         writer.add_scalar('pre_train_stage_1/train_loss_epoch', train_losses.avg, epoch)
@@ -193,7 +192,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
         if sil_score > best_val:
             print(f"[Pretraining][Stage 1] New best validation silhouette score ✅: {sil_score:.6f}")
-            save_status(None, epoch, model_name + "encoder_ft_stage1", save_name, model, optimizer_stage1, scheduler_stage1, sil_score, checkpoint_path, config)
+            save_status(None, epoch, model_name + "encoder_ft_stage1", save_name, model, optimizer_stage1, None, sil_score, checkpoint_path, config)
             
             best_val = sil_score
         
@@ -236,17 +235,23 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     bp_prediction_head = bp_prediction_head.to(device)
     print(f"[Pretraining] Intialized prediction head weights after pre-training stage 1")
     
-    # Freeze backbone, unfreeze head
-    backbone_trainable_params = [p for p in model.parameters() if (p.is_floating_point() or p.is_complex())]
-    for p in backbone_trainable_params:
-        p.requires_grad = False
+    # ====== Stage 2 config ======
+    base_lr = config.get('pre_train_lr')
+    weight_decay = config.get('weight_decay')
+    stage2_epochs = config.get('ft_stage2_epochs')
     
-    head_trainable_params = [p for p in bp_prediction_head.parameters() if (p.is_floating_point() or p.is_complex())]
-    for p in head_trainable_params:
-        p.requires_grad = True
+    # Freeze all backbone (encoder + adapter)
+    for param in model.parameters():
+        if (param.is_floating_point() or param.is_complex()):
+            param.requires_grad = False
+
+    # Unfreeze regression head
+    for param in bp_prediction_head.parameters():
+        if (param.is_floating_point() or param.is_complex()):
+            param.requires_grad = True
         
     # Pass only head parameters
-    optimizer_stage2 = torch.optim.AdamW(head_trainable_params, lr=base_lr, weight_decay=weight_decay)
+    optimizer_stage2 = torch.optim.AdamW(filter(lambda p: p.requires_grad, bp_prediction_head.parameters()), lr=base_lr, weight_decay=weight_decay)
     scheduler_stage2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage2, T_max=max(1, stage2_epochs))
 
     print(f"[Pretraining] ==== Stage 2: fine-tune regressor, {stage2_epochs} epochs, head_lr={base_lr} ====")
@@ -581,20 +586,49 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                         retain_graph=True,
                         allow_unused=True
                     )
+                    
+                    # Build updates (delta = lr * grad), handle None grads
+                    deltas = []
+                    for g in grads:
+                        if g is None:
+                            deltas.append(None)
+                        else:
+                            deltas.append(current_inner_lr * g)
 
-                    # Apply inner update (no clipping)
+                    # Compute global norm over the update vectors (use .detach() to avoid making clipping
+                    # part of the higher-order graph). Add eps for stability.
+                    eps = 1e-12
+                    sq_sum = 0.0
+                    for d in deltas:
+                        if d is not None:
+                            # use .detach() here so clipping scale is not part of the graph
+                            sq_sum = sq_sum + (d.detach() ** 2).sum()
+
+                    global_norm = torch.sqrt(sq_sum + eps)
+
+                    # compute scale factor (<=1) as a detached scalar
+                    clip_coef = (grad_clip_norm / (global_norm + eps)).clamp(max=1.0)
+
+                    # apply the same scale to all deltas (preserves direction)
+                    scaled_deltas = []
+                    for d in deltas:
+                        if d is None:
+                            scaled_deltas.append(None)
+                        else:
+                            scaled_deltas.append(d * clip_coef)  # clip_coef is detached; this is safe
+
+                    # apply inner update to produce new fast_weights
                     new_fast_weights = []
-                    g_iter = iter(grads)
+                    d_iter = iter(scaled_deltas)
                     for i, w in enumerate(fast_weights):
                         if i in opt_idx:
-                            g = next(g_iter)
-                            if g is not None:
-                                new_fast_weights.append(w - current_inner_lr * g)
+                            d = next(d_iter)
+                            if d is not None:
+                                new_fast_weights.append(w - d)   # w - (lr * grad) already scaled
                             else:
                                 new_fast_weights.append(w)
                         else:
                             new_fast_weights.append(w)
-
                     fast_weights = new_fast_weights
 
                     # Evaluate query using the updated fast_weights (multi-step loss)

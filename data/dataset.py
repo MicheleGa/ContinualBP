@@ -11,9 +11,12 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from sklearn.model_selection import train_test_split
-from preprocessing_utils.data_visualization import plot_signals, plot_subject_sample_distribution, plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std, plot_bp_pattern_distribution
+from preprocessing_utils.data_visualization import (
+    plot_signals, plot_subject_sample_distribution, plot_augmented_views,
+    plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std,     
+)
 from preprocessing_utils.split import split_train_val_test
-from preprocessing_utils.augmentations import Jitter, Scaling, TimeWarp, Compose, ContrastiveTransformations
+from preprocessing_utils.augmentations import get_ppg_augmentations, get_ecg_augmentations, ContrastiveTransformations
 
 
 class PhysioDataset(Dataset):
@@ -100,13 +103,11 @@ class PhysioDataset(Dataset):
             print(f"\tCategory {cat}: {len(ids)} samples")
             
         if self.contrastive:
-            contrast_transforms = Compose([
-                Jitter(sigma=0.02, p=0.4),
-                Scaling(sigma=0.1, p=0.4),
-                TimeWarp(p=0.2),
-            ])
-
-            self.contrastive_transform = ContrastiveTransformations(contrast_transforms, n_views=2)
+            self.contrastive_transform = ContrastiveTransformations(
+                ppg_transforms=get_ppg_augmentations(),
+                ecg_transforms=get_ecg_augmentations() if self.ecg else None,
+                n_views=2
+                )
     
     def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
@@ -393,80 +394,101 @@ if __name__ == "__main__":
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
     # Assume contrastive is false
-    assert not args.contrastive, "Visualization not implemented for contrastive mode"
     
-    if args.mix_pretraining_subject_samples:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-            sig2sig=args.sig2sig,
-            savepath=root_figs_folder
-            ) 
-    else:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-            sig2sig=args.sig2sig,
-            savepath=root_figs_folder
-            )
     
-    input_batch = next(iter(train_dataloader))
-    sig = input_batch[0]
-    sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
-    idx = np.random.randint(0, sig.shape[0])
-    
-    annotation = input_batch[1]
-    
-    print(f"Input batch shape: {sig.shape}, Annotation batch shape: {annotation.shape}")
-    
-    if args.sig2sig:
-        sig = sig[idx, :, :].squeeze().numpy()
-        abp = annotation[idx, :].squeeze().numpy()
-    else:
-        sbp_val = annotation[idx, 0].squeeze().numpy()
-        dbp_val = annotation[idx, 1].squeeze().numpy()
-        map_val = annotation[idx, 2].squeeze().numpy()
-    
-    # Note that the train_dataloader will already return the required signals specified by the conditions
-    if args.ecg:
+    if args.contrastive:
+        (signals_anchor, bp_cats_anchor), (signals_pos, bp_cats_pos) = next(iter(train_dataloader))
         
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'ABP'], 
-                title=f'Input: PPG + ECG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'mmHg']
-            )
-        else:
-            plot_signals(
-                sig[idx, :, :].T, fs=args.fs, 
-                labels=['PPG', 'ECG'], 
-                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV']
-                )
+        # --- Shape Debugging Print ---
+        print(f"Shape of signals_anchor: {signals_anchor.shape}")
+        print(f"Shape of bp_cats_anchor: {bp_cats_anchor.shape}")
+        print(f"Shape of signals_pos: {signals_pos.shape}")
+        print(f"Shape of bp_cats_pos: {bp_cats_pos.shape}")
+
+        num_pairs_to_plot = 2
+
+        for i in range(num_pairs_to_plot):
+            anchor_signal = signals_anchor[i]
+            pos_signal = signals_pos[i]
             
+            
+            # You can add more context to the title if needed, e.g., the class
+            title = f"Pair_{i+1}_Cat_{bp_cats_anchor[i].item()}"
+            
+            plot_augmented_views(anchor_signal, pos_signal, title, root_figs_folder)
     else:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ABP'], 
-                title=f'Input: PPG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mmHg']
-            )
+        if args.mix_pretraining_subject_samples:
+            calculate_dataloaders_mean_std(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+                sig2sig=args.sig2sig,
+                savepath=root_figs_folder
+                ) 
         else:
-            plot_signals(
-                sig[idx, :, :].T, 
-                fs=args.fs,
-                labels=['PPG'], 
-                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.']
+            calculate_dataloaders_mean_std(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
+                sig2sig=args.sig2sig,
+                savepath=root_figs_folder
                 )
+
+        input_batch = next(iter(train_dataloader))
+        sig = input_batch[0]
+        sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
+        idx = np.random.randint(0, sig.shape[0])
+
+        annotation = input_batch[1]
+
+        print(f"Input batch shape: {sig.shape}, Annotation batch shape: {annotation.shape}")
+
+        if args.sig2sig:
+            sig = sig[idx, :, :].squeeze().numpy()
+            abp = annotation[idx, :].squeeze().numpy()
+        else:
+            sbp_val = annotation[idx, 0].squeeze().numpy()
+            dbp_val = annotation[idx, 1].squeeze().numpy()
+            map_val = annotation[idx, 2].squeeze().numpy()
+
+        # Note that the train_dataloader will already return the required signals specified by the conditions
+        if args.ecg:
+            
+            if args.sig2sig:
+                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+                plot_signals(
+                    sigs.T, 
+                    fs=args.fs, 
+                    labels=['PPG', 'ECG', 'ABP'], 
+                    title=f'Input: PPG + ECG, Output: ABP', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mV', 'mmHg']
+                )
+            else:
+                plot_signals(
+                    sig[idx, :, :].T, fs=args.fs, 
+                    labels=['PPG', 'ECG'], 
+                    title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mV']
+                    )
+                
+        else:
+            
+            if args.sig2sig:
+                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+                plot_signals(
+                    sigs.T, 
+                    fs=args.fs, 
+                    labels=['PPG', 'ABP'], 
+                    title=f'Input: PPG, Output: ABP', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mmHg']
+                )
+            else:
+                plot_signals(
+                    sig[idx, :, :].T, 
+                    fs=args.fs,
+                    labels=['PPG'], 
+                    title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.']
+                    )
