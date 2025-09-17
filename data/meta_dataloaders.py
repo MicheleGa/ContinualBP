@@ -283,9 +283,9 @@ def parseargs():
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--contrastive', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--k_support', type=int, default=8, help='meta-learning support set size')
-    parser.add_argument('--k_query', type=int, default=8, help='meta-learning query set size')
-    parser.add_argument('--meta_batch_size', type=int, default=16, help='meta batch size')
+    parser.add_argument('--k_support', type=int, default=5, help='meta-learning support set size')
+    parser.add_argument('--k_query', type=int, default=10, help='meta-learning query set size')
+    parser.add_argument('--meta_batch_size', type=int, default=4, help='meta batch size')
     parser.add_argument('--workers', type=int, default=2, help='parallel data loaders')
     
     return parser.parse_args()
@@ -313,29 +313,25 @@ if __name__ == "__main__":
     print(f"#Patients: train={len(splits['train_ids'])}, val={len(splits['val_ids'])}, test={len(splits['test_ids'])}")
 
     # --- Pull ONE TASK from train_loader and print shapes/values ---
-    task_batch = next(iter(train_loader))
-    # Because batch_size=1, dataloader adds a leading dimension of 1. Unwrap it.
+    task_batch = next(iter(val_loader))
+
     (Xs, Ys), (Xq, Yq), pid = task_batch
-    pid = pid[0] if isinstance(pid, list) or isinstance(pid, tuple) else pid
-
-    # Remove outer batch dim of size 1
-    Xs = Xs[0]; Xq = Xq[0]
-    if isinstance(Ys, list):
-        # Classification/regression of SBP/DBP case (sig2sig=False)
-        Ys = [y[0] for y in Ys]
-        Yq = [y[0] for y in Yq]
-    else:
-        Ys = Ys[0]; Yq = Yq[0]
-
+    
+    if len(Xs.shape) == 3:
+        Xs = Xs.unsqueeze(-1)
+    if len(Xq.shape) == 3:
+        Xq = Xq.unsqueeze(-1) 
+    
     print(f"[Task patient id] {pid}")
     print(f"Support X shape: {tuple(Xs.shape)}")
-    if isinstance(Ys, list):
-        print(f"Support SBP shape: {tuple(Ys[0].shape)}, DBP shape: {tuple(Ys[1].shape)}")
-    else:
-        print(f"Support Y (ABP waveform) shape: {tuple(Ys.shape)}")
+    print(f"Support Y shape: {tuple(Ys.shape)}")
+    print(f"Query X shape: {tuple(Xq.shape)}")
+    print(f"Query Y shape: {tuple(Yq.shape)}")
 
-    print(f"Query   X shape: {tuple(Xq.shape)}")
-    if isinstance(Yq, list):
-        print(f"Query   SBP shape: {tuple(Yq[0].shape)}, DBP shape: {tuple(Yq[1].shape)}")
-    else:
-        print(f"Query   Y (ABP waveform) shape: {tuple(Yq.shape)}")
+    sX, sY = Xs[0].float(), Ys[0].float()
+    qX, qY = Xq[0].float(), Yq[0].float()
+    
+    print(f"Support X shape: {tuple(sX.shape)}")
+    print(f"Support Y shape: {tuple(sY.shape)}")
+    print(f"Query X shape: {tuple(qX.shape)}")
+    print(f"Query Y shape: {tuple(qY.shape)}")

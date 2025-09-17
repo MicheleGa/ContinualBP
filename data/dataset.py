@@ -219,9 +219,6 @@ class PhysioDataset(Dataset):
 
         return (SubsetRandomSampler(pretraining_train_sample_ids), SubsetRandomSampler(pretraining_val_sample_ids), SubsetRandomSampler(pretraining_test_sample_ids))    
         
-    def before_pickle(self):
-        self.lmdbenv = None
-        self.lmdbtxn = None
         
     def bp_to_category(self, sbp, dbp):
         """
@@ -399,6 +396,11 @@ if __name__ == "__main__":
     if args.contrastive:
         (signals_anchor, bp_cats_anchor), (signals_pos, bp_cats_pos) = next(iter(train_dataloader))
         
+        if len(signals_anchor.shape) == 2:
+            signals_anchor = signals_anchor.unsqueeze(-1)
+        if len(signals_pos.shape) == 2:
+            signals_pos = signals_pos.unsqueeze(-1)
+        
         # --- Shape Debugging Print ---
         print(f"Shape of signals_anchor: {signals_anchor.shape}")
         print(f"Shape of bp_cats_anchor: {bp_cats_anchor.shape}")
@@ -411,11 +413,10 @@ if __name__ == "__main__":
             anchor_signal = signals_anchor[i]
             pos_signal = signals_pos[i]
             
-            
             # You can add more context to the title if needed, e.g., the class
             title = f"Pair_{i+1}_Cat_{bp_cats_anchor[i].item()}"
             
-            plot_augmented_views(anchor_signal, pos_signal, title, root_figs_folder)
+            plot_augmented_views(anchor_signal, pos_signal, title, root_figs_folder, ecg=args.ecg)
     else:
         if args.mix_pretraining_subject_samples:
             calculate_dataloaders_mean_std(

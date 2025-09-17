@@ -5,8 +5,8 @@ for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import pprint
 import torch
-import pytorch_lightning as pl
-from models.trainer import pretraining_training_validation_testing
+from torch.utils.tensorboard import SummaryWriter
+from models.trainer import pre_training, maml_meta_training
 from training_utils.helpers import fixseed, generate_runname, parseargs
 
 
@@ -53,17 +53,15 @@ if __name__ == "__main__":
     
     # Seed everything
     fixseed(config['seed'])
-    pl.seed_everything(config['seed'])
         
-    ## Pretraining
-    pretraining_training_validation_testing(
-        save_name=args.expname,
-        checkpoint_path=checkpoint_path,
-        tensorboard_path=tensorboard_path,
-        model_name=model_name,
-        config=config,
-        device=device
-    )  
+    # Logging to TensorBoard Summary Writer
+    writer = SummaryWriter(log_dir=tensorboard_path)
+
+    # Contrastive + Supervised Pre-training Stage for Initialization
+    pre_training(args.expname, checkpoint_path, writer, model_name, config, device)
+    
+    # Pre-training with MAML
+    maml_meta_training(args.expname, checkpoint_path, writer, model_name, config, device)
     
     # Save the best model and configuration after training
     print(f"Pretraining completed, best model and configuration saved in {checkpoint_path}")

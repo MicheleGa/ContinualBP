@@ -1,8 +1,4 @@
 import os
-import sys
-folders_to_add = ['preprocessing_utils']
-for folder in folders_to_add:
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 from collections import Counter
 import numpy as np
 import pandas as pd
@@ -83,7 +79,7 @@ def plot_bp_pattern_distribution(dataloaders, dataloaders_names, savepath='./fig
         plt.xlabel('Blood Pressure Pattern')
         plt.ylabel('Number of Samples')
         plt.tight_layout()
-        plt.savefig(os.path.join(savepath, f'{dataloader_name}_bp_distribution.jpg'))
+        plt.savefig(os.path.join(savepath, f'{dataloader_name}_bp_distribution.png'), dpi=1000)
         plt.close()
         
 
@@ -148,7 +144,7 @@ def _calculate_dataset_mean_std(sbp_values, dbp_values, map_values, name, savepa
         plt.legend()  # Update legend to include lines
         plt.tight_layout()
 
-        plt.savefig(os.path.join(savepath, f'{name}_sbp_dbp_map_distribution.jpg'))
+        plt.savefig(os.path.join(savepath, f'{name}_sbp_dbp_map_distribution.png'), dpi=1000)
         plt.close()                    
     else:
         plt.title(f'{name} SBP and DBP Distributions')
@@ -157,7 +153,7 @@ def _calculate_dataset_mean_std(sbp_values, dbp_values, map_values, name, savepa
         plt.legend()  # Update legend to include lines
         plt.tight_layout()
 
-        plt.savefig(os.path.join(savepath, f'{name}_sbp_dbp_distribution.jpg'))
+        plt.savefig(os.path.join(savepath, f'{name}_sbp_dbp_distribution.png'), dpi=1000)
         plt.close()
         
         
@@ -295,7 +291,7 @@ def plot_subject_sample_distribution(subject_sample_dict, ids, savepath="subject
              bbox=dict(facecolor='white', alpha=0.7))
 
     plt.tight_layout()
-    plt.savefig(savepath)
+    plt.savefig(savepath, dpi=1000)
     plt.close()
 
 
@@ -312,7 +308,7 @@ def plot_train_val_test_samples_distribution(train_samples_list, val_samples_lis
     test_samples_list : list
         List of sample IDs for the test set.
     savepath : str, optional
-        File path to save the generated plot. Defaults to './figs/dataset_overview.jpg'.
+        File path to save the generated plot. Defaults to './figs/dataset_overview.png'.
 
     Returns
     ------------
@@ -339,11 +335,11 @@ def plot_train_val_test_samples_distribution(train_samples_list, val_samples_lis
     fig.suptitle(f'{title}', fontsize=14)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap with suptitle
 
-    plt.savefig(savepath)
+    plt.savefig(savepath, dpi=1000)
     plt.close()
 
 
-def plot_pretraining_personalization_subjects_distribution(pretraining_subjects, personalization_subjects, title='', savepath='./figs/two_series_distribution.jpg'):
+def plot_pretraining_personalization_subjects_distribution(pretraining_subjects, personalization_subjects, title='', savepath='./figs/two_series_distribution.png'):
     r"""
     Plots the distribution of counts for two series of values.
 
@@ -356,7 +352,7 @@ def plot_pretraining_personalization_subjects_distribution(pretraining_subjects,
     title : str, optional
         Title of the plot. Defaults to ''.
     savepath : str, optional
-        File path to save the generated plot. Defaults to './figs/two_series_distribution.jpg'.
+        File path to save the generated plot. Defaults to './figs/two_series_distribution.png'.
 
     Returns
     ------------
@@ -383,7 +379,7 @@ def plot_pretraining_personalization_subjects_distribution(pretraining_subjects,
     fig.suptitle(f'{title}', fontsize=14)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent overlap with suptitle
 
-    plt.savefig(savepath)
+    plt.savefig(savepath, dpi=1000)
     plt.close()
 
 
@@ -411,7 +407,7 @@ def plot_signals(signals, labels=None, title="Signals Plot", fs=125, savepath='.
     Returns
     ------------
     None: 
-        The function saves the plot as a .jpg file in the specified savepath.    
+        The function saves the plot as a .png file in the specified savepath.    
     """
 
     num_signals = len(signals) if isinstance(signals, list) else signals.shape[0] # Handle list or 2D array input
@@ -438,7 +434,7 @@ def plot_signals(signals, labels=None, title="Signals Plot", fs=125, savepath='.
             plt.ylabel(ylabels[i])
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust subplot params for title
-    plt.savefig(os.path.join(savepath, f'{title}.jpg'))
+    plt.savefig(os.path.join(savepath, f'{title}.png'), dpi=1000)
     plt.close()
 
 
@@ -466,7 +462,7 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
 
     Returns
     ------------
-    None, saves the plot as a .jpg file in the specified save_path.
+    None, saves the plot as a .png file in the specified save_path.
     """
 
     # Seconds on the x-axis, amplitude on the y-axis
@@ -496,9 +492,39 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
         plt.scatter(t[flat_locs_sig], signal[flat_locs_sig], color='green', label='flat lines')
 
     plt.legend(loc='upper right')
-    plt.savefig(os.path.join(save_path, f'{title}.jpg'))
+    plt.savefig(os.path.join(save_path, f'{title}.png'), dpi=1000)
     plt.close()
     
+    
+def plot_augmented_views(aug_signal_0, aug_signal_1, title, savepath, ecg=False):
+    
+    if ecg:
+        _, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+
+        axes[0].plot(aug_signal_0[:,0].numpy())
+        axes[0].set_title("View 0 - PPG")
+        axes[1].plot(aug_signal_0[:,1].numpy())
+        axes[1].set_title("View 0 - ECG")
+
+        axes[2].plot(aug_signal_1[:,0].numpy())
+        axes[2].set_title("View 1 - PPG")
+        axes[3].plot(aug_signal_1[:,1].numpy())
+        axes[3].set_title("View 1 - ECG")
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(savepath, f'{title}.png'), dpi=200)
+        plt.close()
+    else:
+        _, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+        axes[0].plot(aug_signal_0[:,0].numpy())
+        axes[0].set_title("View 0 - PPG")
+        axes[1].plot(aug_signal_1[:,0].numpy())
+        axes[1].set_title("View 1 - PPG")
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(savepath, f'{title}.png'), dpi=200)
+        plt.close()
 
 def plot_subject_validity_over_time(subject_id, subject_windows, window_length, fs, savepath):
     if not subject_windows:
@@ -607,5 +633,5 @@ def plot_subject_validity_over_time(subject_id, subject_windows, window_length, 
     ax.legend(handles=list(unique_legend_elements.values()), labels=list(unique_legend_elements.keys()))
     
     plt.tight_layout()
-    plt.savefig(os.path.join(savepath, f'subject_{subject_id}_validity_plot.png'))
+    plt.savefig(os.path.join(savepath, f'subject_{subject_id}_validity_plot.png'), dpi=1000)
     plt.close() # Close the figure to free up memory
