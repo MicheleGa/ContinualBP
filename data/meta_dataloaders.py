@@ -96,7 +96,6 @@ class MetaTaskDataset(Dataset):
                 cat = self.bp_to_category(sbp, dbp)  # from PhysioDataset
                 self.patient_bp_index[pid][cat].append(sid)
 
-
     def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
         """
         Sample support/query windows for one patient,
@@ -173,7 +172,6 @@ def build_meta_splits_and_loaders(
     input_seq_len_s: int = 10,
     ecg: bool = False,
     sig2sig: bool = False,
-    contrastive: bool = False, 
     pretraining_split_ratio=(0.7, 0.1, 0.2),
     mix_pretraining_subject_samples: bool = False,
     min_subject_sample_number: int = 0,
@@ -201,7 +199,6 @@ def build_meta_splits_and_loaders(
         input_seq_len_s=input_seq_len_s,
         ecg=ecg,
         sig2sig=sig2sig,
-        contrastive=contrastive,
         min_subject_sample_number=min_subject_sample_number,
         plot=False,
         savepath="./figs"

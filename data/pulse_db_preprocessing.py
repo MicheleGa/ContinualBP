@@ -42,7 +42,7 @@ def process_subject(subject_info, args, result_queue=None, savepath=''):
             map = np.array([map]).astype(np.float32)
             
             # The pulse_db data is already windowed
-            subject_data.append((sig, abp, sbp, dbp, map))
+            subject_data.append((sig, abp, sbp, dbp, map) if not args.consider_timestamp else (sig, abp, sbp, dbp, map, data["timestamps"][segment_idx])) 
             
             if args.plot:
                 plot_signals(
@@ -125,18 +125,33 @@ def preprocess_dataset(args):
             index_by_subject_id[subject_id] = []
             subject_n_recording = 0
             
-            for window_sig, window_abp, window_sbp, window_dbp, window_map in subject_data:
-                txn.put(key="{}-ecg".format(sample_id).encode(), value=window_sig[0].tobytes()) # ECG is the first channel
-                txn.put(key="{}-ppg".format(sample_id).encode(), value=window_sig[1].tobytes()) # PPG is the second channel
-                txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
-                txn.put(key="{}-sbp".format(sample_id).encode(), value=window_sbp.tobytes())
-                txn.put(key="{}-dbp".format(sample_id).encode(), value=window_dbp.tobytes())
-                txn.put(key="{}-map".format(sample_id).encode(), value=window_map.tobytes())
-                
-                index_by_sample_id.append((subject_id, subject_n_recording))
-                index_by_subject_id[subject_id].append(sample_id)
-                sample_id += 1
-                subject_n_recording += 1
+            if not args.consider_timestamp:
+                for window_sig, window_abp, window_sbp, window_dbp, window_map in subject_data:
+                    txn.put(key="{}-ecg".format(sample_id).encode(), value=window_sig[0].tobytes()) # ECG is the first channel
+                    txn.put(key="{}-ppg".format(sample_id).encode(), value=window_sig[1].tobytes()) # PPG is the second channel
+                    txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
+                    txn.put(key="{}-sbp".format(sample_id).encode(), value=window_sbp.tobytes())
+                    txn.put(key="{}-dbp".format(sample_id).encode(), value=window_dbp.tobytes())
+                    txn.put(key="{}-map".format(sample_id).encode(), value=window_map.tobytes())
+                    
+                    index_by_sample_id.append((subject_id, subject_n_recording))
+                    index_by_subject_id[subject_id].append(sample_id)
+                    sample_id += 1
+                    subject_n_recording += 1
+            else:
+                for window_sig, window_abp, window_sbp, window_dbp, window_map, window_timestamp in subject_data:
+                    txn.put(key="{}-ecg".format(sample_id).encode(), value=window_sig[0].tobytes()) # ECG is the first channel
+                    txn.put(key="{}-ppg".format(sample_id).encode(), value=window_sig[1].tobytes()) # PPG is the second channel
+                    txn.put(key="{}-abp".format(sample_id).encode(), value=window_abp.tobytes())
+                    txn.put(key="{}-sbp".format(sample_id).encode(), value=window_sbp.tobytes())
+                    txn.put(key="{}-dbp".format(sample_id).encode(), value=window_dbp.tobytes())
+                    txn.put(key="{}-map".format(sample_id).encode(), value=window_map.tobytes())
+                    txn.put(key="{}-timestamp".format(sample_id).encode(), value=window_timestamp.tobytes())
+                    
+                    index_by_sample_id.append((subject_id, subject_n_recording))
+                    index_by_subject_id[subject_id].append(sample_id)
+                    sample_id += 1
+                    subject_n_recording += 1
             
         txn.put(key="index_by_sample_id".encode(), value=pickle.dumps(index_by_sample_id))
         txn.put(key="index_by_subject_id".encode(), value=pickle.dumps(index_by_subject_id))
@@ -155,6 +170,7 @@ def parseargs():
     parser.add_argument('--num_threads', default=5, type=int, help='number of parallel threads to use for processing')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot intermediate preprocessing steps or not')
     parser.add_argument('--fs', default=125, type=int, help='the sampling frequency')
+    parser.add_argument('--consider_timestamp', default='False', type=lambda x: bool(strtobool(x)), help='whether to consider the timestamp of window samples to define a chronological order')
     
     args = parser.parse_args()
     return args

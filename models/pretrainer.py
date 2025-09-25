@@ -4,8 +4,8 @@ folders_to_add = ['data', 'training_utils', 'models']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import copy
+from itertools import chain
 import numpy as np
-from sklearn.metrics import silhouette_score
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -16,152 +16,15 @@ from training_utils.helpers import (
     save_status, load_status, 
     get_encoder_architecture, get_prediction_head_architecture, 
     get_meta_lr, get_inner_lr, get_inner_steps, build_inner_optimizer, 
-    supcon_loss, get_msl_weights, should_use_second_order, 
-    compute_embedding_stats
+    get_msl_weights, compute_embedding_stats
     )
 from training_utils.metrics import AverageMeter, get_metric_values, call_metric
 
 
 def pre_training(save_name, checkpoint_path, writer, model_name, config, device):
     
-    # Define model architecture
-    encoder = get_encoder_architecture(config)
-
-    # Optionally load a pretrained checkpoint
-    # This is only for BIOT!
-    if config.get('pretrained_path') is not None and config['model_name'] == 'BIOT':
-        ckpt = torch.load(config['pretrained_path'], weights_only=False, map_location='cpu')
-        encoder.load_state_dict(ckpt['model_state_dict'])
-        print(f"[Pretraining] Loaded pretrained weights from {config['pretrained_path']}")
-
-    # Move model to device
-    encoder = encoder.to(device)
+    print(f"[Pretraining][Stage 1] ==== Supervised stage start ====")
     
-    # ---- Pre-training task ----
-    pretrain_ds = PhysioDataset(
-        seed=config['seed'],
-        lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
-        pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
-        fs=config['fs'],
-        input_seq_len_s=config['input_seq_len_s'],
-        ecg=config['ecg'],
-        sig2sig=config['sig2sig'],
-        min_subject_sample_number=config['min_subject_sample_number'],
-        contrastive=True
-    )
-    
-    (pre_train_sampler, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
-    
-    pre_train_dataloader = DataLoader(pretrain_ds, sampler=pre_train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
-    pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
-    pre_test_dataloader = DataLoader(pretrain_ds, sampler=pre_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
-    
-    # ====== Stage 1 config ======
-    stage1_epochs = config.get('stage1_epochs')    
-    stage1_pre_train_lr = config.get('stage1_pre_train_lr')
-    stage1_pre_train_scheduler_eta_min = config.get('stage1_pre_train_scheduler_eta_min')
-    weight_decay = config.get('weight_decay')
-
-    # ====== Stage 1: Backbone only ======
-    for param in encoder.parameters():
-        if (param.is_floating_point() or param.is_complex()):
-            param.requires_grad = True
-                
-    # Optimizer + scheduler (adapter only first)
-    optimizer_stage1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, encoder.parameters()), lr=stage1_pre_train_lr, weight_decay=weight_decay)
-    scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=stage1_epochs, eta_min=stage1_pre_train_scheduler_eta_min)
-
-    print(f"[Pretraining] ==== Stage 1 ====")
-    print(f"\t- Update: encoder only")
-    print(f"\t- Stage 1 epochs: {stage1_epochs}")
-    print(f"\t- Base LR: {stage1_pre_train_lr}")
-    print(f"\t- Min LR: {stage1_pre_train_scheduler_eta_min}")
-    print(f"\t- Scheduler: CosineAnnealingLR")
-    
-    # Define feat_dim before validation silhouette computation
-    feat_dim = encoder.embed_dim
-    train_losses = AverageMeter(name='pre_train_stage_1/train_loss')
-    best_val = -1.0 # Silhouette score is the worse when it is close to -1 and good when it is close to +1 
-    
-    # Training loop
-    for epoch in range(stage1_epochs):
-        
-        encoder.train()
-        train_losses.reset()
-        for batch_idx, batch in enumerate(pre_train_dataloader):
-            # Since signals_anchor/signals_pos are the same window fo PPG/ECG, the bp_cats_anchor/bp_cats_pos are the same
-            (signals_anchor, bp_cats_anchor), (signals_pos, bp_cats_pos) = batch
-            
-            # Move to device
-            signals_anchor, signals_pos, bp_cats_anchor = signals_anchor.to(device), signals_pos.to(device), bp_cats_anchor.to(device)
-            
-            # Zero gradients
-            optimizer_stage1.zero_grad()
-
-            # Forward pass for both anchor and positive samples
-            # model returns [batch_size, time_sequence, embed_dim], hence, reduce to [batch_size, embed_dim] for sup.con. loss 
-            feats_anchor = encoder(signals_anchor).mean(dim=1) 
-            feats_positive = encoder(signals_pos).mean(dim=1)
-            
-            # Stack features for contrastive learning: [B, 2, D]
-            feats_contrastive = torch.stack([feats_anchor, feats_positive], dim=1)
-            
-            # Supervised contrastive loss
-            loss, _, _ = supcon_loss(feats_contrastive, config, labels=bp_cats_anchor)
-            
-            loss.backward()
-
-            # Optimizer step
-            optimizer_stage1.step()
-
-            train_losses.update(loss.item(), signals_anchor.size(0))
-            writer.add_scalar('pre_train_stage_1/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
-        
-        # Step scheduler once per epoch
-        scheduler_stage1.step()
-        
-        # Log LR to TensorBoard
-        writer.add_scalar('pre_train_stage_1/lr', scheduler_stage1.get_last_lr()[0], epoch)
-        # Log loss
-        writer.add_scalar('pre_train_stage_1/train_loss_epoch', train_losses.avg, epoch)
-
-        # Validation
-        encoder.eval()
-        
-        # Record features and bp categories for silhouette score
-        all_feats = np.empty((0, feat_dim), dtype=float)
-        all_bp_cats = np.empty((0, 1), dtype=float)
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(pre_valid_dataloader):
-                signals, _, bp_cats = batch
-                signals, bp_cats = signals.to(device), bp_cats.to(device)
-                
-                feats = encoder(signals).mean(dim=1)
-
-                # Record normalized features and bp categories for silhouette score
-                all_feats = np.concatenate((all_feats, F.normalize(feats, dim=1).detach().cpu().numpy()), axis=0) # Normalized embeddings
-                all_bp_cats = np.concatenate((all_bp_cats, bp_cats.unsqueeze(-1).detach().cpu().numpy()), axis=0)
-
-        # Calculate and log val silhouette score to tensorboard
-        sil_score = silhouette_score(all_feats, all_bp_cats.squeeze()).astype(np.float32)
-        writer.add_scalar('pre_train_stage_1/val_sil_score_epoch', sil_score, epoch)
-        print(f"[Pretraining][Stage 1] Epoch {epoch+1}/{stage1_epochs} - Train {train_losses.avg:.6f} Val Silhouette Score {sil_score:.6f}")
-
-        if sil_score > best_val:
-            print(f"[Pretraining][Stage 1] New best validation silhouette score ✅: {sil_score:.6f}")
-            save_status(
-                subject_id=None, epoch=epoch, model_name=model_name + "_encoder_stage1", save_name=save_name, 
-                model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
-                meter=sil_score, checkpoint_path=checkpoint_path, config=config
-            )
-            
-            best_val = sil_score
-        
-    print(f"[Pretraining] ==== Stage 1 completed ====")
-    print(f"\t- Best silhouette score {best_val}")
-
-    # ====== Stage 2: Head-only ======
     # Instantiate the dataset again, but this time without the contrastive flag
     pretrain_ds = PhysioDataset(
         seed=config['seed'],
@@ -172,8 +35,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
         sig2sig=config['sig2sig'],
-        min_subject_sample_number=config['min_subject_sample_number'],
-        contrastive=False
+        min_subject_sample_number=config['min_subject_sample_number']
     )
         
     (pre_train_sampler, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
@@ -182,56 +44,51 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     pre_test_dataloader = DataLoader(pretrain_ds, sampler=pre_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     
-    # Load best model
+    print(f"[Pretraining][Stage 1] Dataset initialized ✅")
+    
+    # Initialize encoder
     encoder = get_encoder_architecture(config)
-    load_status(
-        subject_id=None, model_name=model_name + "_encoder_stage1", 
-        save_name=save_name, model=encoder, optimizer=None, scheduler=None, 
-        checkpoint_path=checkpoint_path, config=config
-    )
-    encoder.eval()
     encoder = encoder.to(device)
-    print(f"[Pretraining] Loaded encoder pretrained weights after pre-training stage 1")
+    print(f"[Pretraining][Stage 1] Encoder weights initialized ✅")
     
     # Initialize prediction head
     prediction_head = get_prediction_head_architecture(config)
-    prediction_head.eval()
     prediction_head = prediction_head.to(device)
-    print(f"[Pretraining] Intialized prediction head weights after pre-training stage 1")
+    print(f"[Pretraining][Stage 1] Prediction head weights initialized ✅")
     
-    # ====== Stage 2 config ======
-    stage2_epochs = config.get('stage2_epochs')
-    stage2_pre_train_lr = config.get('stage2_pre_train_lr')
-    stage2_pre_train_scheduler_eta_min = config.get('stage2_pre_train_scheduler_eta_min')
+    # ====== Pretraining config ======
+    stage1_epochs = config.get('stage1_epochs')
+    stage1_pre_train_lr = config.get('stage1_pre_train_lr')
+    stage1_pre_train_scheduler_eta_min = config.get('stage1_pre_train_scheduler_eta_min')
     weight_decay = config.get('weight_decay')
     
-    # Freeze all backbone (encoder + adapter)
+    # Train encoder
     for param in encoder.parameters():
         if (param.is_floating_point() or param.is_complex()):
-            param.requires_grad = False
+            param.requires_grad = True
 
-    # Unfreeze regression head
+    # Train regression head
     for param in prediction_head.parameters():
         if (param.is_floating_point() or param.is_complex()):
             param.requires_grad = True
         
     # Pass only head parameters
-    optimizer_stage2 = torch.optim.AdamW(filter(lambda p: p.requires_grad, prediction_head.parameters()), lr=stage2_pre_train_lr, weight_decay=weight_decay)
-    scheduler_stage2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage2, T_max=stage2_epochs, eta_min=stage2_pre_train_scheduler_eta_min)
+    optimizer_stage1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, chain(encoder.parameters(), prediction_head.parameters())), lr=stage1_pre_train_lr, weight_decay=weight_decay)
+    scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=stage1_epochs, eta_min=stage1_pre_train_scheduler_eta_min)
 
-    print(f"[Pretraining] ==== Stage 2 ====")
-    print(f"\t- Update: prediction head only")
-    print(f"\t- Stage 2 epochs: {stage2_epochs}")
-    print(f"\t- Base LR: {stage2_pre_train_lr}")
-    print(f"\t- Min LR: {stage2_pre_train_scheduler_eta_min}")
+    print(f"[Pretraining][Stage 1] Run configuration")
+    print(f"\t- Update: encoder and prediction head")
+    print(f"\t- Epochs: {stage1_epochs}")
+    print(f"\t- Base LR: {stage1_pre_train_lr}")
+    print(f"\t- Min LR: {stage1_pre_train_scheduler_eta_min}")
     print(f"\t- Scheduler: CosineAnnealingLR")
     
-    best_val = float("+inf")    
-    train_losses = AverageMeter(name='pre_train_stage_2/train_loss')
-    val_losses = AverageMeter(name='pre_train_stage_2/val_loss')
-    for epoch in range(stage2_epochs):
+    best_val = best_val = float("+inf")    
+    train_losses = AverageMeter(name='pre_train_stage1/train_loss')
+    val_losses = AverageMeter(name='pre_train_stage1/val_loss')
+    for epoch in range(stage1_epochs):
         
-        prediction_head.train()
+        encoder.train(); prediction_head.train()
         train_losses.reset()
         for batch_idx, batch in enumerate(pre_train_dataloader):
             
@@ -239,7 +96,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             signals, targets = signals.to(device), targets.to(device)
 
             # Zero gradients
-            optimizer_stage2.zero_grad()
+            optimizer_stage1.zero_grad()
 
             # Standard forward pass without contrastive learning
             # the prediction head will sequence the T dimension when sig2sig False, this is why there is no mean()
@@ -252,18 +109,18 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             loss.backward()
 
             # Optimizer step
-            optimizer_stage2.step()
+            optimizer_stage1.step()
             
             train_losses.update(loss.item(), signals.size(0))
-            writer.add_scalar('pre_train_stage_2/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
+            writer.add_scalar('pre_train_stage1/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
         
         # Step scheduler once per epoch
-        scheduler_stage2.step()
+        scheduler_stage1.step()
         
-        writer.add_scalar('pre_train_stage_2/train_loss_epoch', train_losses.avg, epoch)
+        writer.add_scalar('pre_train_stage1/train_loss_epoch', train_losses.avg, epoch)
         
         # Validation
-        prediction_head.eval()
+        encoder.eval(); prediction_head.eval()
         val_losses.reset()
         with torch.no_grad():
             for batch_idx, batch in enumerate(pre_valid_dataloader):
@@ -276,29 +133,58 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
                 vloss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
                 val_losses.update(vloss.item(), signals.size(0))
 
-        writer.add_scalar('pre_train_stage_2/val_loss_epoch', val_losses.avg, epoch)
-        print(f"[Pretraining][Stage 2] Epoch {epoch+1}/{stage2_epochs} "
-            f"- Train {train_losses.avg:.6f} Val {val_losses.avg:.6f}")
-
-        if val_losses.avg < best_val:
-            print(f"[Pretraining][Stage 2] New best validation loss ✅: {val_losses.avg:.6f}")
+        writer.add_scalar('pre_train_stage1/val_loss_epoch', val_losses.avg, epoch)
+        print(f"[Pretraining][Stage 1] Epoch {epoch+1}/{stage1_epochs} - Train {train_losses.avg:.5f} Val {val_losses.avg:.5f}")
+        
+        if (epoch + 1) in {5, 10, 15}: 
+            print(f"[Pretraining][Stage 1] Saving checkpoint at {epoch}")
             save_status(
-                subject_id=None, epoch=epoch, model_name=model_name + "_prediction_head_stage2", 
-                save_name=save_name, model=prediction_head, optimizer=optimizer_stage2, scheduler=scheduler_stage2, 
+                subject_id=None, epoch=epoch, model_name=model_name + f"_encoder_epoch_{epoch}", 
+                save_name=save_name, model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
+                meter=val_losses, checkpoint_path=checkpoint_path, config=config
+            )
+            save_status(
+                subject_id=None, epoch=epoch, model_name=model_name + f"_prediction_head_{epoch}", 
+                save_name=save_name, model=prediction_head, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
+                meter=val_losses, checkpoint_path=checkpoint_path, config=config
+            )
+            
+        if val_losses.avg < best_val:
+            print(f"[Pretraining][Stage 1] New best validation loss ✅: {val_losses.avg:.5f}")
+            save_status(
+                subject_id=None, epoch=epoch, model_name=model_name + "_encoder", 
+                save_name=save_name, model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
+                meter=val_losses, checkpoint_path=checkpoint_path, config=config
+            )
+            save_status(
+                subject_id=None, epoch=epoch, model_name=model_name + "_prediction_head", 
+                save_name=save_name, model=prediction_head, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
                 meter=val_losses, checkpoint_path=checkpoint_path, config=config
             )
             
             best_val = val_losses.avg
     
-    print(f"[Pretraining] ==== Stage 2 completed ====")
-    print(f"\t- Best val loss {best_val}")
-    print(f"[Pretraining] ==== Testing ====")
+    print("[Pretraining][Stage 1] Saving checkpoint at the end of training")
+    save_status(
+        subject_id=None, epoch=epoch, model_name=model_name + "_encoder_epoch_final", 
+        save_name=save_name, model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
+        meter=val_losses, checkpoint_path=checkpoint_path, config=config
+    )
+    save_status(
+        subject_id=None, epoch=epoch, model_name=model_name + "_prediction_head_final", 
+        save_name=save_name, model=prediction_head, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
+        meter=val_losses, checkpoint_path=checkpoint_path, config=config
+    )
     
+    print(f"[Pretraining][Stage 1] Supervised stage training completed ✅")
+    print(f"\t- Best val loss {best_val}")
+    print(f"[Pretraining][Stage 1] Supervised stage testing ...")
+        
     # ====== Final test ======
     # Load best model
     encoder = get_encoder_architecture(config)
     load_status(
-        subject_id=None, model_name=model_name + "_encoder_stage1", save_name=save_name, 
+        subject_id=None, model_name=model_name + "_encoder", save_name=save_name, 
         model=encoder, optimizer=None, scheduler=None, 
         checkpoint_path=checkpoint_path, config=config
     )
@@ -308,7 +194,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     # Load best prediction head
     prediction_head = get_prediction_head_architecture(config)
     load_status(
-        subject_id=None, model_name=model_name + "_prediction_head_stage2", save_name=save_name, 
+        subject_id=None, model_name=model_name + "_prediction_head", save_name=save_name, 
         model=prediction_head, optimizer=None, scheduler=None, 
         checkpoint_path=checkpoint_path, config=config
     )
@@ -319,11 +205,21 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     example_input_batch = next(iter(pre_train_dataloader))
     signals, _ = example_input_batch
     signals = signals.to(device)
-    
-    feats = encoder(signals)
-    writer.add_graph(encoder, signals)
-    _ = prediction_head(feats)
-    writer.add_graph(prediction_head, feats)
+
+    # Define full model (encoder + prediction_head)
+    class FullModel(torch.nn.Module):
+        def __init__(self, encoder, prediction_head):
+            super().__init__()
+            self.encoder = encoder
+            self.prediction_head = prediction_head
+
+        def forward(self, x):
+            feats = self.encoder(x)
+            return self.prediction_head(feats)
+
+    full_model = FullModel(encoder, prediction_head).to(device)
+    # Log whole graph
+    writer.add_graph(full_model, signals)
     
     # Meters    
     test_losses = AverageMeter(name='pre_train_test/loss')
@@ -378,47 +274,50 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
     # Log test metrics
     # Note: `epoch` here is the last epoch of training, not ideal for test summary
-    writer.add_scalar('pre_train_test/loss_final', test_losses.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/sbp_mae_final', test_sbp_maes.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/dbp_mae_final', test_dbp_maes.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/map_mae_final', test_map_maes.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/sbp_me_final', test_sbp_mes.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/dbp_me_final', test_dbp_mes.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/map_me_final', test_map_mes.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/map_mae_std_final', test_map_mae_stds.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/sbp_me_std_final', test_sbp_me_stds.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/dbp_me_std_final', test_dbp_me_stds.avg, config['stage2_epochs'])
-    writer.add_scalar('pre_train_test/map_me_std_final', test_map_me_stds.avg, config['stage2_epochs'])
+    writer.add_scalar('pre_train_test/loss_final', test_losses.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/sbp_mae_final', test_sbp_maes.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/dbp_mae_final', test_dbp_maes.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/map_mae_final', test_map_maes.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/sbp_me_final', test_sbp_mes.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/dbp_me_final', test_dbp_mes.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/map_me_final', test_map_mes.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/map_mae_std_final', test_map_mae_stds.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/sbp_me_std_final', test_sbp_me_stds.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/dbp_me_std_final', test_dbp_me_stds.avg, config['stage1_epochs'])
+    writer.add_scalar('pre_train_test/map_me_std_final', test_map_me_stds.avg, config['stage1_epochs'])
 
     # Log test metrics (optionally, plot them) and return loss for validation
     _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'pretraining_supervised_stage'), plot=True)    
     
-    print(f"[Pretraining] ==== Testing completed ====")
+    print(f"[Pretraining][Stage 1] Supervised stage testing completed ✅")
+    print(f"[Pretraining][Stage 1] ==== Stage 1 end ====")
 
 
 def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, device):
     
+    print(f"[Pretraining][MAML] === MAML start ====")
+    
     # Load best model
     encoder = get_encoder_architecture(config)
     load_status(
-        subject_id=None, model_name=model_name + "_encoder_stage1", save_name=save_name, 
+        subject_id=None, model_name=model_name + "_encoder", save_name=save_name, 
         model=encoder, optimizer=None, scheduler=None, 
         checkpoint_path=checkpoint_path, config=config
     )
     encoder.eval()
-    print(f"[MAML] Loaded encoder pretrained weights after pre-training stage 1")
+    print(f"[Pretraining][MAML] Stage-1 encoder weights loaded ✅")
     
     # Load best prediction head
     prediction_head = get_prediction_head_architecture(config)
     load_status(
-        subject_id=None, model_name=model_name + "_prediction_head_stage2", save_name=save_name, 
+        subject_id=None, model_name=model_name + "_prediction_head", save_name=save_name, 
         model=prediction_head, optimizer=None, scheduler=None, 
         checkpoint_path=checkpoint_path, config=config
     )
     prediction_head.eval()
-    print(f"[MAML] Loaded regressor pretrained weights after pre-training stage 2")
+    print(f"[Pretraining][MAML] Stage-1 prediction head weights loaded ✅")
     
     # Create enhanced learner wrapper and move to device
     learner = MAMLLearner(encoder, prediction_head).to(device)
@@ -440,12 +339,10 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects, must be False
         k_support=config['k_support'],
         k_query=config['k_query'],
-        meta_batch_size=config['meta_batch_size'],
-        contrastive=False # To avoid loading the positive pair for a subject
+        meta_batch_size=config['meta_batch_size']
     )
     
     # Saving feature statistics for intiializing the drift detector during the personalization step
-    print("[MAML] Computing baseline embedding statistics before meta-training...")
     baseline_mean, baseline_std = compute_embedding_stats(encoder, train_dataloader, device)
 
     # Save to file for personalization later on
@@ -454,7 +351,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         'baseline_std': baseline_std,
     }
     np.savez(os.path.join(checkpoint_path, f"{save_name}_embedding_stats.npz"), **stats_ckpt)
-    print(f"[MAML] Saved embedding stats to {save_name}_embedding_stats.npz")
+    print(f"[Pretraining][MAML] Embedding stats saved to {save_name}_embedding_stats.npz ✅")
     
     # Hyperparams / defaults
     meta_epochs = config.get('max_meta_epochs')
@@ -466,14 +363,14 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     inner_steps_schedule = config.get('inner_steps_schedule')
     
     # MAML specific parameters
-    print(f"[MAML] ==== Stage 3 Starting MAML meta-training ====")
+    print(f"[Pretraining][MAML] Run configuration")
     print(f"\t- Meta LR schedule: {meta_lr_schedule}")
     print(f"\t- Inner LR schedule: {inner_lr_schedule}")
     print(f"\t- Inner steps schedule: {inner_steps_schedule}")
     print(f"\t- Using pure functional: {learner.use_pure_functional}")
     
     # Meta-optimizer for the meta-parameters
-    meta_optimizer = torch.optim.Adam(learner.parameters(), lr=get_meta_lr(0, config))
+    meta_optimizer = torch.optim.AdamW(learner.parameters(), lr=get_meta_lr(0, config), weight_decay=config['weight_decay'])
     
     # Meters
     epoch_query_loss_meter = AverageMeter(name='meta/train_query_loss')
@@ -484,6 +381,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
 
     # ---- Outer loop ----
     for epoch in range(meta_epochs):
+        
         learner.train()
 
         # Decide schedules / hyperparams for this epoch
@@ -494,9 +392,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         # Update meta-optimizer learning rate if using manual schedule
         for param_group in meta_optimizer.param_groups:
             param_group['lr'] = current_meta_lr
-
-        # Decide derivative-order for this epoch (derivative annealing)
-        use_second_order = should_use_second_order(epoch, config)
 
         # Get MSL weights for post-update steps (and optionally pre-update)
         include_pre = bool(config.get('msl_include_pre'))
@@ -512,7 +407,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
         writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
         writer.add_scalar('meta/inner_steps', current_inner_steps, epoch)
-        writer.add_scalar('meta/use_second_order', float(use_second_order), epoch)
 
         for batch_idx, batch in enumerate(train_dataloader):
             (Xs, Ys), (Xq, Yq), pid = batch
@@ -563,7 +457,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                     grads = torch.autograd.grad(
                         loss_s,
                         opt_params,
-                        create_graph=use_second_order,
+                        create_graph=False, # Always False, we do FOMAML
                         retain_graph=True,
                         allow_unused=True
                     )
@@ -617,9 +511,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                     loss_q_step = F.smooth_l1_loss(out_q_step, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q_step, qY)
                     per_step_query_losses.append(loss_q_step)
 
-                    # Log per-inner-step support loss
-                    writer.add_scalar(f"inner/epoch{epoch}_batch{batch_idx}/support_loss_step{step}", loss_s.item(), step)
-
                 # --- combine per-step query losses into single meta-loss for this task ---
 
                 # Weighted sum of query losses for this task
@@ -638,6 +529,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
 
                 epoch_query_loss_meter.update(final_query_loss, 1)
                 epoch_support_loss_meter.update(np.mean(support_losses) if len(support_losses) > 0 else 0.0, 1)
+                
 
             # End tasks in meta-batch: do meta-backward on accumulated meta_loss
             # Note: if using first-order (use_second_order=False), create_graph was False above,
@@ -671,19 +563,17 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
         writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
         writer.add_scalar('meta/inner_steps', current_inner_steps, epoch)
-        writer.add_scalar('meta/use_second_order', float(use_second_order), epoch)
 
         print(
-            f"[MAML] Epoch {epoch+1}/{meta_epochs} - "
-            f"train_support_loss {avg_train_support_loss:.6f}, "
-            f"train_query_loss {avg_train_query_loss:.6f}, "
-            f"train_meta_loss {avg_train_meta_loss:.6f}, "
-            f"val_loss {val_loss:.6f}, "
+            f"[Pretraining][MAML] Epoch {epoch+1}/{meta_epochs} - "
+            f"train_support_loss {avg_train_support_loss:.5f}, "
+            f"train_query_loss {avg_train_query_loss:.5f}, "
+            f"train_meta_loss {avg_train_meta_loss:.5f}, "
+            f"val_loss {val_loss:.5f}, "
             f"grad_norm {avg_grad_norm:.3f}, "
-            f"meta_lr {current_meta_lr:.6f}, "
-            f"inner_lr {current_inner_lr:.6f}, "
-            f"inner_steps {current_inner_steps}, "
-            f"second_order {use_second_order}"
+            f"meta_lr {current_meta_lr:.5f}, "
+            f"inner_lr {current_inner_lr:.5f}, "
+            f"inner_steps {current_inner_steps}"
         )
 
         # Save best model according to validation loss
@@ -698,11 +588,13 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
             best_model_path = os.path.join(checkpoint_path, f"{save_name}_best_maml")
             torch.save(save_ckpt, best_model_path)
             best_val = val_loss
-            print(f"[MAML] New best validation loss ✅: {val_loss:.6f}, saved to {best_model_path}")
+            print(f"[Pretraining][MAML] New best validation loss ✅: {val_loss:.5f}, saved to {best_model_path}")
     
     
     # After meta-training, run final test evaluation
-    print(f"[MAML] Starting final test evaluation with best model...")
+    print(f"[Pretraining][MAML] MAML training completed ✅")
+    print(f"\t- Best val loss {best_val}")
+    print(f"[Pretraining][MAML] MAML testing ...")
     
     # Load best model
     best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_maml"), weights_only=False)
@@ -724,6 +616,9 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                    plot=True)  
     
     writer.close()
+    
+    print(f"[Pretraining][Stage 1] MAML testing completed ✅")
+    print(f"[Pretraining][MAML] === MAML end ====")
     
     
 def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=False, writer=None):

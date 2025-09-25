@@ -9,7 +9,7 @@ import sys
 import lmdb
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.sampler import SubsetRandomSampler
+from torch.utils.data.sampler import SubsetRandomSampler, BatchSampler
 from sklearn.model_selection import train_test_split
 from preprocessing_utils.data_visualization import (
     plot_signals, plot_subject_sample_distribution, plot_augmented_views,
@@ -30,7 +30,6 @@ class PhysioDataset(Dataset):
                  ecg=False, 
                  sig2sig=False,
                  min_subject_sample_number=0, 
-                 contrastive=False,
                  plot=False, 
                  savepath='./figs'):
         super(PhysioDataset, self).__init__()
@@ -55,7 +54,6 @@ class PhysioDataset(Dataset):
         self.sig2sig = sig2sig
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
-        self.contrastive = contrastive
         
         # Plot arguments
         self.plot = plot
@@ -80,35 +78,7 @@ class PhysioDataset(Dataset):
                 "Total Samples": len(self.index_by_sample_id)
             }
         )
-        
-        # ---------------------------------------------------------
-        # === Precompute BP categories and build index for contrastive sampling
-        # ---------------------------------------------------------
-        # Since its required only for training, we will nedd the sample ids for trianing
-        pretraining_train_sample_ids, _, _ = self.get_pretraining_samplers()
-
-        self.index_by_bp_category = {0: [], 1: [], 2: [], 3: [], 4: []}
-
-        for sample_id in pretraining_train_sample_ids:
-            sbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{sample_id}-sbp".encode()), dtype="float32"))
-            dbp = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{sample_id}-dbp".encode()), dtype="float32"))
             
-            cat = self.bp_to_category(sbp, dbp)
-            self.index_by_bp_category[cat].append(sample_id)
-
-        print("Built BP category index:")
-        for cat, ids in self.index_by_bp_category.items():
-            print(f"\tCategory {cat}: {len(ids)} samples")
-            
-        if self.contrastive:
-            self.contrastive_transform = ContrastiveTransformations(
-                ppg_transforms=get_ppg_augmentations(),
-                ecg_transforms=get_ecg_augmentations() if self.ecg else None,
-                n_views=2
-                )
-    
     def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
         # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
@@ -130,6 +100,52 @@ class PhysioDataset(Dataset):
                 if len(self.index_by_subject_id[subject]) > min_subject_sample_number:
                     self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
     
+    def _build_bp_category_index(self, sample_ids, split_name):
+        """Build BP category index for a given set of sample IDs"""
+        category_dict = {cat: [] for cat in range(5)}
+        
+        for sample_id in sample_ids:
+            sbp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{sample_id}-sbp".encode()), dtype="float32"))
+            dbp = np.squeeze(np.frombuffer(
+                self.lmdbtxn.get(f"{sample_id}-dbp".encode()), dtype="float32"))
+            
+            cat = self.bp_to_category(sbp, dbp)
+            category_dict[cat].append(sample_id)
+        
+        print(f"Built {split_name} BP category index:")
+        for cat, ids in category_dict.items():
+            print(f"\tCategory {cat}: {len(ids)} samples")
+        
+        return category_dict
+
+    def bp_to_category(self, sbp, dbp):
+        """
+        Categorize BP based on American Heart Association (AHA) guidelines:
+        Source: https://www.heart.org/en/health-topics/high-blood-pressure/understanding-blood-pressure-readings
+        
+        - Category 0: Normal
+            SBP < 120 mmHg AND DBP < 80 mmHg
+        - Category 1: Elevated
+            SBP 120 - 129 mmHg AND DBP < 80 mmHg
+        - Category 2: Hypertension Stage 1
+            SBP 130 - 139 mmHg OR DBP 80 - 89 mmHg
+        - Category 3: Hypertension Stage 2
+            SBP 140 - 180 mmHg OR DBP 90 - 120 mmHg
+        - Category 4: Hypertensive Crisis
+            SBP > 180 mmHg AND/OR DBP > 120 mmHg
+        """
+        if sbp < 120 and dbp < 80:
+            return 0
+        elif 120 <= sbp < 130 and dbp < 80:
+            return 1
+        elif (130 <= sbp < 140) or (80 <= dbp < 90):
+            return 2
+        elif (140 <= sbp <= 180) or (90 <= dbp <= 120):
+            return 3
+        else:
+            return 4
+
     def get_pretraining_samplers(self):
         
         print("{:s} {:s}".format(self.__class__.__name__, sys._getframe().f_code.co_name))
@@ -219,43 +235,16 @@ class PhysioDataset(Dataset):
 
         return (SubsetRandomSampler(pretraining_train_sample_ids), SubsetRandomSampler(pretraining_val_sample_ids), SubsetRandomSampler(pretraining_test_sample_ids))    
         
-        
-    def bp_to_category(self, sbp, dbp):
-        """
-        Categorize BP based on American Heart Association (AHA) guidelines:
-        Source: https://www.heart.org/en/health-topics/high-blood-pressure/understanding-blood-pressure-readings
-        
-        - Category 0: Normal
-            SBP < 120 mmHg AND DBP < 80 mmHg
-        - Category 1: Elevated
-            SBP 120 - 129 mmHg AND DBP < 80 mmHg
-        - Category 2: Hypertension Stage 1
-            SBP 130 - 139 mmHg OR DBP 80 - 89 mmHg
-        - Category 3: Hypertension Stage 2
-            SBP 140 - 180 mmHg OR DBP 90 - 120 mmHg
-        - Category 4: Hypertensive Crisis
-            SBP > 180 mmHg AND/OR DBP > 120 mmHg
-        """
-        if sbp < 120 and dbp < 80:
-            return 0
-        elif 120 <= sbp < 130 and dbp < 80:
-            return 1
-        elif (130 <= sbp < 140) or (80 <= dbp < 90):
-            return 2
-        elif (140 <= sbp <= 180) or (90 <= dbp <= 120):
-            return 3
-        else:
-            return 4
-
     def __len__(self):
         return len(self.index_by_sample_id)
-    
+
     def __getitem__(self, index):
+        
         # ---------------------------------------------------------
         # === Load raw input signals (PPG/ECG) ===
         # ---------------------------------------------------------
-        ppg = np.frombuffer(self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32")
-        ecg = np.frombuffer(self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32")
+        ppg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32"))
+        ecg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32"))
 
         # ---------------------------------------------------------
         # === Load annotations ===
@@ -304,37 +293,114 @@ class PhysioDataset(Dataset):
                 torch.tensor(map)
             ], dim=-1)
 
-        # ---------------------------------------------------------
-        # === Default return (val/test or no contrastive mode) ===
-        # ---------------------------------------------------------
-        if not self.contrastive:
-            return signals, annotation
+        return signals, annotation
         
-        # ---------------------------------------------------------
-        # === Guardrails for contrastive mode ===
-        # ---------------------------------------------------------
-        if self.contrastive and self.mix_pretraining_subject_samples:
-            raise ValueError("Contrastive learning not possible "
-                            "when pretraining samples are mixed among subjects.")
 
-        # ----------------------------------------------
-        # Contrastive Training mode: apply augmentations 
-        # ----------------------------------------------
-        bp_cat = self.bp_to_category(sbp, dbp)
-        subject_id, _ = self.index_by_sample_id[index]
-        
-        # In contrastive mode, we are interested in returning positive paris only for training samples
-        # However, in pre-training val/test mode, may useful to get the sample BP category
-        # to visualize the clusters in the embedding space
-        if subject_id in set(self.pretraining_val_subjects):
-            return signals, annotation, bp_cat
-        if subject_id in set(self.pretraining_test_subjects):
-            return signals, annotation, bp_cat
-        if subject_id not in set(self.pretraining_train_subjects):
-            raise ValueError("Subject ID not found in train/val/test splits.")
+def fix_seed(seed=42):
+    """Your existing seed fixing function"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-        views = self.contrastive_transform(signals)
-        return (views[0], bp_cat), (views[1], bp_cat)
+
+def test_sampler_determinism(args):
+    """Test if get_pretraining_samplers() is deterministic"""
+    
+    # Test 1: Same dataset instance, multiple calls
+    print("=== Test 1: Same dataset instance ===")
+    fix_seed(args.seed)
+    dataset = PhysioDataset(
+        seed=args.seed,
+        lmdb_folder=os.path.join(args.dataset_folder, args.name),
+        pretraining_split_ratio=list(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
+        mix_pretraining_subject_samples=args.mix_pretraining_subject_samples,
+        fs=args.fs,
+        input_seq_len_s=args.input_seq_len_s,
+        ecg=args.ecg,
+        sig2sig=args.sig2sig,
+        contrastive=args.contrastive,
+        min_subject_sample_number=args.min_subject_sample_number,
+        plot=args.plot, 
+        savepath=root_figs_folder
+    )
+    
+    train_sampler1, _, _ = dataset.get_pretraining_samplers()
+    train_ids1 = set(train_sampler1.indices)
+    
+    train_sampler2, _, _ = dataset.get_pretraining_samplers()
+    train_ids2 = set(train_sampler2.indices)
+    
+    print(f"Same results: {train_ids1 == train_ids2}")
+    
+    # Test 2: Different dataset instances
+    print("\n=== Test 2: Different dataset instances ===")
+    fix_seed(args.seed)
+    dataset1 = PhysioDataset(
+        seed=args.seed,
+        lmdb_folder=os.path.join(args.dataset_folder, args.name),
+        pretraining_split_ratio=list(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
+        mix_pretraining_subject_samples=args.mix_pretraining_subject_samples,
+        fs=args.fs,
+        input_seq_len_s=args.input_seq_len_s,
+        ecg=args.ecg,
+        sig2sig=args.sig2sig,
+        contrastive=args.contrastive,
+        min_subject_sample_number=args.min_subject_sample_number,
+        plot=args.plot, 
+        savepath=root_figs_folder
+    )
+    train_sampler1, _, _ = dataset1.get_pretraining_samplers()
+    train_ids1 = set(train_sampler1.indices)
+    
+    fix_seed(args.seed)
+    dataset2 = PhysioDataset(
+        seed=args.seed,
+        lmdb_folder=os.path.join(args.dataset_folder, args.name),
+        pretraining_split_ratio=list(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
+        mix_pretraining_subject_samples=args.mix_pretraining_subject_samples,
+        fs=args.fs,
+        input_seq_len_s=args.input_seq_len_s,
+        ecg=args.ecg,
+        sig2sig=args.sig2sig,
+        contrastive=args.contrastive,
+        min_subject_sample_number=args.min_subject_sample_number,
+        plot=args.plot, 
+        savepath=root_figs_folder
+    )
+    train_sampler2, _, _ = dataset2.get_pretraining_samplers()
+    train_ids2 = set(train_sampler2.indices)
+    
+    print(f"Same results: {train_ids1 == train_ids2}")
+    
+    # Test 3: With some random operations in between
+    print("\n=== Test 3: With random operations in between ===")
+    fix_seed(args.seed)
+    dataset = PhysioDataset(
+        seed=args.seed,
+        lmdb_folder=os.path.join(args.dataset_folder, args.name),
+        pretraining_split_ratio=list(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
+        mix_pretraining_subject_samples=args.mix_pretraining_subject_samples,
+        fs=args.fs,
+        input_seq_len_s=args.input_seq_len_s,
+        ecg=args.ecg,
+        sig2sig=args.sig2sig,
+        contrastive=args.contrastive,
+        min_subject_sample_number=args.min_subject_sample_number,
+        plot=args.plot, 
+        savepath=root_figs_folder
+    )
+    train_sampler1, _, _ = dataset.get_pretraining_samplers()
+    train_ids1 = set(train_sampler1.indices)
+    
+    # Some random operations
+    random.randint(1, 100)
+    np.random.rand(5)
+    
+    train_sampler2, _, _ = dataset.get_pretraining_samplers()
+    train_ids2 = set(train_sampler2.indices)
+    
+    print(f"Same results: {train_ids1 == train_ids2}")
 
 
 def parseargs():
@@ -352,7 +418,6 @@ def parseargs():
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--contrastive', default='False', type=lambda x: bool(strtobool(x)), help='whether to load the positive pair of a subject sample or not')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--plot_aug', default='False', type=lambda x: bool(strtobool(x)), help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
@@ -368,6 +433,9 @@ if __name__ == "__main__":
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
     
+    # Run the test
+    #test_sampler_determinism(args)  
+      
     dataset = PhysioDataset(
         seed=args.seed,
         lmdb_folder=os.path.join(args.dataset_folder, args.name),
@@ -377,7 +445,6 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         sig2sig=args.sig2sig,
-        contrastive=args.contrastive,
         min_subject_sample_number=args.min_subject_sample_number,
         plot=args.plot, 
         savepath=root_figs_folder
@@ -390,106 +457,78 @@ if __name__ == "__main__":
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
-    # Assume contrastive is false
-    
-    
-    if args.contrastive:
-        (signals_anchor, bp_cats_anchor), (signals_pos, bp_cats_pos) = next(iter(train_dataloader))
-        
-        if len(signals_anchor.shape) == 2:
-            signals_anchor = signals_anchor.unsqueeze(-1)
-        if len(signals_pos.shape) == 2:
-            signals_pos = signals_pos.unsqueeze(-1)
-        
-        # --- Shape Debugging Print ---
-        print(f"Shape of signals_anchor: {signals_anchor.shape}")
-        print(f"Shape of bp_cats_anchor: {bp_cats_anchor.shape}")
-        print(f"Shape of signals_pos: {signals_pos.shape}")
-        print(f"Shape of bp_cats_pos: {bp_cats_pos.shape}")
-
-        num_pairs_to_plot = 2
-
-        for i in range(num_pairs_to_plot):
-            anchor_signal = signals_anchor[i]
-            pos_signal = signals_pos[i]
-            
-            # You can add more context to the title if needed, e.g., the class
-            title = f"Pair_{i+1}_Cat_{bp_cats_anchor[i].item()}"
-            
-            plot_augmented_views(anchor_signal, pos_signal, title, root_figs_folder, ecg=args.ecg)
+    if args.mix_pretraining_subject_samples:
+        calculate_dataloaders_mean_std(
+            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+            sig2sig=args.sig2sig,
+            savepath=root_figs_folder
+            ) 
     else:
-        if args.mix_pretraining_subject_samples:
-            calculate_dataloaders_mean_std(
-                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-                sig2sig=args.sig2sig,
-                savepath=root_figs_folder
-                ) 
-        else:
-            calculate_dataloaders_mean_std(
-                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-                sig2sig=args.sig2sig,
-                savepath=root_figs_folder
-                )
+        calculate_dataloaders_mean_std(
+            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+            dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
+            sig2sig=args.sig2sig,
+            savepath=root_figs_folder
+            )
 
-        input_batch = next(iter(train_dataloader))
-        sig = input_batch[0]
-        sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
-        idx = np.random.randint(0, sig.shape[0])
+    input_batch = next(iter(train_dataloader))
+    sig = input_batch[0]
+    sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
+    idx = np.random.randint(0, sig.shape[0])
 
-        annotation = input_batch[1]
+    annotation = input_batch[1]
 
-        print(f"Input batch shape: {sig.shape}, Annotation batch shape: {annotation.shape}")
+    print(f"Input batch shape: {sig.shape}, Annotation batch shape: {annotation.shape}")
 
+    if args.sig2sig:
+        sig = sig[idx, :, :].squeeze().numpy()
+        abp = annotation[idx, :].squeeze().numpy()
+    else:
+        sbp_val = annotation[idx, 0].squeeze().numpy()
+        dbp_val = annotation[idx, 1].squeeze().numpy()
+        map_val = annotation[idx, 2].squeeze().numpy()
+
+    # Note that the train_dataloader will already return the required signals specified by the conditions
+    if args.ecg:
+        
         if args.sig2sig:
-            sig = sig[idx, :, :].squeeze().numpy()
-            abp = annotation[idx, :].squeeze().numpy()
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ECG', 'ABP'], 
+                title=f'Input: PPG + ECG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV', 'mmHg']
+            )
         else:
-            sbp_val = annotation[idx, 0].squeeze().numpy()
-            dbp_val = annotation[idx, 1].squeeze().numpy()
-            map_val = annotation[idx, 2].squeeze().numpy()
-
-        # Note that the train_dataloader will already return the required signals specified by the conditions
-        if args.ecg:
-            
-            if args.sig2sig:
-                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-                plot_signals(
-                    sigs.T, 
-                    fs=args.fs, 
-                    labels=['PPG', 'ECG', 'ABP'], 
-                    title=f'Input: PPG + ECG, Output: ABP', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.', 'mV', 'mmHg']
+            plot_signals(
+                sig[idx, :, :].T, fs=args.fs, 
+                labels=['PPG', 'ECG'], 
+                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mV']
                 )
-            else:
-                plot_signals(
-                    sig[idx, :, :].T, fs=args.fs, 
-                    labels=['PPG', 'ECG'], 
-                    title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.', 'mV']
-                    )
-                
+            
+    else:
+        
+        if args.sig2sig:
+            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+            plot_signals(
+                sigs.T, 
+                fs=args.fs, 
+                labels=['PPG', 'ABP'], 
+                title=f'Input: PPG, Output: ABP', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.', 'mmHg']
+            )
         else:
-            
-            if args.sig2sig:
-                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-                plot_signals(
-                    sigs.T, 
-                    fs=args.fs, 
-                    labels=['PPG', 'ABP'], 
-                    title=f'Input: PPG, Output: ABP', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.', 'mmHg']
+            plot_signals(
+                sig[idx, :, :].T, 
+                fs=args.fs,
+                labels=['PPG'], 
+                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                savepath=root_figs_folder, 
+                ylabels=['a.u.']
                 )
-            else:
-                plot_signals(
-                    sig[idx, :, :].T, 
-                    fs=args.fs,
-                    labels=['PPG'], 
-                    title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                    savepath=root_figs_folder, 
-                    ylabels=['a.u.']
-                    )

@@ -635,3 +635,298 @@ def plot_subject_validity_over_time(subject_id, subject_windows, window_length, 
     plt.tight_layout()
     plt.savefig(os.path.join(savepath, f'subject_{subject_id}_validity_plot.png'), dpi=1000)
     plt.close() # Close the figure to free up memory
+    
+
+def plot_consecutive_runs_subject(runs, subject_id, savepath="subject_run_lengths.png"):
+    r"""
+    Plots the distribution of run lengths (consecutive windows) for a single subject.
+
+    Parameters
+    ------------
+    runs : list of dict
+        Output from `find_consecutive_runs`, where each dict contains:
+            - "start_idx": start index in subject sample list
+            - "end_idx": end index in subject sample list
+            - "values": the consecutive values
+            - "length": length of the run
+    subject_id : int
+        The subject identifier.
+    savepath : str, optional
+        Path to save the generated figure (default="subject_run_lengths.png").
+
+    Returns
+    ------------
+    None (saves the plot to the specified savepath)
+    """
+    run_lengths = [r["length"] for r in runs]
+    run_positions = [r["start_idx"] for r in runs]
+
+    mean_len = np.mean(run_lengths)
+    min_len = np.min(run_lengths)
+    max_len = np.max(run_lengths)
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(run_positions, run_lengths, width=1.0, align="center", alpha=0.7)
+    plt.xlabel("Run start index (in subject sample list)")
+    plt.ylabel("Run length (# consecutive windows)")
+    plt.title(f"Consecutive run lengths for Subject {subject_id}")
+
+    # Display stats inside the plot
+    plt.text(0.95, 0.95,
+             f'Mean: {mean_len:.2f}\nMin: {min_len}\nMax: {max_len}',
+             verticalalignment='top', horizontalalignment='right',
+             transform=plt.gca().transAxes,
+             bbox=dict(facecolor='white', alpha=0.7))
+
+    plt.tight_layout()
+    plt.savefig(savepath)
+    plt.close()
+
+
+def plot_consecutive_runs_all(all_runs, savepath="all_subjects_run_lengths.png"):
+    r"""
+    Plots the cumulative distribution of run lengths across all subjects.
+
+    Parameters
+    ------------
+    all_runs : list of list of dict
+        A list where each element corresponds to one subject's runs (output of `find_consecutive_runs`).
+        Example: [ [run_dict, run_dict, ...],   # subject 1
+                   [run_dict, run_dict, ...],   # subject 2
+                   ... ]
+    savepath : str, optional
+        Path to save the generated figure (default="all_subjects_run_lengths.png").
+
+    Returns
+    ------------
+    None (saves the plot to the specified savepath)
+    """
+    # Flatten run lengths across subjects
+    all_lengths = [r["length"] for subj_runs in all_runs for r in subj_runs]
+
+    mean_len = np.mean(all_lengths)
+    min_len = np.min(all_lengths)
+    max_len = np.max(all_lengths)
+
+    plt.figure(figsize=(10, 6))
+    sns.histplot(all_lengths, bins=50, kde=False, edgecolor="black")
+    plt.xlabel("Run length (# consecutive windows)")
+    plt.ylabel("Count")
+    plt.title("Distribution of consecutive run lengths across all subjects")
+
+    # Display stats inside the plot
+    plt.text(0.95, 0.95,
+             f'Mean: {mean_len:.2f}\nMin: {min_len}\nMax: {max_len}',
+             verticalalignment='top', horizontalalignment='right',
+             transform=plt.gca().transAxes,
+             bbox=dict(facecolor='white', alpha=0.7))
+
+    plt.tight_layout()
+    plt.savefig(savepath)
+    plt.close()
+
+
+def plot_subject_annotation_runs(dataset, subject_id, blocks, savepath="subject_annotation_plots.jpg", show_bp_plot=False):
+    """
+    Plot annotation statistics for a subject with fixed interleaved blocks.
+
+    Parameters
+    ----------
+    dataset : OnlineSubjectDataset
+        Dataset instance (must allow __getitem__ access to annotation tensors).
+    subject_id : int
+        Subject identifier.
+    blocks : list of dict
+        Each dict contains 'train' and 'test' sample IDs
+        (from get_subject_runs_fixed_interleaved).
+    savepath : str
+        File path to save the figure.
+    show_bp_plot : bool, optional
+        If True, also plot SBP/DBP/MAP evolution. Default=False.
+    """
+    
+    # Activate subject
+    full_index_list = dataset.index_by_subject_id[subject_id]
+
+    # Helper: extract SBP/DBP/MAP
+    def get_annotations(sample_ids):
+        sbp_values, dbp_values, map_values = [], [], []
+        for sid in sample_ids:
+            _, ann, _ = dataset.__getitem__(sid)
+            if dataset.sig2sig:
+                sbp, dbp, _, _ = compute_sp_dp(ann.numpy())
+                map = (2 * dbp + sbp) / 3
+                sbp_values.append(sbp)
+                dbp_values.append(dbp)
+                map_values.append(map)
+            else:
+                sbp_values.append(float(ann[0]))
+                dbp_values.append(float(ann[1]))
+                map_values.append(float(ann[2]))
+        return sbp_values, dbp_values, map_values
+
+    # Collect block-level data
+    run_idxs_list, block_list, set_list = [], [], []
+    sbp_list, dbp_list, map_list, window_indices = [], [], [], []
+
+    for block in blocks:
+        
+        # Adaptation windows
+        train_sbp, train_dbp, train_map = get_annotations(block["train"])
+        adapt_window_indices = [full_index_list.index(sid) for sid in block["train"]]
+
+        block_list.extend([block["b_idx"]] * len(train_sbp))
+        run_idxs_list.extend([block["r_idx"]] * len(train_sbp))
+        set_list.extend(['training'] * len(train_sbp))
+        sbp_list.extend(train_sbp)
+        dbp_list.extend(train_dbp)
+        map_list.extend(train_map)
+        window_indices.extend(adapt_window_indices)
+
+        # Validation windows
+        test_sbp, test_dbp, test_map = get_annotations(block["test"])
+        val_window_indices = [full_index_list.index(sid) for sid in block["test"]]
+
+        block_list.extend([block["b_idx"]] * len(test_sbp))
+        run_idxs_list.extend([block["r_idx"]] * len(test_sbp))
+        set_list.extend(['testing'] * len(test_sbp))
+        sbp_list.extend(test_sbp)
+        dbp_list.extend(test_dbp)
+        map_list.extend(test_map)
+        window_indices.extend(val_window_indices)
+        
+    # Build DataFrame and sort chronologically
+    df = pd.DataFrame({
+        'window_index': window_indices,
+        'run_idx': run_idxs_list,
+        'block': block_list,
+        'set': set_list,
+        'sbp': sbp_list,
+        'dbp': dbp_list,
+        'map': map_list
+    }).sort_values(by='window_index').reset_index(drop=True)
+    
+    # Create the plot with three horizontal subplots
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(f'Subject {subject_id} - Annotation Statistics', fontsize=14, fontweight='bold')
+
+    # Subplot 1: Window indices vs Run/Block structure
+    ax1 = axes[0]
+    
+    # Plot points for each run with different colors
+    unique_runs = df['run_idx'].unique()
+    colors_runs = plt.cm.tab10(np.linspace(0, 1, len(unique_runs)))
+    
+    for i, run_idx in enumerate(unique_runs):
+        run_data = df[df['run_idx'] == run_idx]
+        ax1.scatter(run_data['window_index'], run_data['block'], 
+                   c=[colors_runs[i]], label=f'Run {run_idx}', alpha=0.7, s=30)
+    
+    ax1.set_ylabel('Block Number')
+    ax1.set_title('Window Index vs Block Number')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    # Subplot 2: Window indices vs Set (adaptation/validation)
+    ax2 = axes[1]
+    adaptation_data = df[df['set'] == 'training']
+    validation_data = df[df['set'] == 'testing']
+    
+    # Create categorical y-values for adaptation/validation
+    y_adaptation = np.ones(len(adaptation_data)) * 1  # adaptation = 1
+    y_validation = np.ones(len(validation_data)) * 2  # validation = 2
+    
+    ax2.scatter(adaptation_data['window_index'], y_adaptation, 
+               c='red', label='Training', alpha=0.7, s=30)
+    ax2.scatter(validation_data['window_index'], y_validation, 
+               c='blue', label='Testing', alpha=0.7, s=30)
+    
+    ax2.set_ylabel('Set Type')
+    ax2.set_yticks([1, 2])
+    ax2.set_yticklabels(['Training', 'Testing'])
+    ax2.set_title('Window Index vs Set Type')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    # Subplot 3: Window indices vs SBP/DBP/MAP
+    ax3 = axes[2]
+    ax3.plot(df['window_index'], df['sbp'], 'o-', color='red', 
+             label='SBP', alpha=0.7, markersize=4, linewidth=1)
+    ax3.plot(df['window_index'], df['dbp'], 'o-', color='blue', 
+             label='DBP', alpha=0.7, markersize=4, linewidth=1)
+    ax3.plot(df['window_index'], df['map'], 'o-', color='green', 
+             label='MAP', alpha=0.7, markersize=4, linewidth=1)
+    
+    ax3.set_ylabel('Blood Pressure (mmHg)')
+    ax3.set_xlabel('Window Index')
+    ax3.set_title('Window Index vs Blood Pressure Values')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
+    
+    # Save the figure
+    plt.savefig(savepath)
+    plt.close()
+
+
+def plot_run_length_statistics(dataset, savepath='./data_figs', keep_longest=False):
+    r"""
+    Plot statistics of run lengths across subjects.
+
+    Parameters
+    ----------
+    dataset : OnlineSubjectDataset
+        Initialized dataset object.
+    savepath : str or None
+        Path to save plots. If None, plots are only shown.
+    keep_longest : bool
+        If True, only the longest run per subject is considered.
+    """
+    run_lengths_by_subject = {}
+
+    for subj in dataset.subjects_for_personalization:
+        runs = dataset.find_consecutive_runs(dataset.index_by_subject_id[subj], dataset.input_seq_len_s)
+        lengths = [r["length"] for r in runs]
+
+        if not lengths:
+            continue
+
+        if keep_longest:
+            run_lengths_by_subject[subj] = [max(lengths)]
+        else:
+            run_lengths_by_subject[subj] = lengths
+
+    # Flatten all run lengths
+    all_lengths = [l for lengths in run_lengths_by_subject.values() for l in lengths]
+
+    # --- Summary statistics ---
+    print(f"Total subjects: {len(run_lengths_by_subject)}")
+    print(f"Total runs: {len(all_lengths)}")
+    print(f"Mean run length: {np.mean(all_lengths):.2f}")
+    print(f"Median run length: {np.median(all_lengths):.2f}")
+    print(f"Max run length: {np.max(all_lengths)}")
+    print(f"Min run length: {np.min(all_lengths)}")
+
+    # --- Histogram ---
+    plt.figure(figsize=(12, 10))
+    plt.hist(all_lengths, bins=50, color="steelblue", alpha=0.7)
+    plt.xlabel("Run length (#windows)")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of run lengths across all subjects")
+    plt.savefig(os.path.join(savepath, "run_length_histogram.png"))
+    
+    # --- Boxplot per subject ---
+    plt.figure(figsize=(20, 10))
+    plt.boxplot([run_lengths_by_subject[subj] for subj in run_lengths_by_subject],
+                showfliers=False)
+    plt.xlabel("Subjects")
+    plt.xticks(ticks=range(1, len(run_lengths_by_subject) + 1),
+           labels=list(run_lengths_by_subject.keys()),
+           rotation=90, ha='right') 
+    plt.ylabel("Run length (#windows)")
+    plt.title("Run length distribution per subject")
+    plt.savefig(os.path.join(savepath, "run_length_boxplot.png"))
+    
+    return run_lengths_by_subject

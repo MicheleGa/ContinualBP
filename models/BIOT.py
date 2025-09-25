@@ -10,14 +10,14 @@ from thop import profile, clever_format
 
 
 class PatchFrequencyEmbedding(nn.Module):
-    def __init__(self, embed_dim=256, n_freq=101):
+    def __init__(self, emb_size=256, n_freq=101):
         super().__init__()
-        self.projection = nn.Linear(n_freq, embed_dim)
+        self.projection = nn.Linear(n_freq, emb_size)
 
     def forward(self, x):
         """
         x: (batch, freq, time)
-        out: (batch, time, embed_dim)
+        out: (batch, time, emb_size)
         """
         x = x.permute(0, 2, 1)
         x = self.projection(x)
@@ -25,10 +25,11 @@ class PatchFrequencyEmbedding(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1250):
-        super().__init__()
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000):
+        super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
+        # Compute the positional encodings once in log space.
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1).float()
         div_term = torch.exp(
@@ -40,6 +41,12 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        """
+        Args:
+            x: `embeddings`, shape (batch, max_len, d_model)
+        Returns:
+            `encoder input`, shape (batch, max_len, d_model)
+        """
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
 
@@ -47,58 +54,70 @@ class PositionalEncoding(nn.Module):
 class BIOTEncoder(nn.Module):
     def __init__(
         self,
-        embed_dim=256,
+        emb_size=256,
         heads=8,
         depth=4,
         n_channels=16,
         n_fft=200,
-        hop_length=100
+        hop_length=100,
+        **kwargs
     ):
         super().__init__()
+
         self.n_fft = n_fft
         self.hop_length = hop_length
 
         self.patch_embedding = PatchFrequencyEmbedding(
-            embed_dim=embed_dim, n_freq=self.n_fft // 2 + 1
+            emb_size=emb_size, n_freq=self.n_fft // 2 + 1
         )
-        self.positional_encoding = PositionalEncoding(embed_dim)
-        self.channel_tokens = nn.Embedding(n_channels, embed_dim)
-        self.index = nn.Parameter(torch.LongTensor(range(n_channels)), requires_grad=False)
         self.transformer = LinearAttentionTransformer(
-            dim=embed_dim,
+            dim=emb_size,
             heads=heads,
             depth=depth,
-            max_seq_len=1250,
-            attn_layer_dropout=0.2,
-            attn_dropout=0.2,
+            max_seq_len=1024,
+            attn_layer_dropout=0.2,  # dropout right after self-attention layer
+            attn_dropout=0.2,  # dropout post-attention
+        )
+        self.positional_encoding = PositionalEncoding(emb_size)
+
+        # channel token, N_channels >= your actual channels
+        self.channel_tokens = nn.Embedding(n_channels, 256)
+        self.index = nn.Parameter(
+            torch.LongTensor(range(n_channels)), requires_grad=False
         )
 
     def stft(self, sample):
-        spectral = torch.stft(
-            input=sample.squeeze(1),
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            center=False,
-            onesided=True,
-            return_complex=True,
+        spectral = torch.stft( 
+            input = sample.squeeze(1),
+            n_fft = self.n_fft,
+            hop_length = self.hop_length,
+            center = False,
+            onesided = True,
+            return_complex = True,
         )
         return torch.abs(spectral)
 
     def forward(self, x, n_channel_offset=0, perturb=False):
+        """
+        x: [batch_size, channel, ts]
+        output: [batch_size, emb_size]
+        """
         emb_seq = []
         for i in range(x.shape[1]):
             channel_spec_emb = self.stft(x[:, i : i + 1, :])
             channel_spec_emb = self.patch_embedding(channel_spec_emb)
             batch_size, ts, _ = channel_spec_emb.shape
-
+            # (batch_size, ts, emb)
             channel_token_emb = (
                 self.channel_tokens(self.index[i + n_channel_offset])
                 .unsqueeze(0)
                 .unsqueeze(0)
                 .repeat(batch_size, ts, 1)
             )
+            # (batch_size, ts, emb)
             channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb)
 
+            # perturb
             if perturb:
                 ts = channel_emb.shape[1]
                 ts_new = np.random.randint(ts // 2, ts)
@@ -106,7 +125,9 @@ class BIOTEncoder(nn.Module):
                 channel_emb = channel_emb[:, selected_ts]
             emb_seq.append(channel_emb)
 
+        # (batch_size, 16 * ts, emb)
         emb = torch.cat(emb_seq, dim=1)
+        # (batch_size, emb)
         emb = self.transformer(emb).mean(dim=1)
         return emb
 
@@ -119,7 +140,7 @@ class BPWaveformDecoder(nn.Module):
             dim=input_dim,
             depth=depth,
             heads=heads,
-            max_seq_len=1250,
+            max_seq_len=1024,
             attn_layer_dropout=0.2,
             attn_dropout=0.2,
         )
@@ -228,17 +249,10 @@ class BIOT(nn.Module):
             ckpt = torch.load(pretrained_path, map_location='cpu')
             if 'encoder' in ckpt:
                 ckpt = ckpt['encoder']
-                
-            # Filter out patch embedding weights (they won’t match with new n_fft/fs)
-            filtered_ckpt = {
-                k: v for k, v in ckpt.items()
-                if not k.startswith("patch_embedding")
-                and not k.startswith("positional_encoding")
-            }
 
-            missing, unexpected = self.encoder.load_state_dict(filtered_ckpt, strict=False)
+            missing, unexpected = self.encoder.load_state_dict(ckpt, strict=False)
             print(f"Loaded pretrained encoder from {pretrained_path}")
-            print(f"Skipped loading patch embedding. Missing keys: {missing}, Unexpected: {unexpected}")
+            print(f"Missing keys: {missing}, Unexpected: {unexpected}")
             
     def forward(self, x, n_channel_offset=0):
         
@@ -294,7 +308,7 @@ def parseargs():
     parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
     parser.add_argument('--n_fft', default=256, type=int, help='fft window size for spectral embedding')
     parser.add_argument('--hop_length', default=32, type=int, help='hop length for STFT')
-    parser.add_argument('--pretrained_path', default='', type=str, help='path to pretrained encoder weights')
+    parser.add_argument('--pretrained_encoder_ckpt_path', default='', type=str, help='path to pretrained encoder weights')
     
     return parser.parse_args()
 
@@ -312,7 +326,7 @@ if __name__ == "__main__":
         num_decoder_layers=args.num_decoder_layers,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
-        pretrained_path=args.pretrained_path
+        pretrained_path=args.pretrained_encoder_ckpt_path
     )
 
     total_input_channels = model.in_channels

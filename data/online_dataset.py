@@ -3,9 +3,8 @@ import argparse
 from distutils.util import strtobool
 import pickle
 import pprint
-import numpy as np
 import random
-import sys
+import numpy as np
 import lmdb
 import torch
 from torch.utils.data import Dataset, DataLoader # Keep Dataset import for clarity and potential future base datasets
@@ -35,10 +34,10 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
         self.lmdbtxn = self.lmdbenv.begin()
 
         # Subject/Sample lists/dicts
+        # NOTE: this expects the lmdb to contain pickled objects under these keys
         self.subjects_for_personalization:list = pickle.loads(self.lmdbtxn.get("subject_list".encode()))
         self.index_by_subject_id:dict = pickle.loads(self.lmdbtxn.get("index_by_subject_id".encode()))
         self.index_by_sample_id = pickle.loads(self.lmdbtxn.get("index_by_sample_id".encode()))
-        self.subject_adjacent_samples:dict = pickle.loads(self.lmdbtxn.get("subject_adjacent_samples".encode()))
         self.check_subjects_list(min_subject_sample_number=min_subject_sample_number)
                 
         # Which input data to load (PPG or PPG + ECG), PPG is always loaded
@@ -68,146 +67,215 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
             }
         )
 
-    def check_subjects_list(self, min_subject_sample_number):
+    def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
         # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
         # with lmdbenv.begin(write=True) as txn: deos not make this check
         invalid_subjects = list()
-        for subject in self.subjects_for_personalization:
-            if len(self.index_by_subject_id[subject]) <= min_subject_sample_number:
+        # Fix: use the correct attribute self.subjects_for_personalization
+        for subject in list(self.subjects_for_personalization):
+            if subject not in self.index_by_subject_id or len(self.index_by_subject_id.get(subject, [])) <= min_subject_sample_number:
                 invalid_subjects.append(subject)
         
         if len(invalid_subjects) > 0:
             print("Invalid subjects found in the dataset, removing them ...")
             for subject in invalid_subjects:
-                self.subjects_for_personalization.remove(subject)
-                del self.index_by_subject_id[subject]
-                del self.subject_adjacent_samples[subject]
+                if subject in self.subjects_for_personalization:
+                    self.subjects_for_personalization.remove(subject)
+                if subject in self.index_by_subject_id:
+                    del self.index_by_subject_id[subject]
 
-    def before_pickle(self):
-        self.lmdbenv = None
-        self.lmdbtxn = None
+        # Shorten each subject list to min_subject_sample_number
+        if min_subject_sample_number > 0:
+            for subject in list(self.subjects_for_personalization):
+                if len(self.index_by_subject_id.get(subject, [])) > min_subject_sample_number:
+                    self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
 
     def __len__(self):
         """Returns the total number of samples across all subjects available in the dataset."""
         return len(self.index_by_sample_id)
 
     def __getitem__(self, index):
-        sample = dict()
+        
+        # ---------------------------------------------------------
+        # === Load raw input signals (PPG/ECG) ===
+        # ---------------------------------------------------------
+        ppg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32"))
+        ecg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32"))
 
-        # Input data        
+        # ---------------------------------------------------------
+        # === Load annotations ===
+        #   - Full ABP waveform
+        #   - SBP, DBP, MAP values
+        # ---------------------------------------------------------
+        abp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
+        sbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
+        dbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
+        map = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
+        
+        # ---------------------------------------------------------
+        # === Load timestamps ===
+        # ---------------------------------------------------------
+        timestamp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-timestamp".encode()), dtype="float32"))
+        
         if self.ecg:
-            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
-            sample['ecg'] = np.frombuffer(self.lmdbtxn.get("{}-ecg".format(index).encode()), dtype="float32")
-            
-            sample['sig'] = np.concatenate(
-                (
-                    np.expand_dims(sample['ppg'], axis=-1), 
-                    np.expand_dims(sample['ecg'], axis=-1)
-                ), 
-                axis=-1)
+            # Shape: [time, 2]  (PPG, ECG)
+            sig = np.stack((ppg, ecg), axis=-1)
         else:
-            sample['ppg'] = np.frombuffer(self.lmdbtxn.get("{}-ppg".format(index).encode()), dtype="float32")
+            # Shape: [time, 1]  (PPG)
+            sig = ppg
+
+        # Make arrays writable
+        sig = np.require(sig, requirements=['O', 'W'])
+        sig.setflags(write=1)
+        
+        # Cast to torch tensor
+        signals = torch.tensor(sig)
             
-            sample['sig'] = sample['ppg']
-            
-        # Annotation
         if self.sig2sig:
-            sample['abp'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
-            
-            # Ensure arrays are writeable
-            for k in sample:
-                sample[k] = np.require(sample[k], requirements=['O', 'W'])
-                sample[k].setflags(write=1)
+            # Make arrays writable
+            abp = np.require(abp, requirements=['O', 'W'])
+            abp.setflags(write=1)
             
             # Cast to torch tensor
-            signals = torch.tensor(sample['sig'])
-            abp = torch.tensor(sample['abp'])
-            
-            return signals, abp
-        
+            annotation = torch.tensor(abp)
         else:
-            # Regression mode: return SBP/DBP/MAP
-            sample['sbp'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
-            sample['dbp'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
-            sample['map'] = np.squeeze(np.frombuffer(
-                self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
+            # Make arrays writable
+            sbp = np.require(sbp, requirements=['O', 'W'])
+            sbp.setflags(write=1)
+            dbp = np.require(dbp, requirements=['O', 'W'])
+            dbp.setflags(write=1)
+            map = np.require(map, requirements=['O', 'W'])
+            map.setflags(write=1)
             
-            for k in sample:
-                sample[k] = np.require(sample[k], requirements=['O', 'W'])
-                sample[k].setflags(write=1)
-            
-            signals = torch.tensor(sample['sig'])
-            sbp_val = torch.tensor(sample['sbp'])
-            dbp_val = torch.tensor(sample['dbp'])
-            map_val = torch.tensor(sample['map'])
-            
-            return signals, torch.stack([sbp_val, dbp_val, map_val], dim=-1)
+            # Cast to torch tensor
+            annotation = torch.stack([
+                torch.tensor(sbp), 
+                torch.tensor(dbp), 
+                torch.tensor(map)
+            ], dim=-1)
+
+        return signals, annotation, timestamp
         
 
 class OnlineSubjectDataset(OnlineDatasetBase):
     def __init__(self, min_run_length, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Build mapping between "internal index" and "real subject_id"
-        self.active_subject = None
-        self.active_subject_samples = []
-        self.sample_pointer = 0
-        
-        self.min_run_length = min_run_length
-        
-        self.filter_subjects_by_min_run_length(self.min_run_length)
+        self.min_run_length = min_run_length        
+        self.filter_subjects_by_min_run_length(self.min_run_length, kwargs['input_seq_len_s'])
 
-    def set_active_subject(self, subject_id):
-        
-        self.active_subject = subject_id
-        self.active_subject_samples = self.subject_adjacent_samples[subject_id]
-        
-        self.sample_pointer = 0
-
-    def __len__(self):
-        if self.active_subject is None:
-            return 0
-        return len(self.active_subject_samples)
-
-    def find_consecutive_runs(self, sample_list):
+    def find_consecutive_runs(self, sample_list, window_length):
         """
-        Find runs of consecutive values in a list of sample indices.
+        Find runs of chronologically consecutive windows for a list of sample ids.
+
+        The function will:
+          - fetch timestamps for each sample id from the LMDB
+          - sort windows by their start timestamp
+          - compute time gaps between consecutive window starts
+          - group windows into runs when the gap <= threshold
+
+        Returns a list of dictionaries, each with the following keys:
+          - start_idx: start index in the SORTED list
+          - end_idx: end index in the SORTED list
+          - length: number of windows in the run
+          - start_time: float (start time of run)
+          - end_time: float (end time of run)
+          - sample_ids: list of sample ids (ordered chronologically) in the run
         """
-        if not sample_list:
+        if sample_list is None:
             return []
 
+        # Ensure a list copy
+        samples = list(sample_list)
+        n = len(samples)
+        if n == 0:
+            return []
+
+        starts = np.zeros(n, dtype=float)
+        ends = np.zeros(n, dtype=float)
+        valid_samples = []
+        
+        # Read timestamps for each sample. Keep those with valid timestamps.
+        for i, sid in enumerate(samples):
+            key = f"{sid}-timestamp".encode()
+            raw = self.lmdbtxn.get(key)
+            if raw is None:
+                # Skip samples without timestamps
+                raise ValueError("Found a sample without timestamp. Exiting ...")
+            ts = np.squeeze(np.frombuffer(raw, dtype="float32"))
+            if ts.size == 0:
+                # Skip samples with empty timestamps
+                raise ValueError("Found a sample with an empty timestamp. Exiting ...")
+            
+            valid_samples.append((sid, float(ts[0]), float(ts[-1])))
+        
+        if len(valid_samples) == 0:
+            return []
+
+        # Unpack and sort by start time
+        sample_ids = [x[0] for x in valid_samples]
+        starts = np.array([x[1] for x in valid_samples], dtype=float)
+        ends = np.array([x[2] for x in valid_samples], dtype=float)
+
+        order = np.argsort(starts)
+        sorted_ids = [sample_ids[i] for i in order]
+        sorted_starts = starts[order]
+        sorted_ends = ends[order]
+        
+        # Compute diffs between consecutive START times
+        if len(sorted_starts) <= 1:
+            # Single window -> a single run
+            return [{
+                "start_idx": 0,
+                "end_idx": 0,
+                "length": 1,
+                "start_time": float(sorted_starts[0]),
+                "end_time": float(sorted_ends[0]),
+                "sample_ids": [sorted_ids[0]]
+            }]
+
+        diffs = np.diff(sorted_starts)
+        # Consider only strictly positive diffs for median (just in case of duplicated timestamps)
+        
+        # Estimate a reasonable threshold to decide when a gap separates runs:
+        # the gap exists between two consecutive windows if diff is greater then the window length plus a small delta (0.5)
+        # if the end of a window and the ebginning of the next one is more then half-a second delta, then there is a gap 
+        threshold = float(window_length) + 0.5
+
+        # Group into runs: whenever gap > threshold we cut the run
         runs = []
-        start_idx = 0
-
-        for i in range(1, len(sample_list)):
-            if sample_list[i] != sample_list[i - 1] + 1:
-                run_values = sample_list[start_idx:i]
+        run_start = 0
+        for i, gap in enumerate(diffs):
+            if gap > threshold:
+                run_end = i
                 runs.append({
-                    "start_idx": start_idx,
-                    "end_idx": i - 1,
-                    "values": run_values,
-                    "length": len(run_values)
+                    "start_idx": run_start,
+                    "end_idx": run_end,
+                    "length": run_end - run_start + 1,
+                    "start_time": float(sorted_starts[run_start]),
+                    "end_time": float(sorted_ends[run_end]),
+                    "sample_ids": sorted_ids[run_start:run_end+1]
                 })
-                start_idx = i
+                run_start = i + 1
 
-        run_values = sample_list[start_idx:]
-        runs.append({
-            "start_idx": start_idx,
-            "end_idx": len(sample_list) - 1,
-            "values": run_values,
-            "length": len(run_values)
-        })
+        # Add last run
+        if run_start <= len(sorted_ids) - 1:
+            runs.append({
+                "start_idx": run_start,
+                "end_idx": len(sorted_ids) - 1,
+                "length": len(sorted_ids) - run_start,
+                "start_time": float(sorted_starts[run_start]),
+                "end_time": float(sorted_ends[-1]),
+                "sample_ids": sorted_ids[run_start:]
+            })
 
         return runs
 
-    def filter_subjects_by_min_run_length(self, min_run_length: int):
+    def filter_subjects_by_min_run_length(self, min_run_length, window_length):
         """
         Filter subjects so that only runs of length >= min_run_length are kept.
-        Subjects without any valid runs are removed entirely.
+        Subjects with fewer than 2 runs meeting the minimum length are removed entirely.
 
         Updates:
             - self.subject_adjacent_samples
@@ -222,36 +290,42 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         subjects_to_remove = []
 
         for subj in list(self.subjects_for_personalization):
-            sample_list = self.subject_adjacent_samples[subj]
-            index_list = self.index_by_subject_id[subj]
+            # Get all samples of a subject
+            index_list = list(self.index_by_subject_id[subj])
+            if len(index_list) <= min_run_length:
+                subjects_to_remove.append(subj)
+                continue
 
-            runs = self.find_consecutive_runs(sample_list)
+            # Find consecutive runs and their lengths (runs contain actual sample ids)
+            runs = self.find_consecutive_runs(index_list, window_length)
 
-            # Collect indices of valid runs
-            keep_positions = []
+            # Collect sample ids of runs that satisfy the length constraint
+            keep_samples = []
+            valid_runs = []
             for r in runs:
                 if r["length"] >= min_run_length:
-                    keep_positions.extend(range(r["start_idx"], r["end_idx"] + 1))
+                    keep_samples.extend(r["sample_ids"])
+                    valid_runs.append(r)
 
-            if keep_positions:
-                # Keep only valid samples for this subject
-                self.subject_adjacent_samples[subj] = [sample_list[i] for i in keep_positions]
-                self.index_by_subject_id[subj] = [index_list[i] for i in keep_positions]
+            # Require at least two valid runs to keep the subject
+            if len(valid_runs) >= 2:
+                # Update the index_by_subject_id mapping to only contain the kept (chronological) samples
+                self.index_by_subject_id[subj] = keep_samples
             else:
-                # Mark subject for removal
                 subjects_to_remove.append(subj)
 
-        # Remove subjects with no valid runs
+        # Remove subjects with insufficient valid runs
         for subj in subjects_to_remove:
-            del self.subject_adjacent_samples[subj]
-            del self.index_by_subject_id[subj]
-            self.subjects_for_personalization.remove(subj)
+            if subj in self.index_by_subject_id:
+                del self.index_by_subject_id[subj]
+            if subj in self.subjects_for_personalization:
+                self.subjects_for_personalization.remove(subj)
 
         print(f"Filtered dataset: {len(self.subjects_for_personalization)} subjects remain "
-            f"(removed {len(subjects_to_remove)} subjects with no runs ≥ {min_run_length})")
+            f"(removed {len(subjects_to_remove)} subjects with fewer than 2 runs ≥ {min_run_length})")
 
 
-    def get_subject_runs(self, subject_id: int, adapt_size: int = 32, val_size: int = 32, min_block_length: int = 200):
+    def get_subject_runs(self, subject_id, window_length, adapt_size: int = 32, val_size: int = 32, min_block_length: int = 128):
         r"""
         Build subject runs using fixed interleaved adaptation/validation windows.
 
@@ -274,18 +348,19 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             - "test": list of sample IDs for validation
             - "all": list of all sample IDs in the block (train + test)
         """
-        sample_list = self.subject_adjacent_samples[subject_id]
-        index_list = self.index_by_subject_id[subject_id]
+        # Get samples of a subject
+        index_list = list(self.index_by_subject_id[subject_id])
 
-        runs = self.find_consecutive_runs(sample_list)
+        # Collect valid run indices
+        runs = self.find_consecutive_runs(index_list, window_length)
         subject_runs = []
 
         for r_idx, r in enumerate(runs):
-            run_positions = range(r["start_idx"], r["end_idx"] + 1)
-            run_samples = [index_list[i] for i in run_positions]
+            # r['sample_ids'] is already chronologically ordered
+            run_samples = r['sample_ids']
             run_len = len(run_samples)
 
-            # Skip runs shorter than required minimum
+            # Skip runs shorter than required minimum (should not happen as get_subject_runs should be called after the initial filtering of subjects)
             if run_len < min_block_length:
                 raise ValueError(f"Run length {run_len} is shorter than minimum required {min_block_length}")
 
@@ -318,9 +393,8 @@ def parseargs():
     parser.add_argument('--save_path', default='./data_figs', type=str, help='where to save graphs from dataset analysis')
     parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
-    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
-    parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
-    parser.add_argument('--min_run_length', default=0, type=int, help='minimum number of samples per subject to consider it valid for doing online learning, 0 means no limit')
+    parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds')
+    parser.add_argument('--min_run_length', default=128, type=int, help='minimum number of samples per subject to consider it valid for doing online learning, 0 means no limit')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
@@ -351,22 +425,22 @@ if __name__ == "__main__":
         savepath=root_figs_folder
     )
     
-    # Sucjet id
-    subject_id = 570 # alternatively also 2100 has enough windows
+    # Sucjet id notixe that subjects with insufficient runs have been removed
+    subject_id = random.choice(list(online_physio_dataset.index_by_subject_id))
     print(f"Subject selected {subject_id}")
-    online_physio_dataset.set_active_subject(subject_id)
     
     # Compute runs first
     all_runs = []
     for subj in online_physio_dataset.subjects_for_personalization:
-        runs = online_physio_dataset.find_consecutive_runs(online_physio_dataset.subject_adjacent_samples[subj])
+        index_list = list(online_physio_dataset.index_by_subject_id[subj])
+        runs = online_physio_dataset.find_consecutive_runs(index_list, args.input_seq_len_s)
         all_runs.append(runs)
 
     # Plot distribution across all subjects
     plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if args.min_run_length == 0 else f'all_subjects_run_lengths_{args.min_run_length}.jpg'))
 
     # Plot the Annotation statistics for the runs
-    runs = online_physio_dataset.get_subject_runs(subject_id, adapt_size=args.batch_size, val_size=args.batch_size, min_block_length=args.min_run_length)
+    runs = online_physio_dataset.get_subject_runs(subject_id, window_length=args.input_seq_len_s, adapt_size=args.batch_size, val_size=args.batch_size, min_block_length=args.min_run_length)
     
     plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"), show_bp_plot=args.plot)
     

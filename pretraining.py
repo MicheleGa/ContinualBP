@@ -6,14 +6,14 @@ for folder in folders_to_add:
 import pprint
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from models.trainer import pre_training, maml_meta_training
+from models.pretrainer import pre_training, maml_meta_training
 from training_utils.helpers import fixseed, generate_runname, parseargs
 
 
 if __name__ == "__main__":
     args = parseargs()
 
-    ## Setup configuration
+    # Setup configuration
     # Load the model class dynamically
     imported_module = __import__(args.model)
     model_name = args.model.split(sep='.')[-1]
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     # Logging to TensorBoard Summary Writer
     writer = SummaryWriter(log_dir=tensorboard_path)
 
-    # Contrastive + Supervised Pre-training Stage for Initialization
+    # Supervised Pre-training Stage for Initialization
     pre_training(args.expname, checkpoint_path, writer, model_name, config, device)
     
     # Pre-training with MAML

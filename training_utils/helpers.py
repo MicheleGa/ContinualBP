@@ -34,26 +34,11 @@ def parseargs():
     parser.add_argument('--enable_amp', default='False', type=lambda x: bool(strtobool(x)), help='enable automatic mixed precision')
     
     # Optimization Setup
-    parser.add_argument('--smoothl1loss_beta', default=5, type=int, help='beta for SmoothL1Loss')
-    parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
-    parser.add_argument('--l2norm', default=0.0001, type=float, help='L2 regularization')
-    parser.add_argument('--sgd_momentum', default=0.9, type=float, help='Momentum for SGD optimizer')
-    parser.add_argument('--lrsched_step', default="5, 10, 15, 20, 40", type=str, help='learning rate scheduler steps')
-    parser.add_argument('--lrsched_gamma', default=0.5, type=float, help='learning rate scheduler gamma')
-    parser.add_argument('--optimizer_type', default="AdamW", type=str, help='optimizer type')
-    parser.add_argument('--lr_scheduler_type', default="MultiStepLR", type=str, help='learning rate scheduler type')
-    parser.add_argument('--lr_scheduler_enable', default='False', type=lambda x: bool(strtobool(x)), help='enable learning rate scheduler')
-    parser.add_argument('--lr_scheduler_min_lr', default=0.0001, type=float, help='enable learning rate scheduler')
-    parser.add_argument('--lr_scheduler_warmup', default=0, type=int, help='enable learning rate scheduler')
-    
-    # Loss function Setup (supervised and self-supervised)
     parser.add_argument('--criterion', default="MSELoss", type=str, help='loss criterion')
-    parser.add_argument('--lambda_supervised', default=0., type=float, help='scale supervised loss function contribution, set 0. to prevent its application')
-    parser.add_argument('--lambda_ortho', default=0., type=float, help='induce feature orthogonality during pretraining, set 0. to prevent its application')
-    parser.add_argument('--lambda_contrastive', default=0., type=float, help='induce contrastive loss contribution to the final loss during pretraining, set 0. to prevent its application')
-    parser.add_argument('--temperature', default=0., type=float, help='temperature scalar for SimCLR loss')
-    parser.add_argument('--lambda_msr', default=0., type=float, help='induce masked signal loss contribution to the final loss during pretraining, set 0. to prevent its application')
-    parser.add_argument('--lambda_cwg', default=0., type=float, help='induce prev/next signal reconstruction loss contribution to the final loss during pretraining, set 0. to prevent its application')
+    parser.add_argument('--smoothl1loss_beta', default=5, type=int, help='beta for SmoothL1Loss')
+    parser.add_argument('--sgd_momentum', default=0.9, type=float, help='Momentum for SGD optimizer')
+    parser.add_argument('--weight_decay', default=1e-4, type=float, help='weight decay for optimizer')
+    parser.add_argument('--grad_clip', default=10.0, type=float, help='gradient clipping')
     
     # Dataset Setup
     parser.add_argument('--dataset_folder', default='./data/lmdb', type=str, help='path to dataset fodler')
@@ -71,9 +56,8 @@ def parseargs():
     parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
     
     # Personalization Setup
-    parser.add_argument('--use_ratio', default='False', type=lambda x: bool(strtobool(x)), help='whether to split personalization batches into training/testing after a ratio or to take a fixed number of samples')
-    parser.add_argument('--training_samples', default=8, type=int, help='number of samples to take for personalization')
-    parser.add_argument('--training_ratio', default=0.5, type=float, help='number of samples to take for personalization as ratio')
+    parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
+    parser.add_argument('--pretraining_feats_stats', default=None, type=str, help='path to the features statistics during pretraining')
     parser.add_argument('--min_run_length', default=10, type=float, help='number of samples to take for trainng and testing personalization must be greater than training_samples')
     parser.add_argument('--num_personalization_subjects', default=100, type=int, help='number of subjects to for personalization')
     parser.add_argument('--personalization_steps', default=5, type=int, help='number of gradient steps for personalization')
@@ -83,20 +67,11 @@ def parseargs():
     parser.add_argument('--setup_type', default='drift', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
 
     # Pre-training Setup
-    parser.add_argument('--pretrained_path', default=None, type=str)
+    parser.add_argument('--pretrained_encoder_ckpt_path', default=None, type=str, help='optional checkpoint path for the encoder')
     parser.add_argument('--stage1_epochs', default=10, type=int, help='epochs training head only')
     parser.add_argument('--stage1_freeze_epochs', default=30, type=int, help='epochs training head only')
-    parser.add_argument('--stage2_epochs', default=50, type=int, help='epochs for full/unfrozen fine-tuning')
-    parser.add_argument('--warmup_epochs_stage1', default=3, type=int, help='warmup epochs for stage1')
     parser.add_argument('--stage1_pre_train_lr', default=1e-3, type=float, help='ssl learning rate for pre-training stage 1')
     parser.add_argument('--stage1_pre_train_scheduler_eta_min', default=1e-5, type=float, help='min learning rate for stage 1 pre-training stage 1')
-    parser.add_argument('--stage2_pre_train_lr', default=1e-3, type=float, help='learning rate for pre-training stage 2')
-    parser.add_argument('--stage2_pre_train_scheduler_eta_min', default=1e-5, type=float, help='min learning rate for stage 2 pre-training stage 1')
-    parser.add_argument('--backbone_lr_multiplier', default=0.05, type=float, help='multiplier for backbone lr')
-    parser.add_argument('--weight_decay', default=1e-4, type=float, help='weight decay for optimizer')
-    parser.add_argument('--grad_clip', default=10.0, type=float, help='gradient clipping')
-    parser.add_argument('--freeze_backbone_first', default=True, type=lambda x: bool(strtobool(x)), help='if True start with backbone frozen')
-    parser.add_argument('--unfreeze_last_k_layers', default=0, type=int, help='if >0, only unfreeze last k transformer blocks in stage2')
     
     # Meta-learning Setup
     parser.add_argument('--max_meta_epochs', default=150, type=int, help='maximum number of meta epochs')
@@ -104,8 +79,6 @@ def parseargs():
     parser.add_argument('--k_query', type=int, default=10, help='number of query samples in meta-learning')
     parser.add_argument('--meta_batch_size', type=int, default=8, help='meta batch size')
     parser.add_argument('--use_pure_functional', default=False, type=lambda x: bool(strtobool(x)), help='use pure functional for MAML (True for memory efficiency)')
-    parser.add_argument('--second_order_maml', default=False, type=lambda x: bool(strtobool(x)), help='use second-order derivative for MAML')
-    parser.add_argument('--derivative_order_anneal_epoch', default=10, type=int, help='number of epochs after which to switch from first to second order')   
     parser.add_argument('--msl_anneal_epochs', default=20, type=int, help='how many epochs until full MSL anneal (later inner steps get more weight)')   
     parser.add_argument('--msl_include_pre', default=False, type=lambda x: bool(strtobool(x)), help='whether to include the pre-adaptation (step-0) query loss into the meta-loss')
     parser.add_argument('--msl_pre_base_weight', default=0.5, type=float, help='base weight for pre-adaptation loss if included')
@@ -131,7 +104,7 @@ def parseargs():
     parser.add_argument('--inner_lr_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner learning rate schedule type (simplified for ANIL)')
     parser.add_argument('--inner_head_lr_mult', default=1.0, type=float, help='learning rate multiplier for head parameters in inner loop')
     parser.add_argument('--inner_backbone_lr_mult', default=0.1, type=float, help='learning rate multiplier for backbone parameters')
-    parser.add_argument('--inner_steps', default=4, type=int, help='number of inner steps for meta-learning (increased for ANIL)')
+    parser.add_argument('--inner_steps', default=5, type=int, help='number of inner steps for meta-learning (increased for ANIL)')
     parser.add_argument('--inner_steps_max', default=8, type=int, help='maximum inner steps for cosine schedule')
     parser.add_argument('--inner_steps_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner steps schedule type (simplified for ANIL)')
     
@@ -149,8 +122,8 @@ def parseargs():
     parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
     parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of trasnformer layers')
     parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
-    parser.add_argument('--n_fft', default=256, type=int, help='STFT n_fft parameter')
-    parser.add_argument('--hop_length', default=32, type=int, help='STFT hop length parameter')
+    parser.add_argument('--n_fft', default=200, type=int, help='STFT n_fft parameter')
+    parser.add_argument('--hop_length', default=100, type=int, help='STFT hop length parameter')
         
     args = parser.parse_args()
     return args
@@ -352,7 +325,7 @@ def get_encoder_architecture(config):
             num_decoder_layers=config['num_decoder_layers'],
             n_fft=config['n_fft'],
             hop_length=config['hop_length'],
-            pretrained_path=config['pretrained_path'],
+            pretrained_path=config['pretrained_encoder_ckpt_path'],
         )
     else:
         raise ValueError("Invalid model name ...")
@@ -505,7 +478,7 @@ def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
     mode = config.get('inner_adapt')   
     opt_type = config.get('inner_opt').lower()  
     head_mult = float(config.get('inner_head_lr_mult'))
-    weight_decay = float(config.get('weight_decay'))
+    bb_mult   = float(config.get('inner_backbone_lr_mult'))
     
     # Decide which params to adapt
     backbone_params = [p for p in adapted_model.parameters()
@@ -521,7 +494,6 @@ def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
             {'params': head_params, 'lr': base_lr * head_mult},
         ]
     elif mode == 'all':    
-        bb_mult   = float(config.get('inner_backbone_lr_mult'))
         # train both
         for p in backbone_params:
             p.requires_grad = True
@@ -536,10 +508,10 @@ def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
 
     # Build optimizer
     if opt_type == 'adam':
-        inner_opt = torch.optim.Adam(params, lr=base_lr, weight_decay=weight_decay)
+        inner_opt = torch.optim.Adam(params, lr=base_lr)
     elif opt_type == 'sgd':
         momentum = float(config.get('sgd_momentum'))
-        inner_opt = torch.optim.SGD(params, lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+        inner_opt = torch.optim.SGD(params, lr=base_lr, momentum=momentum)
     else:
         raise ValueError("config['inner_opt'] must be 'adam' or 'sgd'")
 
@@ -560,21 +532,10 @@ def linear_warmup(current_epoch, warmup_epochs, base_lr):
         return base_lr
     return base_lr * (0.1 + 0.9 * (current_epoch / warmup_epochs))
 
-
-def set_requires_grad_safe(module, req, original_trainable, name_prefix=""):
-    """Toggle requires_grad but respect original_trainable mask when unfreezing."""
-    for n, p in module.named_parameters():
-        full_name = f"{name_prefix}.{n}" if name_prefix else n
-        if not req:  # freezing
-            p.requires_grad = False
-        else:        # unfreezing
-            if original_trainable.get(full_name, True):
-                p.requires_grad = True
-                
                 
 def supcon_loss(features, config, labels=None, mask=None):
     """
-    Improved Supervised Contrastive Loss / SimCLR Loss
+    Supervised Contrastive Loss / SimCLR Loss
     """
     device = features.device
     
@@ -657,7 +618,6 @@ def supcon_loss(features, config, labels=None, mask=None):
     return loss, cos_sim, pos_mask
 
 
-# ---------- Helpers for MSL and derivative annealing in MAML ----------
 def get_msl_weights(epoch, config, num_inner_steps, include_pre=False):
     """
     Returns a list of weights (length num_inner_steps [+1 if include_pre]),
@@ -682,17 +642,6 @@ def get_msl_weights(epoch, config, num_inner_steps, include_pre=False):
     total = sum(raw)
     weights = [r / total for r in raw]
     return weights
-
-
-def should_use_second_order(epoch, config):
-    """
-    Decide whether to use second-order gradients this epoch.
-    If 'derivative_order_anneal_epoch' not set, fallback to config['second_order_maml'].
-    """
-    da_epoch = config.get('derivative_order_anneal_epoch')
-    if da_epoch is None:
-        return bool(config.get('second_order_maml'))
-    return epoch >= int(da_epoch)
 
 
 def compute_embedding_stats(encoder, dataloader, device):
