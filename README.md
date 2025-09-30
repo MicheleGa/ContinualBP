@@ -172,7 +172,6 @@ conda activate ps_dnn
 conda install numpy matplotlib scikit-learn seaborn pandas markdown tensorboard
 conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
 pip install netron thop torchinfo pyCompare lmdb pyampd wfdb==4.0.0 linear_attention_transformer
-MAX_JOBS=4 pip install flash-attn --no-build-isolation
 conda install -c conda-forge emd-signal
 conda install -c conda-forge pywavelets
 conda install lightning -c conda-forge

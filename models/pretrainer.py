@@ -13,7 +13,7 @@ from data.dataset import PhysioDataset
 from data.meta_dataloaders import build_meta_splits_and_loaders
 from models.MAMLLearner import MAMLLearner
 from training_utils.helpers import (
-    save_status, load_status, 
+    save_status, load_status, count_parameters, LSLRStepSize,
     get_encoder_architecture, get_prediction_head_architecture, 
     get_meta_lr, get_inner_lr, get_inner_steps, build_inner_optimizer, 
     get_msl_weights, compute_embedding_stats
@@ -56,7 +56,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     prediction_head = prediction_head.to(device)
     print(f"[Pretraining][Stage 1] Prediction head weights initialized ✅")
     
-    # ====== Pretraining config ======
+    # Pretraining config
     stage1_epochs = config.get('stage1_epochs')
     stage1_pre_train_lr = config.get('stage1_pre_train_lr')
     stage1_pre_train_scheduler_eta_min = config.get('stage1_pre_train_scheduler_eta_min')
@@ -71,30 +71,41 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     for param in prediction_head.parameters():
         if (param.is_floating_point() or param.is_complex()):
             param.requires_grad = True
-        
-    # Pass only head parameters
-    optimizer_stage1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, chain(encoder.parameters(), prediction_head.parameters())), lr=stage1_pre_train_lr, weight_decay=weight_decay)
+    
+    # Count trainable params
+    encoder_trainable, encoder_non_trainable = count_parameters(encoder)
+    head_trainable, head_non_trainable = count_parameters(prediction_head)
+    total_trainable = encoder_trainable + head_trainable 
+    total_non_trainable = encoder_non_trainable + head_non_trainable
+
+    print(f"[Pretraining][Stage 1] Parameter count:")
+    print(f"\t- Encoder: {encoder_trainable:,} trainable, {encoder_non_trainable:,} non-trainable")
+    print(f"\t- Prediction head: {head_trainable:,} trainable, {head_non_trainable:,} non-trainable")
+    print(f"\t- Total: {total_trainable:,} trainable, {total_non_trainable:,} non-trainable")
+    
+    # Collect trainable params
+    trainable_params = list(filter(lambda p: p.requires_grad, chain(encoder.parameters(), prediction_head.parameters())))
+    optimizer_stage1 = torch.optim.AdamW(trainable_params, lr=stage1_pre_train_lr, weight_decay=weight_decay)
     scheduler_stage1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_stage1, T_max=stage1_epochs, eta_min=stage1_pre_train_scheduler_eta_min)
 
     print(f"[Pretraining][Stage 1] Run configuration")
     print(f"\t- Update: encoder and prediction head")
     print(f"\t- Epochs: {stage1_epochs}")
-    print(f"\t- Base LR: {stage1_pre_train_lr}")
-    print(f"\t- Min LR: {stage1_pre_train_scheduler_eta_min}")
-    print(f"\t- Scheduler: CosineAnnealingLR")
+    print(f"\t- Scheduler: CosineAnnealingLR - base LR {stage1_pre_train_lr} / min LR {stage1_pre_train_scheduler_eta_min}")
     
+    # ==== Train/Val ====
     best_val = best_val = float("+inf")    
     train_losses = AverageMeter(name='pre_train_stage1/train_loss')
     val_losses = AverageMeter(name='pre_train_stage1/val_loss')
     for epoch in range(stage1_epochs):
         
-        encoder.train(); prediction_head.train()
+        # Training
         train_losses.reset()
+        encoder.train(); prediction_head.train()
         for batch_idx, batch in enumerate(pre_train_dataloader):
-            
             signals, targets = batch
             signals, targets = signals.to(device), targets.to(device)
-
+            
             # Zero gradients
             optimizer_stage1.zero_grad()
 
@@ -111,17 +122,19 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             # Optimizer step
             optimizer_stage1.step()
             
+            # Logg batch loss
             train_losses.update(loss.item(), signals.size(0))
             writer.add_scalar('pre_train_stage1/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
         
         # Step scheduler once per epoch
         scheduler_stage1.step()
         
+        # Log epoch loss
         writer.add_scalar('pre_train_stage1/train_loss_epoch', train_losses.avg, epoch)
         
         # Validation
-        encoder.eval(); prediction_head.eval()
         val_losses.reset()
+        encoder.eval(); prediction_head.eval()
         with torch.no_grad():
             for batch_idx, batch in enumerate(pre_valid_dataloader):
                 signals, targets = batch
@@ -135,19 +148,6 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
         writer.add_scalar('pre_train_stage1/val_loss_epoch', val_losses.avg, epoch)
         print(f"[Pretraining][Stage 1] Epoch {epoch+1}/{stage1_epochs} - Train {train_losses.avg:.5f} Val {val_losses.avg:.5f}")
-        
-        if (epoch + 1) in {5, 10, 15}: 
-            print(f"[Pretraining][Stage 1] Saving checkpoint at {epoch}")
-            save_status(
-                subject_id=None, epoch=epoch, model_name=model_name + f"_encoder_epoch_{epoch}", 
-                save_name=save_name, model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
-                meter=val_losses, checkpoint_path=checkpoint_path, config=config
-            )
-            save_status(
-                subject_id=None, epoch=epoch, model_name=model_name + f"_prediction_head_{epoch}", 
-                save_name=save_name, model=prediction_head, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
-                meter=val_losses, checkpoint_path=checkpoint_path, config=config
-            )
             
         if val_losses.avg < best_val:
             print(f"[Pretraining][Stage 1] New best validation loss ✅: {val_losses.avg:.5f}")
@@ -164,24 +164,12 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             
             best_val = val_losses.avg
     
-    print("[Pretraining][Stage 1] Saving checkpoint at the end of training")
-    save_status(
-        subject_id=None, epoch=epoch, model_name=model_name + "_encoder_epoch_final", 
-        save_name=save_name, model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
-        meter=val_losses, checkpoint_path=checkpoint_path, config=config
-    )
-    save_status(
-        subject_id=None, epoch=epoch, model_name=model_name + "_prediction_head_final", 
-        save_name=save_name, model=prediction_head, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
-        meter=val_losses, checkpoint_path=checkpoint_path, config=config
-    )
-    
     print(f"[Pretraining][Stage 1] Supervised stage training completed ✅")
     print(f"\t- Best val loss {best_val}")
     print(f"[Pretraining][Stage 1] Supervised stage testing ...")
         
-    # ====== Final test ======
-    # Load best model
+    # ==== Test ====
+    # Load best encoder
     encoder = get_encoder_architecture(config)
     load_status(
         subject_id=None, model_name=model_name + "_encoder", save_name=save_name, 
@@ -206,7 +194,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     signals, _ = example_input_batch
     signals = signals.to(device)
 
-    # Define full model (encoder + prediction_head)
+    # Define full model (encoder + prediction_head) -> important tolog a single graph to tensorboard
     class FullModel(torch.nn.Module):
         def __init__(self, encoder, prediction_head):
             super().__init__()
@@ -297,9 +285,9 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
 def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, device):
     
-    print(f"[Pretraining][MAML] === MAML start ====")
+    print(f"[Pretraining][MAML] ==== MAML start ====")
     
-    # Load best model
+    # Load best encoder
     encoder = get_encoder_architecture(config)
     load_status(
         subject_id=None, model_name=model_name + "_encoder", save_name=save_name, 
@@ -322,12 +310,12 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     # Create enhanced learner wrapper and move to device
     learner = MAMLLearner(encoder, prediction_head).to(device)
     
-    # Configure functional forward approach based on your preference
-    learner.use_pure_functional = config.get('use_pure_functional')  # Set to True for memory efficiency
-    
-    # ==== Meta-learning (MAML) Stage ====
-    
-    # ---- Setup ----
+    # Count trainable parameters
+    learner_trainable, learner_non_trainable = count_parameters(learner)
+    print(f"[Pretraining][MAML] Parameter count:")
+    print(f"\t- MAML learner: {learner_trainable:,} trainable, {learner_non_trainable:,} non-trainable")
+        
+    # MAML meta-dataloader setup
     _, train_dataloader, val_dataloader, test_dataloader, _ = build_meta_splits_and_loaders(
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
         seed=config['seed'],
@@ -337,59 +325,50 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         sig2sig=config['sig2sig'],
         pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
         mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects, must be False
+        min_subject_sample_number=config['min_subject_sample_number'],
         k_support=config['k_support'],
         k_query=config['k_query'],
         meta_batch_size=config['meta_batch_size']
     )
     
-    # Saving feature statistics for intiializing the drift detector during the personalization step
-    baseline_mean, baseline_std = compute_embedding_stats(encoder, train_dataloader, device)
-
-    # Save to file for personalization later on
-    stats_ckpt = {
-        'baseline_mean': baseline_mean,
-        'baseline_std': baseline_std,
-    }
-    np.savez(os.path.join(checkpoint_path, f"{save_name}_embedding_stats.npz"), **stats_ckpt)
-    print(f"[Pretraining][MAML] Embedding stats saved to {save_name}_embedding_stats.npz ✅")
-    
     # Hyperparams / defaults
     meta_epochs = config.get('max_meta_epochs')
-    grad_clip_norm = config.get('grad_clip')  # Increased for MAML
-    
-    # Enhanced scheduling parameters
+    grad_clip_norm = config.get('grad_clip') 
     meta_lr_schedule = config.get('meta_lr_schedule')
     inner_lr_schedule = config.get('inner_lr_schedule')
     inner_steps_schedule = config.get('inner_steps_schedule')
     
     # MAML specific parameters
     print(f"[Pretraining][MAML] Run configuration")
-    print(f"\t- Meta LR schedule: {meta_lr_schedule}")
-    print(f"\t- Inner LR schedule: {inner_lr_schedule}")
-    print(f"\t- Inner steps schedule: {inner_steps_schedule}")
-    print(f"\t- Using pure functional: {learner.use_pure_functional}")
+    print(f"\t- Update: {'Almost-No-Inner-Loop' if config['inner_adapt'] == 'head' else 'encoder and prediction head'}")
+    print(f"\t- Epochs: {meta_epochs}")
+    print(f"\t- Meta LR schedule: {meta_lr_schedule} - base LR {config['meta_lr']} / min LR {config['meta_lr_scheduler_eta_min']}")
+    print(f"\t- Inner LR schedule: {inner_lr_schedule} - LR {config['inner_lr']}")
+    print(f"\t- Inner steps schedule: {inner_steps_schedule} - Steps {config['inner_steps']}")
     
     # Meta-optimizer for the meta-parameters
-    meta_optimizer = torch.optim.AdamW(learner.parameters(), lr=get_meta_lr(0, config), weight_decay=config['weight_decay'])
+    model_param_list = list(learner.parameters())
+    meta_optimizer = torch.optim.AdamW(model_param_list, lr=get_meta_lr(0, config), weight_decay=config['weight_decay'])
     
     # Meters
+    best_val = float("+inf")
     epoch_query_loss_meter = AverageMeter(name='meta/train_query_loss')
     epoch_support_loss_meter = AverageMeter(name='meta/train_support_loss')
     epoch_meta_loss_meter = AverageMeter(name='meta/train_meta_loss')
     
-    best_val = float("+inf")
-
-    # ---- Outer loop ----
+    # ==== Train/Val ====
+    # Outer loop
     for epoch in range(meta_epochs):
-        
+
+        # Train
         learner.train()
 
-        # Decide schedules / hyperparams for this epoch
+        # Set schedules / hyperparams for this epoch
         current_meta_lr = get_meta_lr(epoch, config)
         current_inner_lr = get_inner_lr(epoch, config)
         current_inner_steps = get_inner_steps(epoch, config)
 
-        # Update meta-optimizer learning rate if using manual schedule
+        # Update meta-optimizer learning rate with manual schedule
         for param_group in meta_optimizer.param_groups:
             param_group['lr'] = current_meta_lr
 
@@ -419,11 +398,11 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
             task_query_pre_losses = []
             meta_loss = 0.0  # accumulated weighted multi-step meta-loss (averaged over tasks)
 
-            for t in range(meta_batch):
+            for t in range(meta_batch):                    
                 # Extract task-specific support/query
                 sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
                 qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
-
+                
                 # Query loss before adaptation (step 0) — keep for logging and optional MSL include
                 with torch.no_grad():
                     out_q0 = learner(qX)  # Use current meta-parameters
@@ -442,27 +421,25 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                     per_step_query_losses.append(loss_q0)
 
                 for step in range(current_inner_steps):
-                    # Support forward using the current fast_weights
-                    out_s = learner(sX, fast_weights)
+                    # --- support forward ---
+                    out_s = learner(sX, fast_weights)    
                     loss_s = F.smooth_l1_loss(out_s, sY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_s, sY)
                     support_losses.append(loss_s.item())
 
-                    # Select differentiable params from fast_weights
+                    # grads wrt fast_weights
                     opt_idx, opt_params = zip(
                         *[(i, w) for i, w in enumerate(fast_weights)
-                        if w.requires_grad and torch.is_floating_point(w)]
+                          if w.requires_grad and torch.is_floating_point(w)]
                     )
-
-                    # Compute grads for the inner-update. create_graph True iff we want second-order
                     grads = torch.autograd.grad(
                         loss_s,
                         opt_params,
-                        create_graph=False, # Always False, we do FOMAML
+                        create_graph=False,
                         retain_graph=True,
                         allow_unused=True
                     )
-                    
-                    # Build updates (delta = lr * grad), handle None grads
+
+                    # Update with grad clipping
                     deltas = []
                     for g in grads:
                         if g is None:
@@ -470,48 +447,41 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                         else:
                             deltas.append(current_inner_lr * g)
 
-                    # Compute global norm over the update vectors (use .detach() to avoid making clipping
-                    # part of the higher-order graph). Add eps for stability.
+                    # Clip norm
                     eps = torch.finfo(torch.float32).eps
                     sq_sum = 0.0
                     for d in deltas:
                         if d is not None:
-                            # use .detach() here so clipping scale is not part of the graph
                             sq_sum = sq_sum + (d.detach() ** 2).sum()
-
                     global_norm = torch.sqrt(sq_sum + eps)
-
-                    # compute scale factor (<=1) as a detached scalar
                     clip_coef = (grad_clip_norm / (global_norm + eps)).clamp(max=1.0)
 
-                    # apply the same scale to all deltas (preserves direction)
                     scaled_deltas = []
                     for d in deltas:
                         if d is None:
                             scaled_deltas.append(None)
                         else:
-                            scaled_deltas.append(d * clip_coef)  # clip_coef is detached; this is safe
+                            scaled_deltas.append(d * clip_coef)
 
-                    # apply inner update to produce new fast_weights
                     new_fast_weights = []
                     d_iter = iter(scaled_deltas)
                     for i, w in enumerate(fast_weights):
                         if i in opt_idx:
                             d = next(d_iter)
                             if d is not None:
-                                new_fast_weights.append(w - d)   # w - (lr * grad) already scaled
+                                new_fast_weights.append(w - d)
                             else:
                                 new_fast_weights.append(w)
                         else:
                             new_fast_weights.append(w)
                     fast_weights = new_fast_weights
-
+                        
                     # Evaluate query using the updated fast_weights (multi-step loss)
                     out_q_step = learner(qX, fast_weights)
                     loss_q_step = F.smooth_l1_loss(out_q_step, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q_step, qY)
                     per_step_query_losses.append(loss_q_step)
 
-                # --- combine per-step query losses into single meta-loss for this task ---
+                # --- Combine per-step query losses into single meta-loss for this task ---
 
                 # Weighted sum of query losses for this task
                 weighted_task_meta = 0.0
@@ -530,10 +500,9 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                 epoch_query_loss_meter.update(final_query_loss, 1)
                 epoch_support_loss_meter.update(np.mean(support_losses) if len(support_losses) > 0 else 0.0, 1)
                 
-
             # End tasks in meta-batch: do meta-backward on accumulated meta_loss
-            # Note: if using first-order (use_second_order=False), create_graph was False above,
-            # so second-order contributions are omitted (Derivative-order annealing behavior).
+            # Note: since we use first-order derivatives (use_second_order=False in autograd), create_graph was False above,
+            # so second-order contributions are omitted.
             meta_loss.backward()
 
             # Gradient clipping and meta step
@@ -553,13 +522,12 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         # Run validation
         val_loss = evaluate_maml_with_bp_metrics(learner, val_dataloader, device, config)
 
-        # ---- Logging ----
+        # Logging 
         writer.add_scalar('meta/train_query_loss_epoch', avg_train_query_loss, epoch)
         writer.add_scalar('meta/train_support_loss_epoch', avg_train_support_loss, epoch)
         writer.add_scalar('meta/train_meta_loss_epoch', avg_train_meta_loss, epoch)
         writer.add_scalar('meta/val_loss_epoch', val_loss, epoch)
         writer.add_scalar('meta/grad_norm_epoch', avg_grad_norm, epoch)
-
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
         writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
         writer.add_scalar('meta/inner_steps', current_inner_steps, epoch)
@@ -590,7 +558,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
             best_val = val_loss
             print(f"[Pretraining][MAML] New best validation loss ✅: {val_loss:.5f}, saved to {best_model_path}")
     
-    
     # After meta-training, run final test evaluation
     print(f"[Pretraining][MAML] MAML training completed ✅")
     print(f"\t- Best val loss {best_val}")
@@ -599,8 +566,20 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     # Load best model
     best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_maml"), weights_only=False)
     learner.load_state_dict(best_ckpt['learner_state_dict'])
-    learner = learner.to(device)
     
+    # Saving feature statistics for intiializing the drift detector during the personalization step
+    baseline_mean, baseline_std = compute_embedding_stats(learner.encoder, train_dataloader, device)
+
+    # Save to file for personalization later on
+    stats_ckpt = {
+        'baseline_mean': baseline_mean,
+        'baseline_std': baseline_std,
+    }
+    np.savez(os.path.join(checkpoint_path, f"{save_name}_embedding_stats.npz"), **stats_ckpt)
+    print(f"[Pretraining][MAML] Embedding stats saved to {save_name}_embedding_stats.npz ✅")
+    
+    # ==== Test ====
+    learner = learner.to(device)
     all_test_targets, all_test_outputs = evaluate_maml_with_bp_metrics(
         learner, 
         test_dataloader, 
@@ -610,7 +589,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         writer=writer
     )
     
-    # Log test metrics and return loss for validation
+    # Log test metrics
     _ = call_metric(all_test_targets, all_test_outputs, config, 
                    figure_savepath=os.path.join(config['figure_path'], 'maml_meta_stage'), 
                    plot=True)  
@@ -623,7 +602,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
 def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=False, writer=None):
     """
-    Evaluation function adapted for MAML learner
+    Evaluation function for MAML learner
     """
     learner.eval()
     
@@ -664,7 +643,7 @@ def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=Fals
 
             # Build inner optimizer with correct parameter groups & LRs
             inner_opt = build_inner_optimizer(adapted_encoder, adapted_prediction_head, base_lr=config['eval_lr'], config=config)
-
+            
             adapted_encoder.train()
             adapted_prediction_head.train()
 

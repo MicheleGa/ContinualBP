@@ -8,14 +8,15 @@ from typing import List, Tuple, Optional
 import torch
 from torch.utils.data import Dataset, DataLoader
 from dataset import PhysioDataset  
+from preprocessing_utils.augmentations import get_ppg_augmentations, get_ecg_augmentations
 
 
 def _stack_batch(batch):
     """
     Normalize (X, Y) pairs into tensors with shapes:
       - X: (B, C, T)
-      - Y: (B, T)   for sig2sig=True
-      - Y: list [SBP:(B,1), DBP:(B,1)] for sig2sig=False
+      - Y: (B, 3)   for sig2sig=False
+      - Y: (B, T) + (B, 3) for sig2sig=True
     """
     xs = [b[0] for b in batch]
     ys = [b[1] for b in batch]
@@ -37,9 +38,8 @@ def _stack_batch(batch):
             y = y.squeeze(0)                 # -> (T,)
         y_tensors.append(y)
     Y = torch.stack(y_tensors, dim=0)       # (B, T)
-   
+    
     return X, Y
-
 
 class MetaTaskDataset(Dataset):
     """
@@ -47,17 +47,15 @@ class MetaTaskDataset(Dataset):
         - Pick a patient (domain)
         - Sample K support windows and Q query windows from that patient
         - Return ((X_s, Y_s), (X_q, Y_q), patient_id)
-
-    It wraps an existing PhysioDataset (so it fully reuses your LMDB layout and __getitem__).
     """
+
     def __init__(
         self,
         base_dataset: PhysioDataset,
         patient_ids: List[str],
         k_support: int = 8,
         k_query: int = 8,
-        allow_replacement: bool = False,
-        seed: int = 42,
+        allow_replacement: bool = False
     ):
         super().__init__()
         self.ds = base_dataset
@@ -65,105 +63,48 @@ class MetaTaskDataset(Dataset):
         self.k_support = k_support
         self.k_query = k_query
         self.allow_replacement = allow_replacement
-        self.rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(base_dataset.seed)
 
-        # We rely on ds.index_by_subject_id to map patient -> list of sample_ids.
-        # ds.__getitem__(sample_id) already pulls the right signals/targets from LMDB.
+        # Patient → list of sample_ids
         self.index_by_subject_id = self.ds.index_by_subject_id
-        self.bp_to_category = self.ds.bp_to_category
-        
-        self._build_patient_bp_index()
-        
+
     def __len__(self):
-        # Length is "virtual": number of tasks you want per epoch.
-        # You can set it to len(patient_ids) to iterate each patient once per epoch,
-        # or any multiple thereof. We'll do one task per patient by default.
         return len(self.patient_ids)
-    
-    def _build_patient_bp_index(self):
-        """
-        Build phenotype-aware index: for each patient, group sample_ids by BP category.
-        """
-        self.patient_bp_index = {}
-        for pid in self.patient_ids:
-            sample_ids = self.index_by_subject_id[pid]
-            self.patient_bp_index[pid] = defaultdict(list)
-            for sid in sample_ids:
-                sbp = np.squeeze(np.frombuffer(
-                    self.ds.lmdbtxn.get(f"{sid}-sbp".encode()), dtype="float32"))
-                dbp = np.squeeze(np.frombuffer(
-                    self.ds.lmdbtxn.get(f"{sid}-dbp".encode()), dtype="float32"))
-                cat = self.bp_to_category(sbp, dbp)  # from PhysioDataset
-                self.patient_bp_index[pid][cat].append(sid)
 
     def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
         """
-        Sample support/query windows for one patient,
-        encouraging phenotype diversity.
+        Sample disjoint support/query windows for one patient.
+        - Support: k_support random sample_ids
+        - Query: k_query random sample_ids (disjoint from support)
         """
+        sample_ids = list(self.index_by_subject_id[pid])
+        n_total = len(sample_ids)
         total_needed = self.k_support + self.k_query
-        sample_ids = self.index_by_subject_id[pid]
 
-        if self.allow_replacement or total_needed > len(sample_ids):
+        if self.allow_replacement or total_needed > n_total:
             # Fallback: sample with replacement
             chosen = self.rng.choice(sample_ids, size=total_needed, replace=True)
             return list(chosen[:self.k_support]), list(chosen[self.k_support:])
 
-        # Phenotype-aware sampling
-        support_ids, query_ids = [], []
-        bp_index = self.patient_bp_index[pid]
-
-        # Flatten categories sorted by availability
-        cats_sorted = sorted(bp_index.keys(), key=lambda c: -len(bp_index[c]))
-
-        # Step 1: fill support with diverse categories
-        while len(support_ids) < self.k_support and cats_sorted:
-            for cat in list(cats_sorted):  # iterate over categories
-                if len(support_ids) >= self.k_support:
-                    break
-                if bp_index[cat]:
-                    sid = self.rng.choice(bp_index[cat])
-                    support_ids.append(sid)
-                    bp_index[cat].remove(sid)
-                else:
-                    cats_sorted.remove(cat)
-
-        # Step 2: fill query with remaining, still try to diversify
-        cats_sorted = sorted(bp_index.keys(), key=lambda c: -len(bp_index[c]))
-        while len(query_ids) < self.k_query and cats_sorted:
-            for cat in list(cats_sorted):
-                if len(query_ids) >= self.k_query:
-                    break
-                if bp_index[cat]:
-                    sid = self.rng.choice(bp_index[cat])
-                    query_ids.append(sid)
-                    bp_index[cat].remove(sid)
-                else:
-                    cats_sorted.remove(cat)
-
-        # Step 3: If still not enough, backfill randomly
-        remaining = [sid for sids in bp_index.values() for sid in sids]
-        while len(support_ids) < self.k_support:
-            support_ids.append(self.rng.choice(remaining))
-        while len(query_ids) < self.k_query:
-            query_ids.append(self.rng.choice(remaining))
-
+        # Sample without replacement: disjoint sets
+        chosen = self.rng.choice(sample_ids, size=total_needed, replace=False)
+        support_ids = list(chosen[:self.k_support])
+        query_ids   = list(chosen[self.k_support:])
+        
         return support_ids, query_ids
-
 
     def __getitem__(self, idx):
         pid = self.patient_ids[idx % len(self.patient_ids)]
         support_ids, query_ids = self._sample_indices_for_patient(pid)
 
-        # Pull (x,y) using the base dataset's __getitem__(sample_id)
         support_batch = [self.ds[s_id] for s_id in support_ids]
-        query_batch   = [self.ds[q_id] for q_id in query_ids]
-        
-        Xs, Ys = _stack_batch(support_batch)
-        Xq, Yq = _stack_batch(query_batch)
-        
-        return (Xs, Ys), (Xq, Yq), pid
+        query_batch = [self.ds[q_id] for q_id in query_ids]
 
+        Xs, Ys = _stack_batch(support_batch)  # [k_support, C, T]
+        Xq, Yq = _stack_batch(query_batch)    # [k_query, C, T]
+
+        return (Xs, Ys), (Xq, Yq), pid
+        
 
 def build_meta_splits_and_loaders(
     lmdb_folder: str,
@@ -224,24 +165,21 @@ def build_meta_splits_and_loaders(
         patient_ids=train_ids,
         k_support=k_support,
         k_query=k_query,
-        allow_replacement=False,
-        seed=seed,
+        allow_replacement=False
     )
     meta_val_ds = MetaTaskDataset(
         base_dataset=base_ds,
         patient_ids=val_ids,
         k_support=k_support,
         k_query=k_query,
-        allow_replacement=False,
-        seed=seed,
+        allow_replacement=False
     )
     meta_test_ds = MetaTaskDataset(
         base_dataset=base_ds,
         patient_ids=test_ids,
         k_support=k_support,
         k_query=k_query,
-        allow_replacement=False,
-        seed=seed,
+        allow_replacement=False
     )
 
     # 4) DataLoaders: each batch = 1 task (support, query, pid).
@@ -279,13 +217,13 @@ def parseargs():
     parser.add_argument('--input_seq_len_s', type=int, default=10, help='single window duration')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--contrastive', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--k_support', type=int, default=5, help='meta-learning support set size')
-    parser.add_argument('--k_query', type=int, default=10, help='meta-learning query set size')
+    parser.add_argument('--k_support', type=int, default=16, help='meta-learning support set size')
+    parser.add_argument('--k_query', type=int, default=32, help='meta-learning query set size')
     parser.add_argument('--meta_batch_size', type=int, default=4, help='meta batch size')
     parser.add_argument('--workers', type=int, default=2, help='parallel data loaders')
     
     return parser.parse_args()
+    
     
 if __name__ == "__main__":
     
@@ -298,26 +236,20 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         sig2sig=args.sig2sig,
-        contrastive=args.contrastive,
         pretraining_split_ratio=(0.7, 0.1, 0.2),
         mix_pretraining_subject_samples=False,     # IMPORTANT for meta-learning to test on unseen subjects
         k_support=args.k_support,
         k_query=args.k_query,
         meta_batch_size=args.meta_batch_size,
-        loader_workers=args.workers,
+        loader_workers=args.workers
     )
 
     print(f"#Patients: train={len(splits['train_ids'])}, val={len(splits['val_ids'])}, test={len(splits['test_ids'])}")
 
     # --- Pull ONE TASK from train_loader and print shapes/values ---
-    task_batch = next(iter(val_loader))
+    task_batch = next(iter(train_loader))
 
     (Xs, Ys), (Xq, Yq), pid = task_batch
-    
-    if len(Xs.shape) == 3:
-        Xs = Xs.unsqueeze(-1)
-    if len(Xq.shape) == 3:
-        Xq = Xq.unsqueeze(-1) 
     
     print(f"[Task patient id] {pid}")
     print(f"Support X shape: {tuple(Xs.shape)}")

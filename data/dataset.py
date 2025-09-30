@@ -64,7 +64,6 @@ class PhysioDataset(Dataset):
         self.pretraining_split_ratio = pretraining_split_ratio # To divide pretraining from personalization, and then to divide the pretraining dataset
         self.mix_pretraining_subject_samples = mix_pretraining_subject_samples # Whether to split train/val/test during pretraining subjectwise or not
         
-        
         if self.plot:
             if self.min_subject_sample_number > 0:
                 plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, f'pretraining_subject_sample_distribution_min_sample_{self.min_subject_sample_number}.jpg'))
@@ -240,22 +239,12 @@ class PhysioDataset(Dataset):
 
     def __getitem__(self, index):
         
-        # ---------------------------------------------------------
+        # ------------------------------------------
         # === Load raw input signals (PPG/ECG) ===
-        # ---------------------------------------------------------
+        # ------------------------------------------
         ppg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32"))
         ecg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32"))
 
-        # ---------------------------------------------------------
-        # === Load annotations ===
-        #   - Full ABP waveform
-        #   - SBP, DBP, MAP values
-        # ---------------------------------------------------------
-        abp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
-        sbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
-        dbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
-        map = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
-        
         if self.ecg:
             # Shape: [time, 2]  (PPG, ECG)
             sig = np.stack((ppg, ecg), axis=-1)
@@ -269,15 +258,31 @@ class PhysioDataset(Dataset):
         
         # Cast to torch tensor
         signals = torch.tensor(sig)
-            
+
+        # ---------------------------
+        # === Load annotations ===
+        #   - Full ABP waveform
+        #           or
+        #   - SBP, DBP, MAP values
+        # ---------------------------
+    
         if self.sig2sig:
+            # Full ABP waveform
+            abp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
+
             # Make arrays writable
             abp = np.require(abp, requirements=['O', 'W'])
             abp.setflags(write=1)
             
             # Cast to torch tensor
             annotation = torch.tensor(abp)
+
         else:
+            # SBP, DBP, MAP values
+            sbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
+            dbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
+            map = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
+            
             # Make arrays writable
             sbp = np.require(sbp, requirements=['O', 'W'])
             sbp.setflags(write=1)
@@ -411,10 +416,10 @@ def parseargs():
     parser.add_argument('--save_path', default='./data_figs', type=str, help='where to save graphs from dataset analysis')
     parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
-    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
+    parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
-    parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit')
-    parser.add_argument('--mix_pretraining_subject_samples', default='True', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
+    parser.add_argument('--min_subject_sample_number', default=300, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit')
+    parser.add_argument('--mix_pretraining_subject_samples', default='False', type=lambda x: bool(strtobool(x)), help='whether to mix pretraining subject samples among train/val/test or not')
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')

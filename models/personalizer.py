@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from training_utils.helpers import get_encoder_architecture, get_prediction_head_architecture, build_inner_optimizer
+from training_utils.helpers import get_encoder_architecture, get_prediction_head_architecture, build_inner_optimizer, count_parameters
 from training_utils.metrics import call_metric, compute_transfer_metrics_blockwise
 from data.online_dataset import OnlineSubjectDataset
 from data.preprocessing_utils.data_visualization import plot_subject_annotation_runs
@@ -138,7 +138,7 @@ def personalization_on_subject_runs_sequence(pretrained_learner, dataset, subjec
         b_idx = block['b_idx']
         block_id = f"{run_idx+1}.{b_idx+1}"
 
-        print(f"Processing subject {subject_id}, run {run_idx+1}, block {b_idx+1}/{len(runs)}")
+        print(f"[Personalization] Processing subject {subject_id}, run {run_idx+1}, block {b_idx+1}/{len(runs)}")
 
         # --- NO ADAPT : nothing to do ---
 
@@ -265,11 +265,11 @@ def personalization(tensorboard_path, config, device):
     
     # Initialize encoder
     encoder = get_encoder_architecture(config)
-    print(f"[Personalization] Intialized encoder weights")
+    print(f"[Personalization] Encoder weights initialized ✅")
     
     # Initialize prediction head
     prediction_head = get_prediction_head_architecture(config)
-    print(f"[Personalization] Intialized prediction head weights")
+    print(f"[Personalization] Prediction head weights initialized ✅")
 
     learner = MAMLLearner(encoder, prediction_head)
 
@@ -277,16 +277,12 @@ def personalization(tensorboard_path, config, device):
     learner.load_state_dict(ckpt['learner_state_dict'])
     learner = learner.to(device)
     learner.eval()
-    print(f"[Personalization] Loaded MAML Learner after pre-training")
+    print(f"[Personalization] MAML Learner pre-trained ckpt loaded ✅")
 
-    # Model/Regressor number of parameters
-    encoder_trainable_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-    encoder_non_trainable_params = sum(p.numel() for p in encoder.parameters() if not p.requires_grad)
-    prediction_head_trainable_params = sum(p.numel() for p in prediction_head.parameters() if p.requires_grad)
-    prediction_head_non_trainable_params = sum(p.numel() for p in prediction_head.parameters() if not p.requires_grad)
-    print(f"Model parameters: trainable {encoder_trainable_params}/ non trainable {encoder_non_trainable_params}")
-    print(f"Regressor parameters: trainable {prediction_head_trainable_params}/ non trainable {prediction_head_non_trainable_params}")
-    print(f"Checkpoint loaded from {config['pretrained_model_ckpt_path']}")
+    # Count trainable parameters
+    learner_trainable, learner_non_trainable = count_parameters(learner)
+    print(f"[Personalization] Parameter count:")
+    print(f"\t- MAML learner: {learner_trainable:,} trainable, {learner_non_trainable:,} non-trainable")
 
     # Get test subjects
     personalization_subjects = online_physio_dataset.subjects_for_personalization
@@ -297,7 +293,7 @@ def personalization(tensorboard_path, config, device):
     global_outs_and_tgts = {b: [] for b in ['no_adapt','first_batch_finetune','online_adapt']}
 
     for subject_counter, subject_id in enumerate(personalization_subjects):
-        print(f"{subject_counter}/{len(personalization_subjects)} personalizing subject {subject_id}")
+        print(f"[Personalization] {subject_counter}/{len(personalization_subjects)} personalizing model on subject {subject_id}")
         
         per_block_stats, outs_and_tgts = personalization_on_subject_runs_sequence(pretrained_learner_copy, online_physio_dataset, subject_id, tensorboard_path, device, config)
         
@@ -329,9 +325,11 @@ def personalization(tensorboard_path, config, device):
         # ---- Call metric plots for each baseline ----
         for b, (outs, tgts) in outs_and_tgts.items():
             if outs.shape[0] > 0:
-                print(f"{subject_counter}/{len(personalization_subjects)} Results for {subject_id} with baseline {b}")
+                print(f"[Personalization] {subject_counter}/{len(personalization_subjects)} Results for {subject_id} with baseline {b}")
                 call_metric(tgts, outs, config, os.path.join(subj_dir, f"subject_{subject_id}_{b}_metrics.png"), plot=True)
                 global_outs_and_tgts[b].append((outs, tgts))
+                
+        print(f"[Personalization] Personalization on {subject_counter}/{len(personalization_subjects)} subject completed ✅")
             
         if config['num_personalization_subjects'] > 0 and subject_counter > config['num_personalization_subjects']:
             break 
@@ -342,9 +340,10 @@ def personalization(tensorboard_path, config, device):
         os.makedirs(agg_dir)
     for b, data_list in global_outs_and_tgts.items():
         if len(data_list) > 0:
+            print(f'[Personalization] Aggregated personalization results for the baseline {b}')
             all_outs = np.concatenate([o for o, _ in data_list], axis=0)
             all_tgts = np.concatenate([t for _, t in data_list], axis=0)
             call_metric(all_tgts, all_outs, config, os.path.join(agg_dir, f"aggregate_{b}_metrics.png"), plot=True)
 
-    print(f"Personalization completed")
+    print(f"[Personalization] Personalization completed ✅")
     

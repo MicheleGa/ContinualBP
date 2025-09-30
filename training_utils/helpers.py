@@ -51,9 +51,9 @@ def parseargs():
     parser.add_argument('--loader_worker', default=4, type=int, help='number of data loader workers')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--batch_size', default=256, type=int, help='batch size')
+    parser.add_argument('--batch_size', default=128, type=int, help='batch size')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
-    parser.add_argument('--input_seq_len_s', default=5, type=int, help='input sequence length in seconds')
+    parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds')
     
     # Personalization Setup
     parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
@@ -78,14 +78,12 @@ def parseargs():
     parser.add_argument('--k_support', type=int, default=5, help='number of support samples in meta-learning')
     parser.add_argument('--k_query', type=int, default=10, help='number of query samples in meta-learning')
     parser.add_argument('--meta_batch_size', type=int, default=8, help='meta batch size')
-    parser.add_argument('--use_pure_functional', default=False, type=lambda x: bool(strtobool(x)), help='use pure functional for MAML (True for memory efficiency)')
     parser.add_argument('--msl_anneal_epochs', default=20, type=int, help='how many epochs until full MSL anneal (later inner steps get more weight)')   
     parser.add_argument('--msl_include_pre', default=False, type=lambda x: bool(strtobool(x)), help='whether to include the pre-adaptation (step-0) query loss into the meta-loss')
     parser.add_argument('--msl_pre_base_weight', default=0.5, type=float, help='base weight for pre-adaptation loss if included')
     
     parser.add_argument('--meta_lr', default=1e-3, type=float, help='meta-learning learning rate')
     parser.add_argument('--meta_lr_schedule', default='cosine', type=str, choices=['constant', 'cosine', 'cosine_wr', 'multistep'], help='meta-learning learning rate schedule type')
-    parser.add_argument('--meta_lr_decay', default=0.95, type=float, help='meta-learning learning rate decay factor for exponential schedule')
     parser.add_argument('--meta_lr_steps', default=[100, 200, 300, 400], type=int, nargs='+', help='meta-learning learning rate steps for step decay')
     parser.add_argument('--meta_lr_gamma', default=0.1, type=float, help='meta-learning learning rate gamma for step decay')   
     parser.add_argument('--meta_lr_scheduler_T0', default=100, type=int, help='cosine wr scheduler T0 parmeter')   
@@ -94,8 +92,6 @@ def parseargs():
     parser.add_argument('--meta_lr_scheduler_gamma', default=0.00001, type=float, help='cosine wr scheduler eta min parmeter')
     parser.add_argument('--meta_lr_scheduler_min_gamma', default=0.00001, type=float, help='cosine wr scheduler eta min gamma')
     parser.add_argument('--meta_lr_scheduler_max_cycles', default=3, type=int, help='cosine wr number of cycless')
-    parser.add_argument('--meta_lr_scheduler_tail', default='cosine', type=str, help='meta learning rate schedule for the end of training')
-    parser.add_argument('--meta_lr_scheduler_eta_floor', default=0.00001, type=float, help='cosine wr scheduler eta floor')
     
     parser.add_argument('--inner_adapt', default='head', type=str, help='ANIL: adapt only head parameters in inner loop')
     parser.add_argument('--inner_opt', default='adam', type=str, help='inner loop optimizer type')
@@ -117,14 +113,14 @@ def parseargs():
     parser.add_argument('--kernel_size', default=7, type=int, help='convolutional layer kernel size')
     parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
     parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
-    parser.add_argument('--num_groups', default=8, type=int, help='number of groups for group normalization')
     parser.add_argument('--embed_dim', default=256, type=int, help='embedding dimension')
     parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
     parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of trasnformer layers')
     parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
     parser.add_argument('--n_fft', default=200, type=int, help='STFT n_fft parameter')
     parser.add_argument('--hop_length', default=100, type=int, help='STFT hop length parameter')
-        
+    parser.add_argument('--num_groups', default=8, type=int, help='number of groups for group normalization')
+
     args = parser.parse_args()
     return args
 
@@ -178,6 +174,12 @@ def generate_runname(model_name, exp_name):
         exec_timestamp.tm_sec)
     run_name = "{}-{}-{}".format(exp_name, model_name, exec_timestr)
     return run_name
+
+
+def count_parameters(model):
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    return trainable, non_trainable
 
     
 def save_status(subject_id, epoch, model_name, save_name, model, optimizer, scheduler, meter, checkpoint_path, config):
@@ -310,9 +312,9 @@ def get_encoder_architecture(config):
             act=config['act'], 
             pooling=config['pooling'], 
             embed_dim=config['embed_dim'], 
+            num_groups=config['num_groups'],
             fs=config['fs'], 
-            input_seq_len_s=config['input_seq_len_s'],
-            num_groups=config['num_groups']
+            input_seq_len_s=config['input_seq_len_s']
         )
     elif config['model_name'] == 'BIOT':
         encoder = BIOT.BIOT(
@@ -383,16 +385,14 @@ def get_meta_lr(epoch, config):
         eta_min = float(config.get('meta_lr_scheduler_eta_min'))
         return eta_min + (base_meta_lr - eta_min) * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
     elif meta_lr_schedule == 'cosine_wr':
-        # Extended version with decaying peaks and optional tail
-        T0      = int(config.get('meta_lr_scheduler_T0'))
-        T_mult  = float(config.get('meta_lr_scheduler_T_mult'))
+        # Extended version with decaying peaks
+        T0 = int(config.get('meta_lr_scheduler_T0'))
+        T_mult = float(config.get('meta_lr_scheduler_T_mult'))
         eta_min0 = float(config.get('meta_lr_scheduler_eta_min'))
-        gamma   = float(config.get('meta_lr_scheduler_gamma'))
+        gamma = float(config.get('meta_lr_scheduler_gamma'))
         min_gamma = float(config.get('meta_lr_scheduler_min_gamma'))
         max_cycles = config.get('meta_lr_scheduler_max_cycles')
-        tail_mode  = config.get('meta_lr_scheduler_tail')
-        eta_floor  = float(config.get('meta_lr_scheduler_eta_floor'))
-
+        
         cycle = 0
         length = T0
         e = epoch
@@ -402,26 +402,20 @@ def get_meta_lr(epoch, config):
             length = int(length * T_mult)
 
         if (max_cycles is not None) and (cycle >= int(max_cycles)):
-            # compute how many epochs since last cycle finished
-            rem = epoch
-            length = T0
-            for _ in range(int(max_cycles)):
-                rem -= length
-                length = int(length * T_mult)
-            tail_epoch = max(0, rem)
-            total_epochs = int(config['max_meta_epochs'])
-            last_cycle_peak = base_meta_lr * (gamma ** (int(max_cycles)-1))
-
-            if tail_mode == 'linear':
-                progress = min(1.0, tail_epoch / max(1, total_epochs))
-                return eta_floor + (last_cycle_peak - eta_floor) * (1.0 - progress)
-            else:
-                phase = min(1.0, tail_epoch / max(1, total_epochs))
-                return eta_floor + 0.5 * (last_cycle_peak - eta_floor) * (1 + math.cos(math.pi * phase))
-
+            # After max cycles, stay at final eta_min
+            final_eta_min = eta_min0 * (min_gamma ** (int(max_cycles) - 1))
+            return final_eta_min
+        
+        # Calculate current cycle parameters
         eta_max_cycle = base_meta_lr * (gamma ** cycle)
         eta_min_cycle = eta_min0 * (min_gamma ** cycle)
-        return eta_min_cycle + 0.5 * (eta_max_cycle - eta_min_cycle) * (1 + math.cos(math.pi * e / max(1, length)))
+        
+        # Ensure cycle ends exactly at eta_min by using (length-1) for full cycle
+        # When e = length-1, cos(π) = -1, giving eta_min exactly
+        cycle_progress = math.pi * e / max(1, length - 1)
+        cosine_factor = 0.5 * (1 + math.cos(cycle_progress))
+        
+        return eta_min_cycle + (eta_max_cycle - eta_min_cycle) * cosine_factor
     elif meta_lr_schedule == 'multistep':
         # MultiStep LR: piecewise decay at specified milestones
         milestones = config.get("meta_lr_steps")  # epochs where decay happens
@@ -465,6 +459,22 @@ def get_inner_steps(epoch, config):
         return int(round(base_steps + 0.5 * (1 - math.cos(math.pi * progress)) * (max_steps - base_steps)))
     else:
         return base_steps
+
+
+class LSLRStepSize(torch.nn.Module):
+    def __init__(self, model, init_lr=0.01):
+        super().__init__()
+        self.lrs = torch.nn.ParameterDict()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.lrs[name] = torch.nn.Parameter(torch.ones(1) * init_lr)
+
+    def forward(self, grads, params):
+        # grads, params are dicts with same keys
+        updated = {}
+        for name in params:
+            updated[name] = params[name] - self.lrs[name] * grads[name]
+        return updated
     
     
 def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
@@ -486,14 +496,8 @@ def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
     head_params = [p for p in adapted_regressor.parameters()
                    if p.is_floating_point() or p.is_complex()]
 
-    if mode == 'head':
-        # freeze backbone
-        for p in backbone_params:
-            p.requires_grad = False
-        params = [
-            {'params': head_params, 'lr': base_lr * head_mult},
-        ]
-    elif mode == 'all':    
+    # Default to 'head' - ANIL
+    if mode == 'all':
         # train both
         for p in backbone_params:
             p.requires_grad = True
@@ -503,18 +507,21 @@ def build_inner_optimizer(adapted_model, adapted_regressor, base_lr, config):
             {'params': backbone_params, 'lr': base_lr * bb_mult},
             {'params': head_params,     'lr': base_lr * head_mult},
         ]
-    else:
-        raise ValueError("config['inner_adapt'] must be 'all' or 'head'")
-
-    # Build optimizer
-    if opt_type == 'adam':
-        inner_opt = torch.optim.Adam(params, lr=base_lr)
-    elif opt_type == 'sgd':
+    else:    
+        # freeze backbone
+        for p in backbone_params:
+            p.requires_grad = False
+        params = [
+            {'params': head_params, 'lr': base_lr * head_mult},
+        ]
+    
+    # Build optimizer, default to Adam
+    if opt_type == 'sgd':
         momentum = float(config.get('sgd_momentum'))
         inner_opt = torch.optim.SGD(params, lr=base_lr, momentum=momentum)
     else:
-        raise ValueError("config['inner_opt'] must be 'adam' or 'sgd'")
-
+        inner_opt = torch.optim.Adam(params, lr=base_lr)
+    
     return inner_opt
     
 
@@ -653,7 +660,6 @@ def compute_embedding_stats(encoder, dataloader, device):
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             (Xs, _), (_, _), _ = batch
-            
             meta_batch = Xs.shape[0]
             
             for t in range(meta_batch):

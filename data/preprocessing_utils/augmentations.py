@@ -12,98 +12,71 @@ import matplotlib.pyplot as plt
 # =============================
 
 class Jitter(nn.Module):
+    """Add Gaussian noise (same noise params applied across batch)."""
     def __init__(self, sigma=0.02, p=0.5):
         super().__init__()
         self.sigma = sigma
         self.p = p
 
-    def forward(self, x):
-        if random.random() < self.p:
-            return x + self.sigma * torch.randn_like(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [time] or [batch, time]
+        if random.random() >= self.p:
+            return x
+
+        return x + self.sigma * torch.randn_like(x)
+
 
 class Scaling(nn.Module):
+    """Scale amplitude (one factor per batch)."""
     def __init__(self, sigma=0.05, p=0.2):
         super().__init__()
         self.sigma = sigma
         self.p = p
 
-    def forward(self, x):
-        if random.random() < self.p:
-            factor = torch.normal(1.0, self.sigma, size=(1,), device=x.device)
-            return x * factor
-        return x
-
-class TimeShift(nn.Module):
-    def __init__(self, max_shift_samples=10, p=0.2):
-        super().__init__()
-        self.max_shift = max_shift_samples
-        self.p = p
-
-    def forward(self, x):
-        if random.random() < self.p:
-            shift = random.randint(-self.max_shift, self.max_shift)
-            return torch.roll(x, shifts=shift, dims=0)
-        return x
-
-class TimeWarp(nn.Module):
-    def __init__(self, sigma=0.05, knots=4, p=0.2):
-        super().__init__()
-        self.sigma = sigma
-        self.knots = knots
-        self.p = p
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if random.random() >= self.p:
             return x
 
-        L = x.shape[0]
-        # Warp index positions
-        orig_steps = np.arange(0, L)
-        warp = np.linspace(0, L-1, self.knots)
-        warp_noise = np.random.normal(0, self.sigma * L, size=self.knots)
-        warp_steps = np.clip(warp + warp_noise, 0, L-1)
-        interp = np.interp(orig_steps, warp, warp_steps)
-        warped = np.interp(interp, np.arange(L), x.cpu().numpy())
-        return torch.tensor(warped, dtype=x.dtype, device=x.device)
+        factor = torch.normal(1.0, self.sigma, size=(1,), device=x.device)
+        return x * factor
 
-class RandomCrop(nn.Module):
-    def __init__(self, crop_size=0.8, p=0.3):
-        super().__init__()
-        self.crop_size = crop_size
-        self.p = p
-
-    def forward(self, x):
-        if random.random() < self.p:
-            L = x.shape[0]
-            new_L = int(L * self.crop_size)
-            start = random.randint(0, L - new_L)
-            cropped = x[start:start+new_L]
-            # Pad back to length L
-            pad_left = start
-            pad_right = L - (start + new_L)
-            cropped = F.pad(cropped, (pad_left, pad_right))
-            return cropped
-        return x
 
 class RandomMasking(nn.Module):
-    def __init__(self, mask_size=0.1, p=0.3):
+    """Mask out a random continuous region (per-signal by default)."""
+    def __init__(self, mask_size=0.1, p=0.3, same_across_batch=False):
         super().__init__()
         self.mask_size = mask_size
         self.p = p
+        self.same_across_batch = same_across_batch
 
-    def forward(self, x):
-        if random.random() < self.p:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if random.random() >= self.p:
+            return x
+
+        if x.dim() == 1:  # [time]
             L = x.shape[0]
             mask_len = int(L * self.mask_size)
             start = random.randint(0, L - mask_len)
             x = x.clone()
             x[start:start+mask_len] = 0.0
             return x
-        return x
-    
+        else:  # [batch, time]
+            B, L = x.shape
+            mask_len = int(L * self.mask_size)
+            x = x.clone()
+            if self.same_across_batch:
+                start = random.randint(0, L - mask_len)
+                x[:, start:start+mask_len] = 0.0
+            else:
+                for i in range(B):
+                    start = random.randint(0, L - mask_len)
+                    x[i, start:start+mask_len] = 0.0
+            return x
+
+
 class PowerlineNoise(nn.Module):
-    def __init__(self, amplitude_range: Tuple[float, float] = (0.01, 0.05),
+    """Add sinusoidal interference at 50Hz/60Hz (same across batch)."""
+    def __init__(self, amplitude_range: Tuple[float, float] = (0.005, 0.01),
                  freq: float = 50.0, sampling_rate: float = 125.0, p: float = 0.25):
         super().__init__()
         self.amplitude_range = amplitude_range
@@ -112,17 +85,28 @@ class PowerlineNoise(nn.Module):
         self.p = p
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if random.random() > self.p:
+        if random.random() >= self.p:
             return x
-        seq_len = x.size(-1)
+
+        if x.dim() == 1:
+            L = x.shape[0]
+        else:
+            L = x.shape[1]
+
         amplitude = random.uniform(*self.amplitude_range)
-        t = torch.linspace(0, seq_len / self.sampling_rate, seq_len, device=x.device)
+        t = torch.linspace(0, L / self.sampling_rate, L, device=x.device)
         powerline = amplitude * torch.sin(2 * np.pi * self.freq * t)
-        return x + powerline
+
+        if x.dim() == 1:
+            return x + powerline
+        else:
+            return x + powerline.unsqueeze(0).expand(x.size(0), -1)
+
 
 class BaselineWander(nn.Module):
-    def __init__(self, amplitude_range: Tuple[float, float] = (0.05, 0.15),
-                 freq_range: Tuple[float, float] = (1.0, 2.0), sampling_rate: float = 125.0, p: float = 0.3):
+    """Add low-frequency sinusoidal drift (same across batch)."""
+    def __init__(self, amplitude_range: Tuple[float, float] = (0.005, 0.02),
+                 freq_range: Tuple[float, float] = (0.05, 0.5), sampling_rate: float = 125.0, p: float = 0.2):
         super().__init__()
         self.amplitude_range = amplitude_range
         self.freq_range = freq_range
@@ -130,14 +114,35 @@ class BaselineWander(nn.Module):
         self.p = p
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if random.random() > self.p:
+        if random.random() >= self.p:
             return x
-        seq_len = x.size(-1)
+
+        if x.dim() == 1:
+            L = x.shape[0]
+        else:
+            L = x.shape[1]
+
         amplitude = random.uniform(*self.amplitude_range)
         frequency = random.uniform(*self.freq_range)
-        t = torch.linspace(0, seq_len / self.sampling_rate, seq_len, device=x.device)
+        t = torch.linspace(0, L / self.sampling_rate, L, device=x.device)
         baseline = amplitude * torch.sin(2 * np.pi * frequency * t)
-        return x + baseline
+
+        if x.dim() == 1:
+            return x + baseline
+        else:
+            return x + baseline.unsqueeze(0).expand(x.size(0), -1)
+
+
+# --- Wrapper ---
+class Compose(nn.Module):
+    def __init__(self, transforms):
+        super().__init__()
+        self.transforms = transforms
+
+    def forward(self, x):
+        for t in self.transforms:
+            x = t(x)
+        return x
 
 
 # Random Choice Transform
@@ -202,7 +207,7 @@ def plot_compare(signal, aug_signal, title, savepath):
 
     axes[0].plot(signal.numpy())
     axes[0].set_title("Original")
-
+ 
     axes[1].plot(aug_signal.numpy())
     axes[1].set_title(f"{title}")
 
@@ -216,49 +221,31 @@ def plot_compare(signal, aug_signal, title, savepath):
 
 def get_ecg_augmentations(
     jitter_sigma=0.005, jitter_p=0.2,
-    scaling_sigma=0.02, scaling_p=0.1,
-    timeshift_max=3, timeshift_p=0.15,
-    timewarp_sigma=0.02, timewarp_knots=2, timewarp_p=0.1,
-    crop_size=0.95, crop_p=0.1,
-    mask_size=0.03, mask_p=0.1,
-    powerline_p=0.3, baseline_p=0.2,
+    scaling_sigma=0.015, scaling_p=0.1,
+    mask_size=0.025, mask_p=0.1,
+    powerline_p=0.2, baseline_p=0.2,
 ):
     return Compose([
         Jitter(sigma=jitter_sigma, p=jitter_p),
         Scaling(sigma=scaling_sigma, p=scaling_p),
-        TimeShift(max_shift_samples=timeshift_max, p=timeshift_p),
-        TimeWarp(sigma=timewarp_sigma, knots=timewarp_knots, p=timewarp_p),
-        RandomChoice([
-            RandomCrop(crop_size=crop_size, p=crop_p),
-            RandomMasking(mask_size=mask_size, p=mask_p)
-        ]),
+        RandomMasking(mask_size=mask_size, p=mask_p),
         PowerlineNoise(p=powerline_p),
         BaselineWander(p=baseline_p),
     ])
-
 
 def get_ppg_augmentations(
     jitter_sigma=0.01, jitter_p=0.3,
-    scaling_sigma=0.05, scaling_p=0.2,
-    timeshift_max=3, timeshift_p=0.2,
-    timewarp_sigma=0.05, timewarp_knots=3, timewarp_p=0.2,
-    crop_size=0.9, crop_p=0.2,
-    mask_size=0.05, mask_p=0.2,
-    powerline_p=0.3, baseline_p=0.2,
+    scaling_sigma=0.03, scaling_p=0.15,
+    mask_size=0.04, mask_p=0.15,
+    powerline_p=0.25, baseline_p=0.25,
 ):
     return Compose([
         Jitter(sigma=jitter_sigma, p=jitter_p),
         Scaling(sigma=scaling_sigma, p=scaling_p),
-        TimeShift(max_shift_samples=timeshift_max, p=timeshift_p),
-        TimeWarp(sigma=timewarp_sigma, knots=timewarp_knots, p=timewarp_p),
-        RandomChoice([
-            RandomCrop(crop_size=crop_size, p=crop_p),
-            RandomMasking(mask_size=mask_size, p=mask_p)
-        ]),
+        RandomMasking(mask_size=mask_size, p=mask_p),
         PowerlineNoise(p=powerline_p),
         BaselineWander(p=baseline_p),
     ])
-
 
 # =============================
 # Tests
@@ -299,50 +286,30 @@ def test_single_pipeline(pipeline, signal, signal_name, savepath):
 def test_augmentations():
     # --- Read Signals ---
     
-    # Pick the first 10 seconds at 125hz of the first segenet
-    ppg = torch.tensor(np.load('/data/users/mgaspari/data/raw_mimic_iii/ecg/p000188_ecg.npy')[0, :1250])
-    ecg = torch.tensor(np.load('/data/users/mgaspari/data/raw_mimic_iii/ppg/p000188_ppg.npy')[0, :1250])
+    # Pick the first 10 seconds at 125hz of the first segement
+    ppg = torch.tensor(np.load('/data/users/mgaspari/data/raw_mimic_iii/ppg/p000188_ppg.npy')[0, :1250])
+    ecg = torch.tensor(np.load('/data/users/mgaspari/data/raw_mimic_iii/ecg/p000188_ecg.npy')[0, :1250])
     fs = 125
     
-    # --- Init. augmentations ---
-    jitter = Jitter(sigma=0.02, p=1.0)
-    scaling = Scaling(sigma=0.05, p=1.0)
-    time_shift = TimeShift(max_shift_samples=10, p=1.0)
-    time_warp = TimeWarp(sigma=0.05, knots=4, p=1.0)
-    random_crop = RandomCrop(crop_size=0.8, p=1.0)
-    random_masking = RandomMasking(mask_size=0.1, p=1.0)
-    power_line_noise = PowerlineNoise(amplitude_range=(0.01, 0.05), freq= 50.0, sampling_rate=fs, p=1.0)
-    baseline_wander = BaselineWander(amplitude_range=(0.05, 0.15), freq_range=(1.0, 2.0), sampling_rate=125.0, p=1.0)
-    random_choice = RandomChoice([RandomCrop(crop_size=0.8, p=0.2), RandomMasking(mask_size=0.1, p=0.2)])
     ppg_compose = get_ppg_augmentations()
     ecg_compose = get_ecg_augmentations()
     
-    ppg_jitter = jitter(ppg.clone())
-    ecg_jitter = jitter(ecg.clone())
+    # Test PPG/ECG augemntations
     
-    ppg_scaling = scaling(ppg.clone())
-    ecg_scaling = scaling(ecg.clone())
-
-    ppg_time_shift = time_shift(ppg.clone())
-    ecg_time_shift = time_shift(ecg.clone())
-
-    ppg_time_warp = time_warp(ppg.clone())
-    ecg_time_warp = time_warp(ecg.clone())
-
-    ppg_random_crop = random_crop(ppg.clone())
-    ecg_random_crop = random_crop(ecg.clone())
-
-    ppg_random_masking = random_masking(ppg.clone())
-    ecg_random_masking = random_masking(ecg.clone())
-
-    ppg_power_line_noise = power_line_noise(ppg.clone())
-    ecg_power_line_noise = power_line_noise(ecg.clone())
-
-    ppg_baseline_wander = baseline_wander(ppg.clone())
-    ecg_baseline_wander = baseline_wander(ecg.clone())
+    ppg_jitter = Jitter(sigma=0.01, p=1.0)(ppg.clone())
+    ecg_jitter = Jitter(sigma=0.005, p=1.0)(ecg.clone())
     
-    ppg_random_choice_aug = random_choice(ppg.clone())
-    ecg_random_choice_aug = random_choice(ecg.clone())
+    ppg_scaling = Scaling(sigma=0.03, p=1.0)(ppg.clone())
+    ecg_scaling = Scaling(sigma=0.015, p=1.0)(ecg.clone())
+
+    ppg_random_masking = RandomMasking(mask_size=0.04, p=1.0)(ppg.clone())
+    ecg_random_masking = RandomMasking(mask_size=0.025, p=1.0)(ecg.clone())
+
+    ppg_power_line_noise = PowerlineNoise(p=1.0)(ppg.clone())
+    ecg_power_line_noise = PowerlineNoise(p=1.0)(ecg.clone())
+
+    ppg_baseline_wander = BaselineWander(p=1.0)(ppg.clone())
+    ecg_baseline_wander = BaselineWander(p=1.0)(ecg.clone())
     
     ppg_compose_aug = ppg_compose(ppg.clone())
     ecg_compose_aug = ecg_compose(ecg.clone())
@@ -353,15 +320,6 @@ def test_augmentations():
     plot_compare(signal=ppg, aug_signal=ppg_scaling, title='PPG Scaling', savepath='./')
     plot_compare(signal=ecg, aug_signal=ecg_scaling, title='ECG Scaling', savepath='./')
 
-    plot_compare(signal=ppg, aug_signal=ppg_time_shift, title='PPG Time Shift', savepath='./')
-    plot_compare(signal=ecg, aug_signal=ecg_time_shift, title='ECG Time Shift', savepath='./')
-
-    plot_compare(signal=ppg, aug_signal=ppg_time_warp, title='PPG Time Warp', savepath='./')
-    plot_compare(signal=ecg, aug_signal=ecg_time_warp, title='ECG Time Warp', savepath='./')
-
-    plot_compare(signal=ppg, aug_signal=ppg_random_crop, title='PPG Random Crop', savepath='./')
-    plot_compare(signal=ecg, aug_signal=ecg_random_crop, title='ECG Random Crop', savepath='./')
-
     plot_compare(signal=ppg, aug_signal=ppg_random_masking, title='PPG Random Masking', savepath='./')
     plot_compare(signal=ecg, aug_signal=ecg_random_masking, title='ECG Random Masking', savepath='./')
     
@@ -371,9 +329,6 @@ def test_augmentations():
     plot_compare(signal=ppg, aug_signal=ppg_baseline_wander, title='PPG Baseline Wander', savepath='./')
     plot_compare(signal=ecg, aug_signal=ecg_baseline_wander, title='ECG Baseline Wander', savepath='./')
     
-    plot_compare(signal=ppg, aug_signal=ppg_random_choice_aug, title='PPG Random Choice Augmentation', savepath='./')
-    plot_compare(signal=ecg, aug_signal=ecg_random_choice_aug, title='ECG Random Choice Augmentation', savepath='./')
-
     plot_compare(signal=ppg, aug_signal=ppg_compose_aug, title='PPG Compose Augmentation', savepath='./')
     plot_compare(signal=ecg, aug_signal=ecg_compose_aug, title='ECG Compose Augmentation', savepath='./')
     

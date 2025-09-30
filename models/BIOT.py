@@ -244,7 +244,7 @@ class BIOT(nn.Module):
             n_fft=n_fft,
             hop_length=hop_length
         )
-
+        
         if pretrained_path:
             ckpt = torch.load(pretrained_path, map_location='cpu')
             if 'encoder' in ckpt:
@@ -306,8 +306,8 @@ def parseargs():
     parser.add_argument('--num_heads', default=8, type=int, help='number of attention heads')
     parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of encoder layers')
     parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
-    parser.add_argument('--n_fft', default=256, type=int, help='fft window size for spectral embedding')
-    parser.add_argument('--hop_length', default=32, type=int, help='hop length for STFT')
+    parser.add_argument('--n_fft', default=200, type=int, help='fft window size for spectral embedding')
+    parser.add_argument('--hop_length', default=100, type=int, help='hop length for STFT')
     parser.add_argument('--pretrained_encoder_ckpt_path', default='', type=str, help='path to pretrained encoder weights')
     
     return parser.parse_args()
