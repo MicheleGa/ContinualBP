@@ -7,4 +7,4 @@
 #python dataset.py --name mimic_iii_pulse_db --fs 125 --input_seq_len_s 10 --ecg True --sig2sig False --plot True --mix_pretraining_subject_samples False --loader_worker 10
 
 # Vital DB Preprocessing
-python online_dataset.py --name vital_db_pulse_db --ecg False --sig2sig True --input_seq_len_s 10 --fs 125 --plot True --min_run_length 128 --batch_size 32 --plot True
+python online_dataset.py --name vital_db_pulse_db --ecg False --sig2sig True --input_seq_len_s 10 --fs 125 --plot True --min_run_length 128 --batch_size 16 --plot True
