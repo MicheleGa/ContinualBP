@@ -1,0 +1,31 @@
+nohup: ignoring input
+
+7-Zip (z) 21.07 (x64) : Copyright (c) 1999-2021 Igor Pavlov : 2021-12-26
+ 64-bit locale=C.UTF-8 Threads:56
+
+Scanning the drive for archives:
+1 file, 15728640000 bytes (15 GiB)
+
+Extracting archive: PulseDB_Vital.zip.001
+--
+Path = PulseDB_Vital.zip.001
+Type = Split
+Physical Size = 15728640000
+Volumes = 10
+Total Physical Size = 143057571157
+----
+Path = PulseDB_Vital.zip
+Size = 143057571157
+--
+Path = PulseDB_Vital.zip
+Type = zip
+Physical Size = 143057571157
+64-bit = +
+Characteristics = Zip64
+
+Everything is Ok
+
+Folders: 1
+Files: 2938
+Size:       177150233108
+Compressed: 143057571157

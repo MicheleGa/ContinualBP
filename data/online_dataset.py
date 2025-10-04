@@ -398,6 +398,7 @@ def parseargs():
     parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--save_run', default='False', type=lambda x: bool(strtobool(x)), help='whether to save a specific subject run to a pickle dict or not')
     parser.add_argument('--batch_size', default=32, type=int, help='batch size')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
@@ -425,10 +426,21 @@ if __name__ == "__main__":
         savepath=root_figs_folder
     )
     
-    # Sucjet id notixe that subjects with insufficient runs have been removed
-    subject_id = random.choice(list(online_physio_dataset.index_by_subject_id))
+    # Notice that at this point subjects with insufficient runs have been removed
+    subject_id = online_physio_dataset.subjects_for_personalization[1] # random.choice(list(online_physio_dataset.index_by_subject_id))
     print(f"Subject selected {subject_id}")
     
+    if args.save_run:
+        import pickle
+        runs = online_physio_dataset.get_subject_runs(subject_id, window_length=args.input_seq_len_s, adapt_size=args.batch_size, val_size=args.batch_size, min_block_length=args.min_run_length)
+    
+        # Save the list of dictionaries, namely runs
+        with open(f"../notebooks/data/{subject_id}_runs.pkl", "wb") as f:
+            pickle.dump(runs, f)
+            
+        print(f"Saved {subject_id} runs to ../notebooks/data/{subject_id}_runs.pkl, exiting")
+        exit()
+
     # Compute runs first
     all_runs = []
     for subj in online_physio_dataset.subjects_for_personalization:

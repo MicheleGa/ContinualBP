@@ -867,7 +867,152 @@ def plot_subject_annotation_runs(dataset, subject_id, blocks, savepath="subject_
     plt.tight_layout()
     
     # Save the figure
-    plt.savefig(savepath)
+    if not show_bp_plot:
+        plt.savefig(savepath)
+    else:
+        plt.show()
+    plt.close()
+
+
+def plot_subject_annotation_runs_from_files(
+    data,
+    runs,
+    subject_id="p001326",
+    savepath="subject_annotation_plots.jpg",
+    show_bp_plot=False
+):
+    """
+    Plot annotation statistics for a subject using pre-extracted data and run definitions.
+
+    Parameters
+    ----------
+    data : np.lib.npyio.NpzFile
+        Loaded data for a single subject (as from np.load(samples_path, allow_pickle=True)).
+        Must contain 'idxs', 'sbps', 'dbps', 'maps'.
+    runs : list of dict
+        Each dict contains 'train' and 'test' sample IDs, 'r_idx', and 'b_idx'.
+    subject_id : str
+        Subject identifier.
+    savepath : str
+        File path to save the figure.
+    show_bp_plot : bool, optional
+        If True, show the figure instead of saving. Default=False.
+    """
+
+    # === Helper function to extract annotations ===
+    def get_annotations(sample_ids):
+        sbp_values, dbp_values, map_values = [], [], []
+        for sid in sample_ids:
+            # Find index of this sample in data['idxs']
+            idx_arr = np.where(data['idxs'] == sid)[0]
+            if len(idx_arr) == 0:
+                print(f"Warning: sample {sid} not found in data['idxs']")
+                continue
+            idx = int(idx_arr[0])
+            sbp_values.append(float(data['sbps'][idx]))
+            dbp_values.append(float(data['dbps'][idx]))
+            map_values.append(float(data['maps'][idx]))
+        return sbp_values, dbp_values, map_values
+
+    # === Collect all data into lists for DataFrame ===
+    run_idxs_list, block_list, set_list = [], [], []
+    sbp_list, dbp_list, map_list, window_indices = [], [], [], []
+
+    for block in runs:
+        # Training
+        train_sbp, train_dbp, train_map = get_annotations(block["train"])
+        train_indices = [
+            int(np.where(data['idxs'] == sid)[0][0])
+            for sid in block["train"]
+            if sid in data['idxs']
+        ]
+
+        run_idxs_list.extend([block["r_idx"]] * len(train_sbp))
+        block_list.extend([block["b_idx"]] * len(train_sbp))
+        set_list.extend(["training"] * len(train_sbp))
+        sbp_list.extend(train_sbp)
+        dbp_list.extend(train_dbp)
+        map_list.extend(train_map)
+        window_indices.extend(train_indices)
+
+        # Testing
+        test_sbp, test_dbp, test_map = get_annotations(block["test"])
+        test_indices = [
+            int(np.where(data['idxs'] == sid)[0][0])
+            for sid in block["test"]
+            if sid in data['idxs']
+        ]
+
+        run_idxs_list.extend([block["r_idx"]] * len(test_sbp))
+        block_list.extend([block["b_idx"]] * len(test_sbp))
+        set_list.extend(["testing"] * len(test_sbp))
+        sbp_list.extend(test_sbp)
+        dbp_list.extend(test_dbp)
+        map_list.extend(test_map)
+        window_indices.extend(test_indices)
+
+    # === Build DataFrame ===
+    df = pd.DataFrame({
+        "window_index": window_indices,
+        "run_idx": run_idxs_list,
+        "block": block_list,
+        "set": set_list,
+        "sbp": sbp_list,
+        "dbp": dbp_list,
+        "map": map_list,
+    }).sort_values(by="window_index").reset_index(drop=True)
+
+    # === Create the plots ===
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(f"Subject {subject_id} - Annotation Statistics", fontsize=14, fontweight="bold")
+
+    # Subplot 1 — Window index vs Block number (by Run)
+    ax1 = axes[0]
+    unique_runs = df["run_idx"].unique()
+    colors_runs = plt.cm.tab10(np.linspace(0, 1, len(unique_runs)))
+    for i, run_idx in enumerate(unique_runs):
+        run_data = df[df["run_idx"] == run_idx]
+        ax1.scatter(
+            run_data["window_index"], run_data["block"],
+            c=[colors_runs[i]], label=f"Run {run_idx}", alpha=0.7, s=30
+        )
+    ax1.set_ylabel("Block Number")
+    ax1.set_title("Window Index vs Block Number")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    # Subplot 2 — Training vs Testing
+    ax2 = axes[1]
+    adaptation_data = df[df["set"] == "training"]
+    validation_data = df[df["set"] == "testing"]
+    ax2.scatter(adaptation_data["window_index"], np.ones(len(adaptation_data)), c="red", label="Training", alpha=0.7, s=30)
+    ax2.scatter(validation_data["window_index"], np.ones(len(validation_data))*2, c="blue", label="Testing", alpha=0.7, s=30)
+    ax2.set_yticks([1, 2])
+    ax2.set_yticklabels(["Training", "Testing"])
+    ax2.set_ylabel("Set Type")
+    ax2.set_title("Window Index vs Set Type")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    # Subplot 3 — SBP/DBP/MAP
+    ax3 = axes[2]
+    ax3.plot(df["window_index"], df["sbp"], "o-", color="red", label="SBP", alpha=0.7, markersize=4, linewidth=1)
+    ax3.plot(df["window_index"], df["dbp"], "o-", color="blue", label="DBP", alpha=0.7, markersize=4, linewidth=1)
+    ax3.plot(df["window_index"], df["map"], "o-", color="green", label="MAP", alpha=0.7, markersize=4, linewidth=1)
+    ax3.set_ylabel("Blood Pressure (mmHg)")
+    ax3.set_xlabel("Window Index")
+    ax3.set_title("Window Index vs Blood Pressure Values")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    plt.tight_layout()
+
+    # Save or show
+    if show_bp_plot:
+        plt.show()
+    else:
+        plt.savefig(savepath, bbox_inches="tight")
+        print(f"Saved plot to {savepath}")
     plt.close()
 
 
