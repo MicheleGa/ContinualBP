@@ -58,14 +58,16 @@ def parseargs():
     # Personalization Setup
     parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
     parser.add_argument('--pretraining_feats_stats', default=None, type=str, help='path to the features statistics during pretraining')
-    parser.add_argument('--min_run_length', default=10, type=float, help='number of samples to take for trainng and testing personalization must be greater than training_samples')
+    parser.add_argument('--min_run_length', default=128, type=float, help='number of samples to take for trainng and testing personalization must be greater than training_samples')
     parser.add_argument('--num_personalization_subjects', default=100, type=int, help='number of subjects to for personalization')
-    parser.add_argument('--personalization_steps', default=5, type=int, help='number of gradient steps for personalization')
-    parser.add_argument('--personalization_lr', default=5e-3, type=float, help='learning rate for personalization')
+    parser.add_argument('--personalization_steps', default=8, type=int, help='number of gradient steps for personalization')
+    parser.add_argument('--personalization_lr', default=1e-2, type=float, help='learning rate for personalization')
     parser.add_argument('--plot_personalization', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot the subject annotation over the total windows or not')
-    parser.add_argument('--personalization_batch_size', default=32, type=int, help='batch size for personalization')
+    parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size for personalization')
     parser.add_argument('--setup_type', default='drift', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
-
+    parser.add_argument('--replay_buffer_size', default=256, type=int, help='maximum size of the feature replay buffer')
+    parser.add_argument('--replay_batch_size', default=16, type=int, help='batch size for feature replay')
+    
     # Pre-training Setup
     parser.add_argument('--pretrained_encoder_ckpt_path', default=None, type=str, help='optional checkpoint path for the encoder')
     parser.add_argument('--stage1_epochs', default=10, type=int, help='epochs training head only')
@@ -114,12 +116,13 @@ def parseargs():
     parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
     parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
     parser.add_argument('--embed_dim', default=256, type=int, help='embedding dimension')
+    parser.add_argument('--num_groups', default=8, type=int, help='number of groups for group normalization')
     parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
     parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of trasnformer layers')
     parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
-    parser.add_argument('--n_fft', default=200, type=int, help='STFT n_fft parameter')
-    parser.add_argument('--hop_length', default=100, type=int, help='STFT hop length parameter')
-    parser.add_argument('--num_groups', default=8, type=int, help='number of groups for group normalization')
+    parser.add_argument('--dropout', default=0.2, type=float)
+    parser.add_argument('--n_fft', default=200, type=int)
+    parser.add_argument('--hop_length', default=100, type=int)
 
     args = parser.parse_args()
     return args
@@ -327,7 +330,7 @@ def get_encoder_architecture(config):
             num_decoder_layers=config['num_decoder_layers'],
             n_fft=config['n_fft'],
             hop_length=config['hop_length'],
-            pretrained_path=config['pretrained_encoder_ckpt_path'],
+            pretrained_path=config['pretrained_encoder_ckpt_path']
         )
     else:
         raise ValueError("Invalid model name ...")
@@ -360,8 +363,9 @@ def get_prediction_head_architecture(config):
             output_dim=config['input_seq_len_s'] * config['fs'] if config['sig2sig'] else 3  # Full waveform or SBP/DBP/MAP
         )            
     elif config['model_name'] == 'BIOT':
+        total_input_channels = 2 if config['ecg'] else 1
         prediction_head = BIOT.BIOTPredictionHead(
-            embed_dim=config['embed_dim'],
+            embed_dim=config['embed_dim'] * total_input_channels,
             output_dim=config['input_seq_len_s'] * config['fs'] if config['sig2sig'] else 3  # Full waveform or SBP/DBP/MAP
         )
     else:

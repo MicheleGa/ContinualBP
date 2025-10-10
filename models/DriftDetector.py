@@ -8,7 +8,7 @@ class EmbeddingDriftDetector:
     - baseline_mean/std: established from initial run or a short calibration window.
     - trigger when L2 distance of current batch mean to baseline_mean > threshold * baseline_std_l2.
     """
-    def __init__(self, model, device, threshold=5.0):
+    def __init__(self, model, device, threshold=0.5):
         self.model = model.to(device)
         self.device = device
         self.threshold = threshold
@@ -48,12 +48,13 @@ class EmbeddingDriftDetector:
             raise ValueError(f"Failed to initialize baseline from {path}")
         
         print(f"[EmbeddingDriftDetector] Baseline initialized from {path}")
-        print(f"  mean shape: {self.baseline_mean.shape}, std shape: {self.baseline_std.shape}")
-        print(f"  baseline_std_l2: {self.baseline_std_l2:.4f}")
+        print(f"\tμ: {self.baseline_mean}, σ: {self.baseline_std}")
 
     def should_trigger(self, signals_batch):
         z = self._embed_batch(signals_batch)
         mean_z = np.mean(z, axis=0)
+        
         dist = np.linalg.norm(mean_z - self.baseline_mean)
-        scaled = dist / (self.baseline_std_l2 + np.finfo.eps)
+        scaled = dist / (self.baseline_std_l2 + np.finfo(np.float32).eps )
+        
         return scaled > self.threshold, float(scaled)

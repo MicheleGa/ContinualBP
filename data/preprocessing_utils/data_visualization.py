@@ -874,148 +874,6 @@ def plot_subject_annotation_runs(dataset, subject_id, blocks, savepath="subject_
     plt.close()
 
 
-def plot_subject_annotation_runs_from_files(
-    data,
-    runs,
-    subject_id="p001326",
-    savepath="subject_annotation_plots.jpg",
-    show_bp_plot=False
-):
-    """
-    Plot annotation statistics for a subject using pre-extracted data and run definitions.
-
-    Parameters
-    ----------
-    data : np.lib.npyio.NpzFile
-        Loaded data for a single subject (as from np.load(samples_path, allow_pickle=True)).
-        Must contain 'idxs', 'sbps', 'dbps', 'maps'.
-    runs : list of dict
-        Each dict contains 'train' and 'test' sample IDs, 'r_idx', and 'b_idx'.
-    subject_id : str
-        Subject identifier.
-    savepath : str
-        File path to save the figure.
-    show_bp_plot : bool, optional
-        If True, show the figure instead of saving. Default=False.
-    """
-
-    # === Helper function to extract annotations ===
-    def get_annotations(sample_ids):
-        sbp_values, dbp_values, map_values = [], [], []
-        for sid in sample_ids:
-            # Find index of this sample in data['idxs']
-            idx_arr = np.where(data['idxs'] == sid)[0]
-            if len(idx_arr) == 0:
-                print(f"Warning: sample {sid} not found in data['idxs']")
-                continue
-            idx = int(idx_arr[0])
-            sbp_values.append(float(data['sbps'][idx]))
-            dbp_values.append(float(data['dbps'][idx]))
-            map_values.append(float(data['maps'][idx]))
-        return sbp_values, dbp_values, map_values
-
-    # === Collect all data into lists for DataFrame ===
-    run_idxs_list, block_list, set_list = [], [], []
-    sbp_list, dbp_list, map_list, window_indices = [], [], [], []
-
-    for block in runs:
-        # Training
-        train_sbp, train_dbp, train_map = get_annotations(block["train"])
-        train_indices = [
-            int(np.where(data['idxs'] == sid)[0][0])
-            for sid in block["train"]
-            if sid in data['idxs']
-        ]
-
-        run_idxs_list.extend([block["r_idx"]] * len(train_sbp))
-        block_list.extend([block["b_idx"]] * len(train_sbp))
-        set_list.extend(["training"] * len(train_sbp))
-        sbp_list.extend(train_sbp)
-        dbp_list.extend(train_dbp)
-        map_list.extend(train_map)
-        window_indices.extend(train_indices)
-
-        # Testing
-        test_sbp, test_dbp, test_map = get_annotations(block["test"])
-        test_indices = [
-            int(np.where(data['idxs'] == sid)[0][0])
-            for sid in block["test"]
-            if sid in data['idxs']
-        ]
-
-        run_idxs_list.extend([block["r_idx"]] * len(test_sbp))
-        block_list.extend([block["b_idx"]] * len(test_sbp))
-        set_list.extend(["testing"] * len(test_sbp))
-        sbp_list.extend(test_sbp)
-        dbp_list.extend(test_dbp)
-        map_list.extend(test_map)
-        window_indices.extend(test_indices)
-
-    # === Build DataFrame ===
-    df = pd.DataFrame({
-        "window_index": window_indices,
-        "run_idx": run_idxs_list,
-        "block": block_list,
-        "set": set_list,
-        "sbp": sbp_list,
-        "dbp": dbp_list,
-        "map": map_list,
-    }).sort_values(by="window_index").reset_index(drop=True)
-
-    # === Create the plots ===
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    fig.suptitle(f"Subject {subject_id} - Annotation Statistics", fontsize=14, fontweight="bold")
-
-    # Subplot 1 — Window index vs Block number (by Run)
-    ax1 = axes[0]
-    unique_runs = df["run_idx"].unique()
-    colors_runs = plt.cm.tab10(np.linspace(0, 1, len(unique_runs)))
-    for i, run_idx in enumerate(unique_runs):
-        run_data = df[df["run_idx"] == run_idx]
-        ax1.scatter(
-            run_data["window_index"], run_data["block"],
-            c=[colors_runs[i]], label=f"Run {run_idx}", alpha=0.7, s=30
-        )
-    ax1.set_ylabel("Block Number")
-    ax1.set_title("Window Index vs Block Number")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-
-    # Subplot 2 — Training vs Testing
-    ax2 = axes[1]
-    adaptation_data = df[df["set"] == "training"]
-    validation_data = df[df["set"] == "testing"]
-    ax2.scatter(adaptation_data["window_index"], np.ones(len(adaptation_data)), c="red", label="Training", alpha=0.7, s=30)
-    ax2.scatter(validation_data["window_index"], np.ones(len(validation_data))*2, c="blue", label="Testing", alpha=0.7, s=30)
-    ax2.set_yticks([1, 2])
-    ax2.set_yticklabels(["Training", "Testing"])
-    ax2.set_ylabel("Set Type")
-    ax2.set_title("Window Index vs Set Type")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-
-    # Subplot 3 — SBP/DBP/MAP
-    ax3 = axes[2]
-    ax3.plot(df["window_index"], df["sbp"], "o-", color="red", label="SBP", alpha=0.7, markersize=4, linewidth=1)
-    ax3.plot(df["window_index"], df["dbp"], "o-", color="blue", label="DBP", alpha=0.7, markersize=4, linewidth=1)
-    ax3.plot(df["window_index"], df["map"], "o-", color="green", label="MAP", alpha=0.7, markersize=4, linewidth=1)
-    ax3.set_ylabel("Blood Pressure (mmHg)")
-    ax3.set_xlabel("Window Index")
-    ax3.set_title("Window Index vs Blood Pressure Values")
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-
-    plt.tight_layout()
-
-    # Save or show
-    if show_bp_plot:
-        plt.show()
-    else:
-        plt.savefig(savepath, bbox_inches="tight")
-        print(f"Saved plot to {savepath}")
-    plt.close()
-
-
 def plot_run_length_statistics(dataset, savepath='./data_figs', keep_longest=False):
     r"""
     Plot statistics of run lengths across subjects.
@@ -1075,3 +933,110 @@ def plot_run_length_statistics(dataset, savepath='./data_figs', keep_longest=Fal
     plt.savefig(os.path.join(savepath, "run_length_boxplot.png"))
     
     return run_lengths_by_subject
+
+
+def plot_blockwise_mae(per_block_stats, subject_id, savepath=None):
+    """
+    Plot MAE with errorbars per baseline for a subject.
+    This function is intentionally standalone so you can move it to data_visualization.py
+    Expected input format: per_block_stats is a dict mapping baseline -> {'mae': list, 'std': list}
+    """
+    blocks = len(next(iter(per_block_stats.values()))['mae'])
+    x = np.arange(1, blocks + 1)
+    plt.figure(figsize=(12,8))
+    for b in per_block_stats.keys():
+        mae_arr = per_block_stats[b]['mae']
+        std_arr = per_block_stats[b]['std']
+        mae_plot = np.array([np.nan if v is None else v for v in mae_arr])
+        std_plot = np.array([np.nan if v is None else v for v in std_arr])
+        plt.errorbar(x, mae_plot, yerr=std_plot, label=b, marker='o')
+    plt.xlabel('Block index (chronological)')
+    plt.ylabel('MAE (with STD errorbars)')
+    plt.title(f'Subject {subject_id} - Blockwise test MAE per baseline')
+    plt.legend()
+    plt.tight_layout()
+    if savepath is not None:
+        plt.savefig(savepath)
+        plt.close()
+    else:
+        plt.show()
+        
+        
+def plot_age_gender_distribution(valid_subjects, index_file_path, savepath="./figs"):
+    r"""
+    Function description
+    --------------------
+    This function plots and saves two visualizations for the valid subjects:
+    (1) An age distribution histogram.
+    (2) A gender distribution donut chart.
+    The figure is saved to the specified savepath folder.
+
+    Parameters
+    ------------
+    valid_subjects : list
+        List of valid subject IDs to include in the visualization.
+
+    index_file_path : str
+        Path to the CSV file containing subject metadata with columns:
+        ['subject_id', 'age', 'gender'], where 'gender' is encoded as
+        0 for female and 1 for male.
+
+    savepath : str, optional
+        Root folder where the figure will be saved. Defaults to "./figs".
+
+    Returns
+    ------------
+    None
+    """
+
+    # Load index file
+    df = pd.read_csv(index_file_path)
+
+    # Filter for valid subjects
+    valid_df = df[df['subject_id'].isin(valid_subjects)]
+
+    # Prepare figure
+    plt.figure(figsize=(12, 5))
+    pastel_blue = '#AEC6CF'
+    pastel_pink = '#FFD1DC'
+    
+    # --- AGE DISTRIBUTION HISTOGRAM ---
+    plt.subplot(1, 2, 1)
+    n_bins = 10
+    plt.hist(valid_df['age'], bins=n_bins, color=pastel_blue, edgecolor='gray', alpha=0.85)
+    plt.xlabel('Age')
+    plt.ylabel('Number of Subjects')
+    plt.title('Dataset Subjects Age Distribution')
+    plt.grid(alpha=0.3, linestyle='--')
+
+    # --- GENDER DISTRIBUTION (DONUT PLOT) ---
+    plt.subplot(1, 2, 2)
+    gender_counts = valid_df['gender'].value_counts().sort_index()
+    labels = ['Female', 'Male']
+    sizes = [gender_counts.get(0, 0), gender_counts.get(1, 0)]
+    colors = [pastel_pink, pastel_blue]
+
+    wedges, texts, autotexts = plt.pie(
+        sizes,
+        labels=labels,
+        autopct='%1.1f%%',
+        startangle=90,
+        colors=colors,
+        textprops={'color': 'black'}
+    )
+
+    # Donut hole
+    centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+    fig = plt.gcf()
+    fig.gca().add_artist(centre_circle)
+
+    plt.title('Dataset Subjects Gender Distribution')
+    plt.axis('equal')
+
+    plt.tight_layout()
+
+    # Save figure
+    filename = "age_gender_distribution.png"
+    save_file = os.path.join(savepath, filename)
+    plt.savefig(save_file, dpi=300, bbox_inches='tight')
+    plt.close()

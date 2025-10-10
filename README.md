@@ -171,7 +171,7 @@ conda create -n ps_dnn python=3.9.0
 conda activate ps_dnn
 conda install numpy matplotlib scikit-learn seaborn pandas markdown tensorboard
 conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
-pip install netron thop torchinfo pyCompare lmdb pyampd wfdb==4.0.0 linear_attention_transformer
+pip install netron thop torchinfo pyCompare lmdb pyampd wfdb==4.0.0 linear_attention_transformer mat73 transformers 
 conda install -c conda-forge emd-signal
 conda install -c conda-forge pywavelets
 conda install lightning -c conda-forge
@@ -186,7 +186,7 @@ source ./venv/bin/activate
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 pip install numpy==1.24.3 matplotlib==3.9.2 scikit-learn==1.6.1 seaborn==0.13.2 pandas==1.5.3 markdown==3.4.1 tensorboard==2.17.0
 pip install netron==8.1.5 thop torchinfo==1.8.0 pyCompare lmdb pyampd wfdb==4.0.0 
-pip install PyWavelets==1.5.0 EMD-signal==1.6.4 lightning einops linear_attention_transformer mat73
+pip install PyWavelets==1.5.0 EMD-signal==1.6.4 lightning einops linear_attention_transformer mat73 transformers  
 ```
 
 ## Data Provisioning & Preprocessing

@@ -54,15 +54,13 @@ class MetaTaskDataset(Dataset):
         base_dataset: PhysioDataset,
         patient_ids: List[str],
         k_support: int = 8,
-        k_query: int = 8,
-        allow_replacement: bool = False
+        k_query: int = 8
     ):
         super().__init__()
         self.ds = base_dataset
         self.patient_ids = list(patient_ids)
         self.k_support = k_support
         self.k_query = k_query
-        self.allow_replacement = allow_replacement
         self.rng = np.random.default_rng(base_dataset.seed)
 
         # Patient → list of sample_ids
@@ -78,15 +76,9 @@ class MetaTaskDataset(Dataset):
         - Query: k_query random sample_ids (disjoint from support)
         """
         sample_ids = list(self.index_by_subject_id[pid])
-        n_total = len(sample_ids)
         total_needed = self.k_support + self.k_query
 
-        if self.allow_replacement or total_needed > n_total:
-            # Fallback: sample with replacement
-            chosen = self.rng.choice(sample_ids, size=total_needed, replace=True)
-            return list(chosen[:self.k_support]), list(chosen[self.k_support:])
-
-        # Sample without replacement: disjoint sets
+        # Sample support and query sets as disjoint sets
         chosen = self.rng.choice(sample_ids, size=total_needed, replace=False)
         support_ids = list(chosen[:self.k_support])
         query_ids   = list(chosen[self.k_support:])
@@ -164,22 +156,19 @@ def build_meta_splits_and_loaders(
         base_dataset=base_ds,
         patient_ids=train_ids,
         k_support=k_support,
-        k_query=k_query,
-        allow_replacement=False
+        k_query=k_query
     )
     meta_val_ds = MetaTaskDataset(
         base_dataset=base_ds,
         patient_ids=val_ids,
         k_support=k_support,
-        k_query=k_query,
-        allow_replacement=False
+        k_query=k_query
     )
     meta_test_ds = MetaTaskDataset(
         base_dataset=base_ds,
         patient_ids=test_ids,
         k_support=k_support,
-        k_query=k_query,
-        allow_replacement=False
+        k_query=k_query
     )
 
     # 4) DataLoaders: each batch = 1 task (support, query, pid).
@@ -218,7 +207,7 @@ def parseargs():
     parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
     parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
     parser.add_argument('--k_support', type=int, default=16, help='meta-learning support set size')
-    parser.add_argument('--k_query', type=int, default=32, help='meta-learning query set size')
+    parser.add_argument('--k_query', type=int, default=16, help='meta-learning query set size')
     parser.add_argument('--meta_batch_size', type=int, default=4, help='meta batch size')
     parser.add_argument('--workers', type=int, default=2, help='parallel data loaders')
     

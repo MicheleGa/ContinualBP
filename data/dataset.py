@@ -4,19 +4,19 @@ from distutils.util import strtobool
 import pickle
 import pprint
 import numpy as np
+import pandas as pd
 import random
 import sys
 import lmdb
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.sampler import SubsetRandomSampler, BatchSampler
+from torch.utils.data.sampler import SubsetRandomSampler
 from sklearn.model_selection import train_test_split
 from preprocessing_utils.data_visualization import (
-    plot_signals, plot_subject_sample_distribution, plot_augmented_views,
+    plot_signals, plot_subject_sample_distribution, plot_age_gender_distribution,
     plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std,     
 )
 from preprocessing_utils.split import split_train_val_test
-from preprocessing_utils.augmentations import get_ppg_augmentations, get_ecg_augmentations, ContrastiveTransformations
 
 
 class PhysioDataset(Dataset):
@@ -244,7 +244,7 @@ class PhysioDataset(Dataset):
         # ------------------------------------------
         ppg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ppg".encode()), dtype="float32"))
         ecg = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-ecg".encode()), dtype="float32"))
-
+       
         if self.ecg:
             # Shape: [time, 2]  (PPG, ECG)
             sig = np.stack((ppg, ecg), axis=-1)
@@ -411,10 +411,11 @@ def test_sampler_determinism(args):
 def parseargs():
     parser = argparse.ArgumentParser(description="Dataset overview")
 
+    parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--dataset_folder', default='./lmdb', type=str, help='path to the dataset to analyze')
     parser.add_argument('--name', default='test', type=str, help='name of the processed dataset')
-    parser.add_argument('--save_path', default='./data_figs', type=str, help='where to save graphs from dataset analysis')
-    parser.add_argument('--seed', default=42, type=int, help='random seed')
+    parser.add_argument('--figs_folder', default='./data_figs', type=str, help='where to save graphs from dataset analysis')
+    parser.add_argument('--index_file_name', default='', type=str, help='name of the dataset index file')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds')
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.1,0.2', type=str, help='ratio for train, validation, and test split, comma separated')
@@ -434,7 +435,7 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()  
     
-    root_figs_folder = os.path.join(args.save_path, args.name) 
+    root_figs_folder = os.path.join(args.figs_folder, args.name) 
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
     
@@ -462,20 +463,6 @@ if __name__ == "__main__":
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     
-    if args.mix_pretraining_subject_samples:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-            sig2sig=args.sig2sig,
-            savepath=root_figs_folder
-            ) 
-    else:
-        calculate_dataloaders_mean_std(
-            dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
-            dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-            sig2sig=args.sig2sig,
-            savepath=root_figs_folder
-            )
 
     input_batch = next(iter(train_dataloader))
     sig = input_batch[0]
@@ -493,47 +480,69 @@ if __name__ == "__main__":
         sbp_val = annotation[idx, 0].squeeze().numpy()
         dbp_val = annotation[idx, 1].squeeze().numpy()
         map_val = annotation[idx, 2].squeeze().numpy()
-
-    # Note that the train_dataloader will already return the required signals specified by the conditions
-    if args.ecg:
         
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ECG', 'ABP'], 
-                title=f'Input: PPG + ECG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV', 'mmHg']
-            )
+    if args.plot:     
+        if args.index_file_name != '':
+            print(f'Plot age and gender distribution of valid subjects from {args.index_file_name}')
+            plot_age_gender_distribution(dataset.subjects_for_pretraining, args.index_file_name, savepath=root_figs_folder)
         else:
-            plot_signals(
-                sig[idx, :, :].T, fs=args.fs, 
-                labels=['PPG', 'ECG'], 
-                title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mV']
-                )
+            print('No index file provided...')
             
-    else:
-        
-        if args.sig2sig:
-            sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
-            plot_signals(
-                sigs.T, 
-                fs=args.fs, 
-                labels=['PPG', 'ABP'], 
-                title=f'Input: PPG, Output: ABP', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.', 'mmHg']
-            )
+        if args.mix_pretraining_subject_samples:
+            calculate_dataloaders_mean_std(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+                sig2sig=args.sig2sig,
+                savepath=root_figs_folder
+                ) 
         else:
-            plot_signals(
-                sig[idx, :, :].T, 
-                fs=args.fs,
-                labels=['PPG'], 
-                title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
-                savepath=root_figs_folder, 
-                ylabels=['a.u.']
+            calculate_dataloaders_mean_std(
+                dataloaders=[train_dataloader, valid_dataloader, test_dataloader], 
+                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
+                sig2sig=args.sig2sig,
+                savepath=root_figs_folder
                 )
+
+        # Note that the train_dataloader will already return the required signals specified by the conditions
+        if args.ecg:
+            
+            if args.sig2sig:
+                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+                plot_signals(
+                    sigs.T, 
+                    fs=args.fs, 
+                    labels=['PPG', 'ECG', 'ABP'], 
+                    title=f'Input: PPG + ECG, Output: ABP', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mV', 'mmHg']
+                )
+            else:
+                plot_signals(
+                    sig[idx, :, :].T, fs=args.fs, 
+                    labels=['PPG', 'ECG'], 
+                    title=f'Input: PPG + ECG, Output: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mV']
+                    )
+                
+        else:
+            
+            if args.sig2sig:
+                sigs = np.concatenate((sig, abp[:, np.newaxis]), axis=1)
+                plot_signals(
+                    sigs.T, 
+                    fs=args.fs, 
+                    labels=['PPG', 'ABP'], 
+                    title=f'Input: PPG, Output: ABP', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.', 'mmHg']
+                )
+            else:
+                plot_signals(
+                    sig[idx, :, :].T, 
+                    fs=args.fs,
+                    labels=['PPG'], 
+                    title=f'Input: PPG, Ouput: [SBP {sbp_val:.2f} - DBP {dbp_val:.2f} - MAP {map_val:.2f}]', 
+                    savepath=root_figs_folder, 
+                    ylabels=['a.u.']
+                    )

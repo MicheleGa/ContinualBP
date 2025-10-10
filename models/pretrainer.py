@@ -289,23 +289,11 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
     # Load best encoder
     encoder = get_encoder_architecture(config)
-    load_status(
-        subject_id=None, model_name=model_name + "_encoder", save_name=save_name, 
-        model=encoder, optimizer=None, scheduler=None, 
-        checkpoint_path=checkpoint_path, config=config
-    )
-    encoder.eval()
-    print(f"[Pretraining][MAML] Stage-1 encoder weights loaded ✅")
+    print(f"[Pretraining][MAML] Stage-1 encoder weights initialized ✅")
     
     # Load best prediction head
     prediction_head = get_prediction_head_architecture(config)
-    load_status(
-        subject_id=None, model_name=model_name + "_prediction_head", save_name=save_name, 
-        model=prediction_head, optimizer=None, scheduler=None, 
-        checkpoint_path=checkpoint_path, config=config
-    )
-    prediction_head.eval()
-    print(f"[Pretraining][MAML] Stage-1 prediction head weights loaded ✅")
+    print(f"[Pretraining][MAML] Stage-1 prediction head weights initialized ✅")
     
     # Create enhanced learner wrapper and move to device
     learner = MAMLLearner(encoder, prediction_head).to(device)
@@ -435,7 +423,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                         loss_s,
                         opt_params,
                         create_graph=False,
-                        retain_graph=True,
+                        retain_graph=False,
                         allow_unused=True
                     )
 
