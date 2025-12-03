@@ -6,9 +6,8 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 import multiprocessing
-from distutils.util import strtobool
 from preprocessing_utils.data_visualization import plot_signals
-from preprocessing_utils.signal_processing import percentile_normalize
+from preprocessing_utils.signal_processing import percentile_normalize, standardize, rescale_to_unit
 
 
 def process_subject(subject_info, args, result_queue=None, savepath=''):
@@ -30,8 +29,17 @@ def process_subject(subject_info, args, result_queue=None, savepath=''):
             ecg = data["signals"][segment_idx, 0, :]  # ECG
             ppg = data["signals"][segment_idx, 1, :]  # PPG
             
-            ecg = percentile_normalize(ecg, title=f'ECG Normalization for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
-            ppg = percentile_normalize(ppg, title=f'PPG Normalization for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+            if args.normalization == 'z_score':
+                ecg = standardize(ecg, title=f'ECG Z-score for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+                ppg = standardize(ppg, title=f'PPG Z-score for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+            elif args.normalization == 'min_max':
+                ecg = rescale_to_unit(ecg, title=f'ECG Min-max scaling for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+                ppg = rescale_to_unit(ppg, title=f'PPG Min-max scaling for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+            elif args.normalization == 'percentile':
+                ecg = percentile_normalize(ecg, title=f'ECG Percentile normalization for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+                ppg = percentile_normalize(ppg, title=f'PPG Percentile normalization for {subject_id} Segment {segment_idx}', plot=args.plot, savepath=savepath)
+            else:
+                raise ValueError(f"Unknown normalization method: {args.normalization}")
             
             sig = np.concatenate([ecg[np.newaxis, :], ppg[np.newaxis, :]], axis=0)
             abp = data["signals"][segment_idx, 2]  # ABP
@@ -161,8 +169,9 @@ def parseargs():
     parser.add_argument('--figs_folder', default='./data_figs', type=str, help='path to the figures folder')
     parser.add_argument('--index_file_name', default='./pulse_db/pulse_db_index.csv', type=str, help='name of the dataset index file')
     parser.add_argument('--name', default='mimic_iii_pulse_db', type=str, help='name of the processed dataset')
+    parser.add_argument('--normalization', default='percentile', type=str, choices=['percentile', 'min_max', 'z_score'], help='signal amplitude normalization method to use')
     parser.add_argument('--num_threads', default=5, type=int, help='number of parallel threads to use for processing')
-    parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='whether to plot intermediate preprocessing steps or not')
+    parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=False, help='whether to plot intermediate preprocessing steps or not')
     parser.add_argument('--fs', default=125, type=int, help='the sampling frequency')
     
     args = parser.parse_args()

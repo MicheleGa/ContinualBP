@@ -1,5 +1,4 @@
 import argparse
-from distutils.util import strtobool
 import math
 import numpy as np
 import torch
@@ -7,6 +6,7 @@ import torch.nn as nn
 from linear_attention_transformer import LinearAttentionTransformer
 from torchinfo import summary
 from thop import profile, clever_format
+from component_factory import BPRegressor, AttentionPool
 
 
 class PatchFrequencyEmbedding(nn.Module):
@@ -71,7 +71,7 @@ class BIOTEncoder(nn.Module):
 
         self.positional_encoding = PositionalEncoding(emb_size)
 
-        self.channel_tokens = nn.Embedding(n_channels, 256)
+        self.channel_tokens = nn.Embedding(n_channels, emb_size)
         self.index = nn.Parameter(
             torch.LongTensor(range(n_channels)), requires_grad=False
         )
@@ -112,64 +112,12 @@ class BIOTEncoder(nn.Module):
         emb = torch.cat(emb_seq, dim=1)
         emb = self.transformer(emb).mean(dim=1)
         return emb
-
-
-class BPWaveformDecoder(nn.Module):
-    def __init__(self, input_dim, output_dim, depth=4, heads=8):
-        super().__init__()
-        self.transformer = LinearAttentionTransformer(
-            dim=input_dim,
-            depth=depth,
-            heads=heads,
-            max_seq_len=1024,
-            attn_layer_dropout=0.2,
-            attn_dropout=0.2,
-        )
-        self.linear_out = nn.Linear(input_dim, output_dim)
-
-    def forward(self, x):
-        if x.dim() != 3:
-            raise ValueError(f"BPWaveformDecoder expected input dims 3, got {list(x.shape)}")
-        x = self.transformer(x)
-        x = x.mean(dim=1)
-        x = self.linear_out(x)
-        return x
-
-
-class BPRegressor(torch.nn.Module):
-    def __init__(self, input_dim, output_dim=3):
-        super().__init__()
-        self.regressor = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, input_dim),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(input_dim, input_dim // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(input_dim // 2, input_dim // 4),
-            torch.nn.ReLU(),
-            torch.nn.Linear(input_dim // 4, output_dim)
-        )
-
-    def forward(self, x):
-        if x.dim() != 3:
-            raise ValueError(f"BPRegressor expected input dims 3, got {list(x.shape)}")
-        return self.regressor(x.mean(dim=1))
-
-
-class BIOTPredictionHead(nn.Module):
-    def __init__(self, embed_dim, output_dim, use_quadratic=False):
-        super().__init__()
-        if output_dim == 3:
-            self.head = BPRegressor(input_dim=embed_dim, output_dim=output_dim)
-        else:
-            self.head = BPWaveformDecoder(input_dim=embed_dim, output_dim=output_dim, use_quadratic=use_quadratic)
-
-    def forward(self, x):
-        return self.head(x)
-
+    
 
 class BIOT(nn.Module):
+    r"""
+    Source: https://github.com/ycq091044/BIOT/blob/main/model/biot.py
+    """
     def __init__(self,
                  ecg=False,
                  fs=200,
@@ -203,7 +151,7 @@ class BIOT(nn.Module):
             hop_length=hop_length
         )
 
-        if pretrained_path:
+        if pretrained_path != '':
             ckpt = torch.load(pretrained_path, map_location='cpu')
             
             # If checkpoint has a nested encoder key
@@ -236,38 +184,27 @@ class BIOT(nn.Module):
         if (x.shape[1] != self.in_channels or x.shape[2] != self.input_seq_len):
             raise ValueError("The provided input tensor is not [B, C, T] and does not have the right T,C provided during initialization")
         
-        emb_seq = []
-        for i in range(x.shape[1]):
-            channel_spec_emb = self.encoder.stft(x[:, i:i+1, :])
-            channel_spec_emb = self.encoder.patch_embedding(channel_spec_emb)
-            batch_size, ts, _ = channel_spec_emb.shape
-
-            channel_token_emb = (
-                self.encoder.channel_tokens(self.encoder.index[i + n_channel_offset])
-                .unsqueeze(0).unsqueeze(0).repeat(batch_size, ts, 1)
-            )
-            channel_emb = self.encoder.positional_encoding(channel_spec_emb + channel_token_emb)
-            emb_seq.append(channel_emb)
-
-        emb = torch.cat(emb_seq, dim=1)
-        return self.encoder.transformer(emb)
-
+        return self.encoder(x)
+  
 
 def parseargs():
     parser = argparse.ArgumentParser(description="BIOT summary")
     
-    parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)))
-    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)))
-    parser.add_argument('--fs', default=125, type=int)
-    parser.add_argument('--input_seq_len_s', default=10, type=int)
-    parser.add_argument('--embed_dim', default=256, type=int)
-    parser.add_argument('--num_heads', default=8, type=int)
-    parser.add_argument('--num_encoder_layers', default=4, type=int)
-    parser.add_argument('--num_decoder_layers', default=4, type=int)
-    parser.add_argument('--n_fft', default=200, type=int)
-    parser.add_argument('--hop_length', default=100, type=int)
-    parser.add_argument('--pretrained_encoder_ckpt_path', default='', type=str)
+    parser.add_argument('--batch_size', default=128, type=int, help='batch size for training/inference (default: 128)')
+    parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='enable ECG signal processing mode')
+    parser.add_argument('--fs', default=125, type=int, help='sampling frequency in Hz (default: 125)')
+    parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds (default: 10)')
+    parser.add_argument('--embed_dim', default=256, type=int, help='embedding dimension (default: 256)')
+    parser.add_argument('--num_heads', default=8, type=int, help='number of attention heads (default: 8)')
+    parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of transformer encoder layers (default: 4)')
+    parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of transformer decoder layers (default: 4)')
+    parser.add_argument('--n_fft', default=200, type=int, help='FFT size for spectrogram computation (default: 200)')
+    parser.add_argument('--hop_length', default=100, type=int, help='hop length for spectrogram window (default: 100)')
+    parser.add_argument('--pretrained_encoder_ckpt_path', default='', type=str, help='path to pretrained encoder checkpoint (optional)')
+    parser.add_argument('--use_lora', action=argparse.BooleanOptionalAction, default=False, help='enable LoRA (Low-Rank Adaptation) fine-tuning')
+    parser.add_argument('--lora_r', default=8, type=int, help='LoRA rank parameter (default: 8)')
+    parser.add_argument('--lora_alpha', default=16, type=float, help='LoRA alpha scaling parameter (default: 16)')
+    parser.add_argument('--lora_dropout', default=0.1, type=float, help='LoRA dropout rate (default: 0.1)')
     
     return parser.parse_args()
 
@@ -275,35 +212,29 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()
 
-    model = BIOT(
-        ecg=args.ecg,
-        fs=args.fs,
-        input_seq_len_s=args.input_seq_len_s,
-        embed_dim=args.embed_dim,
-        num_heads=args.num_heads,
-        num_encoder_layers=args.num_encoder_layers,
-        num_decoder_layers=args.num_decoder_layers,
-        n_fft=args.n_fft,
+    encoder = BIOT(
+        ecg=args.ecg, 
+        fs=args.fs, 
+        input_seq_len_s=args.input_seq_len_s, 
+        embed_dim=args.embed_dim, 
+        num_heads=args.num_heads, 
+        num_encoder_layers=args.num_encoder_layers, 
+        num_decoder_layers=args.num_decoder_layers, 
+        n_fft=args.n_fft, 
         hop_length=args.hop_length,
         pretrained_path=args.pretrained_encoder_ckpt_path
-    )
-
-    total_input_channels = model.in_channels
-    input_data = torch.rand((args.batch_size, args.input_seq_len_s * args.fs, 2 if args.ecg else 1))
+        )
+    input_tensor = torch.rand((args.batch_size, args.input_seq_len_s * args.fs, 2 if args.ecg else 1))
     print("\n--- Model Encoder Summary ---")
-    summary(model, input_data=[input_data], 
-            col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
-    macs, num_params = profile(model, inputs=(input_data,))
+    summary(encoder, input_data=[input_tensor], col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
+    macs, num_params = profile(encoder, inputs=(input_tensor,))
     macs, num_params = clever_format([macs, num_params], "%.7f")
     print(f'BIOT Encoder has {num_params} params and {macs} MACs.')
-
-    feat_dim = model.embed_dim
-    output_dim = args.input_seq_len_s * args.fs if args.sig2sig else 3
-    bp_prediction_head = BIOTPredictionHead(feat_dim, output_dim)
-    feats = model(input_data)
+    
+    prediction_head = BPRegressor(args.embed_dim, 3)
+    input_tensor = torch.rand((args.batch_size, args.embed_dim))
     print("\n--- Model Prediction Head Summary ---")
-    summary(bp_prediction_head, input_data=[feats], 
-            col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
-    macs, num_params = profile(bp_prediction_head, inputs=(feats,))
+    summary(prediction_head, input_data=[input_tensor], col_names=("input_size", "output_size", "num_params", "params_percent", "mult_adds"))
+    macs, num_params = profile(prediction_head, inputs=(input_tensor,))
     macs, num_params = clever_format([macs, num_params], "%.7f")
     print(f'BIOT Prediction Head has {num_params} params and {macs} MACs.')

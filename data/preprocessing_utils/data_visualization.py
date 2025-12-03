@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import seaborn as sns
+import torch
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from preprocessing_utils.signal_processing import compute_sp_dp
 from preprocessing_utils.split import split_train_val_test_personalization
@@ -157,7 +158,7 @@ def _calculate_dataset_mean_std(sbp_values, dbp_values, map_values, name, savepa
         plt.close()
         
         
-def calculate_dataloaders_mean_std(dataloaders, dataloaders_names, sig2sig, savepath=f'./figs/dataset'):
+def calculate_dataloaders_mean_std(dataloaders, dataloaders_names, savepath=f'./figs/dataset', meta_dataloader=False):
     r"""
     Calculates SBP, DBP, and MAP distributions of the train/val/test split accessed through the corresponding dataloaders.
     The function plots them with mean, standard deviation, and quartiles.
@@ -169,10 +170,10 @@ def calculate_dataloaders_mean_std(dataloaders, dataloaders_names, sig2sig, save
         List of dataloaders containing the data to analyze.
     dataloaders_names : list of str
         List of names corresponding to each dataloader, used for labeling the plots.
-    sig2sig : bool
-        Flag indicating whether the dataloader provides raw signals (True) or precomputed annotations (False).
     savepath : str, default './figs/dataset'
         Path to save the generated plots.
+    meta_dataloader : bool, default False
+        Flag indicating whether the dataloader is a meta-dataloader.
         
     Returns
     ------------
@@ -185,27 +186,28 @@ def calculate_dataloaders_mean_std(dataloaders, dataloaders_names, sig2sig, save
         map_values = []
 
         for batch in dataloader:
-            _, annotation = batch
-            if not sig2sig:
-                sbp_values.extend(annotation[:, 0].flatten().tolist())
-                dbp_values.extend(annotation[:, 1].flatten().tolist())
-                map_values.extend(annotation[:, 2].flatten().tolist())
+            if not meta_dataloader:
+                _, annotation = batch
             else:
-                window_abp = annotation.numpy()               
-                for el in range(window_abp.shape[0]):
-                    sbp, dbp, _, _ = compute_sp_dp(window_abp[el]) # Should not raise an error if the signal is valid
-                    map = (2 * dbp + sbp) / 3
-                    sbp_values.extend([sbp])
-                    dbp_values.extend([dbp])
-                    map_values.extend([map])
-                    
+                (_, Ys), (_, Yq), _ = batch
+                annotation = torch.cat([
+                    Ys.float().view(-1, Ys.shape[-1]), 
+                    Yq.float().view(-1, Yq.shape[-1])
+                    ],
+                    dim=0
+                )
+                
+            sbp_values.extend(annotation[:, 0].flatten().tolist())
+            dbp_values.extend(annotation[:, 1].flatten().tolist())
+            map_values.extend(annotation[:, 2].flatten().tolist())
+            
         _calculate_dataset_mean_std(
             sbp_values=sbp_values,
             dbp_values=dbp_values,
             map_values=map_values,
             name=dataloader_name,
             savepath=savepath
-            )    
+            )   
 
     
 def calculate_personalization_subjects_mean_std(dataset, args, savepath=f'./figs/dataset'):
@@ -753,16 +755,9 @@ def plot_subject_annotation_runs(dataset, subject_id, blocks, savepath="subject_
         sbp_values, dbp_values, map_values = [], [], []
         for sid in sample_ids:
             _, ann, _ = dataset.__getitem__(sid)
-            if dataset.sig2sig:
-                sbp, dbp, _, _ = compute_sp_dp(ann.numpy())
-                map = (2 * dbp + sbp) / 3
-                sbp_values.append(sbp)
-                dbp_values.append(dbp)
-                map_values.append(map)
-            else:
-                sbp_values.append(float(ann[0]))
-                dbp_values.append(float(ann[1]))
-                map_values.append(float(ann[2]))
+            sbp_values.append(float(ann[0]))
+            dbp_values.append(float(ann[1]))
+            map_values.append(float(ann[2]))
         return sbp_values, dbp_values, map_values
 
     # Collect block-level data
@@ -935,6 +930,82 @@ def plot_run_length_statistics(dataset, savepath='./data_figs', keep_longest=Fal
     return run_lengths_by_subject
 
 
+def plot_meta_dataset_run_distribution(meta_ds, dataset_name="train", savepath='./data_figs', bin_width=5):
+    r"""
+    Plot the distribution of patients grouped by the number of runs they have.
+
+    Each bin groups patients whose number of runs falls within a given range,
+    e.g., 1-10, 11-20, etc.
+
+    Parameters
+    ----------
+    meta_ds : MetaTaskDataset
+        The MetaTaskDataset instance (train, val, or test) containing
+        the precomputed 'runs_by_patient' dictionary.
+
+    dataset_name : str, optional
+        Name of the dataset split (e.g., "train", "val", "test").
+        Used in the plot title and axis labels.
+
+    bin_width : int, optional
+        Width of each bin (range of number of runs grouped together).
+        Default is 10 (i.e., bins like 1-10, 11-20, etc.).
+
+    Returns
+    ----------
+    fig : matplotlib.figure.Figure
+        Matplotlib Figure object of the plot.
+    ax : matplotlib.axes.Axes
+        Matplotlib Axes object of the plot.
+    """
+    # Extract number of runs per patient
+    patient_ids = list(meta_ds.runs_by_patient.keys())
+    num_runs = np.array([len(meta_ds.runs_by_patient[pid]) for pid in patient_ids], dtype=int)
+
+    if len(num_runs) == 0:
+        raise ValueError("No patient runs found in the provided MetaTaskDataset.")
+
+    # Compute binned labels
+    max_runs = num_runs.max()
+    bin_edges = np.arange(0, max_runs + bin_width, bin_width)
+    # Shift first bin to start from 1 instead of 0
+    bin_edges[0] = 1
+    bin_labels = [f"{int(b1)}-{int(b2)}" for b1, b2 in zip(bin_edges[:-1], bin_edges[1:])]
+
+    # Assign each patient to a bin
+    bins = pd.cut(num_runs, bins=bin_edges, labels=bin_labels, include_lowest=True, right=True)
+    bin_counts = bins.value_counts().sort_index()
+
+    # Create the plot
+    sns.set_theme(style="whitegrid")
+    pastel_blue = sns.color_palette("pastel")[0]  # soft blue tone
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    sns.barplot(
+        x=bin_counts.index,
+        y=bin_counts.values,
+        color=pastel_blue,
+        edgecolor="black",
+        ax=ax
+    )
+
+    ax.set_title(f"Distribution of Patients by Number of Runs", fontsize=14)
+    ax.set_xlabel("Number of Runs (Grouped)", fontsize=12)
+    ax.set_ylabel("Number of Patients", fontsize=12)
+    ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.7, axis="y")
+
+    # Rotate x labels for readability
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+    # Add value annotations above bars
+    for i, val in enumerate(bin_counts.values):
+        ax.text(i, val + 0.5, str(val), ha='center', va='bottom', fontsize=10)
+        
+    save_file = os.path.join(savepath, f'{dataset_name}_run_length_distribution.png')
+    plt.savefig(save_file, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def plot_blockwise_mae(per_block_stats, subject_id, savepath=None):
     """
     Plot MAE with errorbars per baseline for a subject.
@@ -962,7 +1033,7 @@ def plot_blockwise_mae(per_block_stats, subject_id, savepath=None):
         plt.show()
         
         
-def plot_age_gender_distribution(valid_subjects, index_file_path, savepath="./figs"):
+def plot_age_gender_distribution(valid_subjects, index_file_path, savepath="./figs", filename=""):
     r"""
     Function description
     --------------------
@@ -1036,7 +1107,109 @@ def plot_age_gender_distribution(valid_subjects, index_file_path, savepath="./fi
     plt.tight_layout()
 
     # Save figure
-    filename = "age_gender_distribution.png"
+    filename += "age_gender_distribution.png"
     save_file = os.path.join(savepath, filename)
     plt.savefig(save_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+
+def plot_update_summary_table(updates_dict, save_path):
+    r"""
+    Plot and save a pastel-colored bar chart showing the number of adaptation updates
+    performed by each baseline during online personalization.
+
+    Parameters
+    -------------------
+    updates_dict : dict
+        Dictionary mapping baseline names (str) → either:
+          - int  (for per-subject number of updates)
+          - dict with {"mean": float, "std": float} (for aggregated updates)
+        
+        Examples:
+        # Per-subject version
+        {
+            "no_adapt": 0,
+            "first_batch_finetune": 1,
+            "online_adapt": 10,
+            "online_from_scratch": 12,
+            "continual_replay": 8
+        }
+
+        # Aggregated version
+        {
+            "no_adapt": {"mean": 0.0, "std": 0.0},
+            "first_batch_finetune": {"mean": 1.0, "std": 0.0},
+            "online_adapt": {"mean": 9.8, "std": 1.2},
+            "online_from_scratch": {"mean": 11.7, "std": 2.1},
+            "continual_replay": {"mean": 7.9, "std": 1.5}
+        }
+
+    save_path : str
+        Path (including filename and extension) where the resulting figure will be saved.
+        Example: "./figures/update_summary_subject_01.png"
+
+    Returns
+    --------------------
+    None
+        The function saves the generated figure to the specified path.
+    """
+    # Detect whether input is aggregated (dicts with mean/std) or per-subject (ints)
+    first_val = next(iter(updates_dict.values()))
+    aggregated = isinstance(first_val, dict)
+
+    if aggregated:
+        df = pd.DataFrame([
+            {"Baseline": k, "Mean Updates": v["mean"], "Std Updates": v["std"]}
+            for k, v in updates_dict.items()
+        ])
+    else:
+        df = pd.DataFrame([
+            {"Baseline": k, "Number of Updates": v}
+            for k, v in updates_dict.items()
+        ])
+
+    sns.set_theme(style="whitegrid")
+    plt.figure(figsize=(12, 8))
+
+    if aggregated:
+        ax = sns.barplot(
+            data=df,
+            x="Baseline",
+            y="Mean Updates",
+            hue="Baseline",
+            dodge=False,
+            palette="pastel",
+            legend=False,
+            errorbar=None  # we'll handle error bars manually
+        )
+        # Add manual error bars (std)
+        ax.errorbar(
+            x=range(len(df)),
+            y=df["Mean Updates"],
+            yerr=df["Std Updates"],
+            fmt="none",
+            ecolor="gray",
+            elinewidth=1.5,
+            capsize=4,
+            capthick=1.2
+        )
+        ax.set_title("Aggregated Adaptation Updates per Baseline", fontsize=14, weight="bold", pad=12)
+        ax.set_ylabel("Mean Number of Updates ± Std", fontsize=12)
+    else:
+        ax = sns.barplot(
+            data=df,
+            x="Baseline",
+            y="Number of Updates",
+            hue="Baseline",
+            dodge=False,
+            palette="pastel",
+            legend=False
+        )
+        ax.set_title("Adaptation Updates per Baseline", fontsize=14, weight="bold", pad=12)
+        ax.set_ylabel("Number of Updates", fontsize=12)
+
+    ax.set_xlabel("Baseline", fontsize=12)
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()

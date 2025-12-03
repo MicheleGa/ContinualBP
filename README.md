@@ -304,3 +304,9 @@ nohup ./your_script_runner.sh > /location/of/the/output/file.log 2>&1 &
 ## Example Usage
 
 In the directory *notebooks*, it is possible to find a simple example where the model is employed to perform prediction on a test sample. Further information can be found in the brief jupyter notebook.
+
+## Installing Energy Estimation Tools
+
+At the following [url](https://timeloop.csail.mit.edu/v4/installation) it is possible to isntall timeloop and accelergy to give a ballpark of the model consumptions. When installing make sure you have the python venv (with python 3.10) activated or to use their docker container.
+
+## TO-DO 1: remember to change how the encoder features are saved in the replay buffer during personalization, save them after averagin over the time dimension to save space! Note that we end up with the predcition haed being simply an MLP regressing values and not full waveforms whcih is not even useful in practice.
