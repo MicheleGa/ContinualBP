@@ -4,7 +4,7 @@ from learn2learn.algorithms.base_learner import BaseLearner
 from learn2learn.utils import clone_module, update_module
 
 
-def maml_update(model, lr, grads=None, anil=False, lora=False):
+def maml_update(model, lr, grads=None, anil=False):
     """
     [[Source]](https://github.com/learnables/learn2learn/blob/master/learn2learn/algorithms/maml.py)
 
@@ -24,7 +24,6 @@ def maml_update(model, lr, grads=None, anil=False, lora=False):
     * **grads** (list, *optional*, default=None) - A list of gradients for each parameter
         of the model. If None, will use the gradients in .grad attributes.
     * **anil** (bool) - Almost-No-Incremental-Loop.
-    * **lora** (bool) - Low-Rank Adaptation.
 
     **Example**
     ~~~python
@@ -39,10 +38,6 @@ def maml_update(model, lr, grads=None, anil=False, lora=False):
                 
         if anil:
             params += list(model.prediction_head.parameters())
-            if lora:
-                for name, param in model.encoder.named_parameters():
-                    if 'lora_' in name:
-                        params.append(param)
         else:
             params = list(model.parameters())
         
@@ -75,7 +70,6 @@ class MAML(BaseLearner):
     * **model** (Module) - Module to be wrapped.
     * **lr** (float) - Fast adaptation learning rate.
     * **anil** (bool) - Almost-No-Incremental-Loop.
-    * **lora** (bool) - Low-Rank Adaptation.
     * **first_order** (bool, *optional*, default=False) - Whether to use the first-order
         approximation of MAML. (FOMAML)
     * **allow_unused** (bool, *optional*, default=None) - Whether to allow differentiation
@@ -103,7 +97,6 @@ class MAML(BaseLearner):
                  model,
                  lr,
                  anil=False,
-                 lora=False,
                  first_order=False,
                  allow_unused=None,
                  allow_nograd=False):
@@ -111,7 +104,6 @@ class MAML(BaseLearner):
         self.module = model
         self.lr = lr
         self.anil = anil
-        self.lora = lora
         self.first_order = first_order
         self.allow_nograd = allow_nograd
         if allow_unused is None:
@@ -176,10 +168,6 @@ class MAML(BaseLearner):
                 
                 if self.anil:
                     parameters += list(self.module.prediction_head.parameters())
-                    if self.lora:
-                        for name, param in self.module.encoder.named_parameters():
-                            if 'lora_' in name:
-                                parameters.append(param)
                 else:
                     parameters = list(self.module.parameters())
                 
@@ -193,7 +181,7 @@ class MAML(BaseLearner):
                 print('learn2learn: Maybe try with allow_nograd=True and/or allow_unused=True ?')
 
         # Update the module
-        self.module = maml_update(self.module, self.lr, gradients, self.anil, self.lora)
+        self.module = maml_update(self.module, self.lr, gradients, self.anil)
 
     def clone(self, first_order=None, allow_unused=None, allow_nograd=None):
         """
@@ -225,7 +213,6 @@ class MAML(BaseLearner):
         return MAML(clone_module(self.module),
                     lr=self.lr,
                     anil=self.anil,
-                    lora=self.lora,
                     first_order=first_order,
                     allow_unused=allow_unused,
                     allow_nograd=allow_nograd)

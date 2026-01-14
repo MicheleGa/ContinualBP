@@ -1,10 +1,35 @@
-# MIMIC III Preprocessing
-#python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 10 --fs 125 --window_length 10 --window_overlap 5 --percentile True > ./data_logs/mimic_iii_preprocessing.log
-#python mimic_iii_preprocessing.py --name mimic_iii_biot --num_threads 1 --fs 125 --window_length 10 --window_overlap 5 --percentile True --plot True
-#python dataset.py --name mimic_iii_biot --fs 125 --input_seq_len_s 10 --ecg True --sig2sig False --plot True --mix_pretraining_subject_samples False --loader_worker 10
+# Preprocessing
 
-#python pulse_db_preprocessing.py > ./data_logs/pulse_db_preprocessing.log
-#python dataset.py --name mimic_iii_pulse_db --fs 125 --input_seq_len_s 10 --ecg True --sig2sig False --plot True --mix_pretraining_subject_samples False --loader_worker 10
+# Plot Sample Signals
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/mimic_iii_npz --index_file_name ./pulse_db/mimic_iii_index.csv --name pulse_db_mimic_iii_percentile --num_threads 1 --plot --normalization percentile
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/vital_db_npz --index_file_name ./pulse_db/vital_db_index.csv --name pulse_db_vital_db_percentile --num_threads 1 --plot --normalization percentile
 
-# Vital DB Preprocessing
-python online_dataset.py --name vital_db_pulse_db --ecg False --sig2sig True --input_seq_len_s 10 --fs 125 --plot True --min_run_length 128 --batch_size 16 --plot True
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/mimic_iii_npz --index_file_name ./pulse_db/mimic_iii_index.csv --name pulse_db_mimic_iii_z_score --num_threads 1 --plot --normalization z_score
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/vital_db_npz --index_file_name ./pulse_db/vital_db_index.csv --name pulse_db_vital_db_z_score --num_threads 1 --plot --normalization z_score
+
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/mimic_iii_npz --index_file_name ./pulse_db/mimic_iii_index.csv --name pulse_db_mimic_iii_min_max --num_threads 1 --plot --normalization min_max
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/vital_db_npz --index_file_name ./pulse_db/vital_db_index.csv --name pulse_db_vital_db_min_max --num_threads 1 --plot --normalization min_max
+
+# Build lmdb
+# Percentile normalization
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/mimic_iii_npz --index_file_name ./pulse_db/mimic_iii_index.csv --name pulse_db_mimic_iii_percentile --num_threads 8 --normalization percentile > ./data_logs/pulse_db_mimic_iii_z_score_preprocessing.log
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/vital_db_npz --index_file_name ./pulse_db/vital_db_index.csv --name pulse_db_vital_db_percentile --num_threads 8 --normalization percentile > ./data_logs/pulse_db_vital_db_z_score_preprocessing.log
+
+# Z-score normalization
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/mimic_iii_npz --index_file_name ./pulse_db/mimic_iii_index.csv --name pulse_db_mimic_iii_z_score --num_threads 8 --normalization z_score > ./data_logs/pulse_db_mimic_iii_z_score_preprocessing.log
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/vital_db_npz --index_file_name ./pulse_db/vital_db_index.csv --name pulse_db_vital_db_z_score --num_threads 8 --normalization z_score > ./data_logs/pulse_db_vital_db_z_score_preprocessing.log
+
+# Min-Max scaling
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/mimic_iii_npz --index_file_name ./pulse_db/mimic_iii_index.csv --name pulse_db_mimic_iii_min_max --num_threads 8 --normalization min_max > ./data_logs/pulse_db_mimic_iii_z_score_preprocessing.log
+#python pulse_db_preprocessing.py --input_folder ./pulse_db/vital_db_npz --index_file_name ./pulse_db/vital_db_index.csv --name pulse_db_vital_db_min_max --num_threads 8 --normalization min_max > ./data_logs/pulse_db_vital_db_z_score_preprocessing.log
+
+# Plot Statistics
+#python dataset.py --name pulse_db_mimic_iii_percentile --fs 125 --input_seq_len_s 10 --plot --loader_worker 10 --index_file_name ./pulse_db/mimic_iii_index.csv --plot
+#python dataset.py --name pulse_db_vital_db_percentile --fs 125 --input_seq_len_s 10 --plot --loader_worker 10 --index_file_name ./pulse_db/vital_db_index.csv --plot
+
+# Meta-Learning
+#python meta_dataloaders.py --dataset_name pulse_db_mimic_iii_percentile --k_support 16 --k_query 16 --plot --index_file_name ./pulse_db/mimic_iii_index.csv
+#python meta_dataloaders.py --dataset_name pulse_db_vital_db --k_support 16 --k_query 16 --plot --index_file_name ./pulse_db/vital_db_index.csv
+
+# Online Dataset
+python online_dataset.py --name pulse_db_vital_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 16 --validation_batch_size 16 --valid_runs_number 3 --num_train_val 3 --split_blocks 1

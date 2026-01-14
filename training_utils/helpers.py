@@ -37,15 +37,31 @@ def parseargs():
     parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.15,0.15', type=str, help='ratio for train, validation, and test split, comma separated')
     parser.add_argument('--meta_train_split_ratio', default=0.2, type=float, help='percentage of subjects to extract from the training subjects for meta-learning')
     parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit; given the support and query sample number, it is set to 15')
+    parser.add_argument('--drift_aware', action=argparse.BooleanOptionalAction, default=False, help='sample training subjects according to their SBP drift over time or nots')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of data loader workers')
     parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
     parser.add_argument('--batch_size', default=128, type=int, help='batch size')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds')
-    parser.add_argument('--output_dim', default=3, type=int, help='output dimension (SBP/MAP/DBP))')
+    parser.add_argument('--output_dim', default=3, type=int, help='output dimension (SBP/MAP/DBP)')
+    
+    # Model Setup
+    parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
+    parser.add_argument('--channels', default='1, 64, 128, 256', type=str, help='channels produced by the convolutional blocks')
+    parser.add_argument('--kernel_size', default=7, type=int, help='convolutional layer kernel size')
+    parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
+    parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
+    parser.add_argument('--embed_dim', default=256, type=int, help='embedding dimension')
+    parser.add_argument('--num_groups', default=8, type=int, help='number of groups for group normalization')
+    parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
+    parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of trasnformer layers')
+    parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
+    parser.add_argument('--dropout', default=0.2, type=float, help='dropout probability')
+    parser.add_argument('--n_fft', default=200, type=int, help='number of elements for STFT')
+    parser.add_argument('--hop_length', default=100, type=int, help='hop length for STFT')
     
     # Pre-training Setup
-    parser.add_argument('--pretrained_encoder_ckpt_path', default='', type=str, help='optional checkpoint path for the encoder')
+    parser.add_argument('--pretrained_encoder_ckpt_path', default='', type=str, help='optional checkpoint path for the BIOT encoder')
     parser.add_argument('--stage1_epochs', default=10, type=int, help='epochs training head only')
     parser.add_argument('--stage1_freeze_epochs', default=30, type=int, help='epochs training head only')
     parser.add_argument('--stage1_pre_train_lr', default=1e-3, type=float, help='ssl learning rate for pre-training stage 1')
@@ -77,32 +93,11 @@ def parseargs():
     parser.add_argument('--inner_lr_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner learning rate schedule type (simplified for ANIL)')
     parser.add_argument('--inner_steps', default=5, type=int, help='number of inner steps for meta-learning (increased for ANIL)')
     parser.add_argument('--inner_steps_max', default=8, type=int, help='maximum inner steps for cosine schedule')
-    parser.add_argument('--inner_steps_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner steps schedule type (simplified for ANIL)')
+    parser.add_argument('--inner_steps_schedule', default='constant', type=str, choices=['constant', 'cosine'], help='inner steps schedule type (simplified for ANIL)') 
     
     parser.add_argument('--eval_lr', default=5e-3, type=float, help='inner learning rate for meta-learning evaluation')
     parser.add_argument('--eval_steps', default=8, type=int, help='inner steps for meta-learning evaluation')
-    
-    # LoRA setup
-    parser.add_argument('--use_lora', action=argparse.BooleanOptionalAction, default=False, help='enable Low-Rank Adaptation (LoRA) for parameter-efficient fine-tuning')
-    parser.add_argument('--lora_r', default=8, type=int, help='LoRA rank (dimensionality of low-rank matrices A and B)')
-    parser.add_argument('--lora_alpha', default=16, type=float, help='LoRA scaling parameter (alpha), controls the magnitude of LoRA updates')
-    parser.add_argument('--lora_dropout', default=0.1, type=float, help='dropout probability applied to LoRA layers during training')
-    
-    # Model Setup
-    parser.add_argument('--model', default="models.ResGRUNet", type=str, help='model name')
-    parser.add_argument('--channels', default='1, 64, 128, 256', type=str, help='channels produced by the convolutional blocks')
-    parser.add_argument('--kernel_size', default=7, type=int, help='convolutional layer kernel size')
-    parser.add_argument('--act', default='leaky_relu', type=str, help='which activation to use (ReLU or LeakyReLU)')
-    parser.add_argument('--pooling', default='avg', type=str, help='which poolng to use (average or max)')
-    parser.add_argument('--embed_dim', default=256, type=int, help='embedding dimension')
-    parser.add_argument('--num_groups', default=8, type=int, help='number of groups for group normalization')
-    parser.add_argument('--num_heads', default=8, type=int, help='number of heads for the self-attention mechanism')
-    parser.add_argument('--num_encoder_layers', default=4, type=int, help='number of trasnformer layers')
-    parser.add_argument('--num_decoder_layers', default=4, type=int, help='number of decoder layers')
-    parser.add_argument('--dropout', default=0.2, type=float, help='dropout probability')
-    parser.add_argument('--n_fft', default=200, type=int, help='number of elements for STFT')
-    parser.add_argument('--hop_length', default=100, type=int, help='hop length for STFT')
-
+   
     # Personalization Setup
     parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
     parser.add_argument('--pretraining_feats_stats', default=None, type=str, help='path to the features statistics during pretraining')
@@ -113,12 +108,15 @@ def parseargs():
     parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size for personalization')
     parser.add_argument('--validation_batch_size', default=16, type=int, help='batch size for personalization')
     parser.add_argument('--num_train_val', default=2, type=int, help='number of training and validation phases per block')
+    parser.add_argument('--split_blocks', default=1, type=int, help='number of train/test sub part of a block')
     parser.add_argument('--valid_runs_number', default=2, type=int, help='valid runs number')
-    parser.add_argument('--setup_type', default='drift', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
+    parser.add_argument('--setup_type', default='fixed', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
     parser.add_argument('--drift_threshold', default=0.5, type=float, help='threshold for drift detector')
-    parser.add_argument('--replay_threshold', default=0.35, type=float, help='replay buffer threshold for drift detector')
-    parser.add_argument('--replay_buffer_size', default=256, type=int, help='maximum size of the feature replay buffer')
+    parser.add_argument('--replay_buffer_size', default=64, type=int, help='maximum size of the feature replay buffer')
     parser.add_argument('--replay_batch_size', default=16, type=int, help='batch size for feature replay')
+    parser.add_argument('--adaptive', action=argparse.BooleanOptionalAction, default=False, help='whether to perform adaptive layer freezing during personalization or not')
+    parser.add_argument('--lwf_lambda', default=0.01, type=float, help='lambda for LwF distillation loss')
+    parser.add_argument('--ewc_lambda', default=10.0, type=float, help='lambda for EWC weight-regulariaztion loss')
     
     args = parser.parse_args()
     return args
@@ -511,13 +509,21 @@ def get_inner_steps(epoch, config):
     else:
         return base_steps
 
-    
-def build_inner_optimizer(adapted_encoder, adapted_head, base_lr, config):
+
+def build_inner_optimizer(
+    adapted_encoder,
+    adapted_head,
+    base_lr,
+    mode,       
+    opt_type,
+    config
+):
     r"""
     Build inner optimizer for meta-learning algorithms evaluation and deployment (not training, learn2learn library with autograd is employed for training).
     Behaviors:
     - inner_adapt='all'  : adapt backbone + regressor
-    - inner_adapt='head' : freeze backbone, adapt only regressor and LoRA params if applicable.
+    - inner_adapt='temporal'  : freeze backbone, adapt only the backbone GRU and LayerNorm + regressor
+    - inner_adapt='head' : freeze backbone, adapt only regressor
     
     Parameters
     ------------
@@ -527,6 +533,10 @@ def build_inner_optimizer(adapted_encoder, adapted_head, base_lr, config):
             The model prediction head to be adapted.
         base_lr (float): 
             The base learning rate for the inner optimizer.
+        mode (str): 
+            Inner adaptation mode, 'all' or 'head'.
+        opt_type (str): 
+            Inner optimizer type, either 'sgd' or 'adam'.
         config (dict): 
             Configuration dictionary containing inner adaptation parameters.
             
@@ -534,35 +544,63 @@ def build_inner_optimizer(adapted_encoder, adapted_head, base_lr, config):
     ------------
         inner_opt (torch.optim.Optimizer): 
             The constructed inner optimizer for meta-learning evaluation and deployment.    
-    """
-    mode = config.get('inner_adapt')   
-    opt_type = config.get('inner_opt').lower()  
+    """ 
+
+    # ----------------------------
+    # 1) Make everything trainable
+    # ----------------------------
+    # BIOT has longtensor parameters for index (positional embedding), when setting requires_grad for them an error is raised
+    if config['model_name'] == 'BIOT':
+        for p in adapted_encoder.parameters():
+            if p.dtype.is_floating_point or p.is_complex():
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+    else:
+        for p in adapted_encoder.parameters():
+            p.requires_grad = True
     
-    params = []
-    
-    # Default to 'head' - ANIL
-    if mode == 'all':
-        # Mode all not supported for LoRA
-        if config['use_lora']:
-            raise ValueError("inner_adapt='all' not supported for LoRA models")
-        
-        # Train both encoder and head parameters
-        params = list(adapted_encoder.parameters()) + list(adapted_head.parameters())
-    else:    
-        # Do not train backbone parameters in ANIL - only head + LoRA params if applicable
-        params = list(adapted_head.parameters())
-        if config['use_lora']:
-            for name, param in adapted_encoder.named_parameters():
-                if 'lora_' in name:
-                    params.append(param)
-    
-    # Build optimizer, default to Adam
-    if opt_type == 'sgd':
-        momentum = float(config.get('sgd_momentum'))
-        inner_opt = torch.optim.SGD(params, lr=base_lr, momentum=momentum)
+    for p in adapted_head.parameters():
+        p.requires_grad = True
+
+    # -------------------------------
+    # 2) Apply mode-specific freezing
+    # -------------------------------
+    if mode == "head":
+        # Freeze entire encoder
+        for p in adapted_encoder.parameters():
+            p.requires_grad = False
+
+    elif mode == "all":
+        # Nothing frozen
+        pass
+
+    else:
+        raise ValueError(f"Unknown adaptation mode: {mode}")
+
+    # -------------------------------
+    # 3) Collect trainable parameters
+    # -------------------------------
+    params = [
+        p for p in list(adapted_encoder.parameters()) + list(adapted_head.parameters())
+        if p.requires_grad
+    ]
+
+    if len(params) == 0:
+        raise RuntimeError("No trainable parameters selected for inner optimizer.")
+
+    # ------------------
+    # 4) Build optimizer
+    # ------------------
+    if opt_type == "sgd":
+        inner_opt = torch.optim.SGD(
+            params,
+            lr=base_lr,
+            momentum=float(config.get("sgd_momentum"))
+        )
     else:
         inner_opt = torch.optim.Adam(params, lr=base_lr)
-    
+
     return inner_opt
     
 

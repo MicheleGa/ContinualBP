@@ -14,15 +14,13 @@ def get_meta_lr(epoch, config):
         return base_meta_lr * 0.5 * (1 + math.cos(math.pi * epoch / meta_epochs))
     elif meta_lr_schedule == 'cosine_wr':
         # Extended version with decaying peaks and optional tail
-        T0      = int(config.get('lr_scheduler_T0'))
-        T_mult  = float(config.get('lr_scheduler_T_mult'))
+        T0 = int(config.get('lr_scheduler_T0'))
+        T_mult = float(config.get('lr_scheduler_T_mult'))
         eta_min0 = float(config.get('lr_scheduler_eta_min'))
-        gamma   = float(config.get('lr_scheduler_gamma'))
+        gamma = float(config.get('lr_scheduler_gamma'))
         min_gamma = float(config.get('lr_scheduler_min_gamma'))
         max_cycles = config.get('lr_scheduler_max_cycles')
-        tail_mode  = config.get('lr_scheduler_tail')
-        eta_floor  = float(config.get('lr_scheduler_eta_floor'))
-
+        
         cycle = 0
         length = T0
         e = epoch
@@ -32,26 +30,20 @@ def get_meta_lr(epoch, config):
             length = int(length * T_mult)
 
         if (max_cycles is not None) and (cycle >= int(max_cycles)):
-            # compute how many epochs since last cycle finished
-            rem = epoch
-            length = T0
-            for _ in range(int(max_cycles)):
-                rem -= length
-                length = int(length * T_mult)
-            tail_epoch = max(0, rem)
-            total_epochs = int(config['max_training_epochs'])
-            last_cycle_peak = base_meta_lr * (gamma ** (int(max_cycles)-1))
-
-            if tail_mode == 'linear':
-                progress = min(1.0, tail_epoch / max(1, total_epochs))
-                return eta_floor + (last_cycle_peak - eta_floor) * (1.0 - progress)
-            else:
-                phase = min(1.0, tail_epoch / max(1, total_epochs))
-                return eta_floor + 0.5 * (last_cycle_peak - eta_floor) * (1 + math.cos(math.pi * phase))
-
+            # After max cycles, stay at final eta_min
+            final_eta_min = eta_min0 * (min_gamma ** (int(max_cycles) - 1))
+            return final_eta_min
+        
+        # Calculate current cycle parameters
         eta_max_cycle = base_meta_lr * (gamma ** cycle)
         eta_min_cycle = eta_min0 * (min_gamma ** cycle)
-        return eta_min_cycle + 0.5 * (eta_max_cycle - eta_min_cycle) * (1 + math.cos(math.pi * e / max(1, length)))
+        
+        # Ensure cycle ends exactly at eta_min by using (length-1) for full cycle
+        # When e = length-1, cos(π) = -1, giving eta_min exactly
+        cycle_progress = math.pi * e / max(1, length - 1)
+        cosine_factor = 0.5 * (1 + math.cos(cycle_progress))
+        
+        return eta_min_cycle + (eta_max_cycle - eta_min_cycle) * cosine_factor
     else:
         return base_meta_lr
 
@@ -88,29 +80,27 @@ def get_inner_steps(epoch, config):
 
 # === Example config ===
 config = {
-    'max_training_epochs': 800,
+    'max_training_epochs': 150,
 
     # Meta LR schedule
     'meta_lr': 0.001,
     'meta_lr_schedule': 'cosine_wr',
-    'lr_scheduler_T0': 100,
-    'lr_scheduler_T_mult': 1.5,
+    'lr_scheduler_T0': 75,
+    'lr_scheduler_T_mult': 1,
     'lr_scheduler_eta_min': 1e-5,
     'lr_scheduler_gamma': 0.7,
     'lr_scheduler_min_gamma': 1.0,
-    'lr_scheduler_max_cycles': 3,
-    'lr_scheduler_tail': 'cosine',
-    'lr_scheduler_eta_floor': 1e-5,
+    'lr_scheduler_max_cycles': 2,
 
     # Inner LR schedule
     'lr_inner': 0.01,
     'inner_lr_min': 0.001,
-    'inner_lr_schedule': 'cosine',
+    'inner_lr_schedule': 'costant',
 
     # Inner steps schedule
-    'inner_steps': 4,
+    'inner_steps': 5,
     'inner_steps_max': 8,
-    'inner_steps_schedule': 'cosine',
+    'inner_steps_schedule': 'costant',
 }
 
 # === Collect curves ===
@@ -136,4 +126,4 @@ axs[2].set_xlabel("Epoch")
 axs[2].set_title("Inner Steps schedule")
 
 plt.tight_layout()
-plt.show()
+plt.savefig('./meta_lr_scheduler_viz.png')

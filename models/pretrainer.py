@@ -32,6 +32,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
         pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
         meta_split_ratio=config['meta_train_split_ratio'],
+        drift_aware=config['drift_aware'],
         fs=config['fs'],
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
@@ -282,8 +283,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         model=encoder, optimizer=None, scheduler=None, 
         checkpoint_path=checkpoint_path, config=config
     )
-    if config['use_lora']:
-        encoder.attach_lora(r=config['lora_r'], alpha=config['lora_alpha'])
     encoder.eval()
     print(f"[Pretraining][MAML] Stage-1 encoder weights initialized ✅")
     
@@ -308,8 +307,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         model, 
         lr=config['inner_lr'], 
         first_order=True, 
-        anil=(config['inner_adapt'] == 'head'), 
-        lora=config['use_lora']
+        anil=(config['inner_adapt'] == 'head')
     ).to(device)
 
     # MAML meta-dataloader setup
@@ -321,6 +319,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         ecg=config['ecg'],
         pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
         meta_split_ratio=config['meta_train_split_ratio'],
+        drift_aware=config['drift_aware'],
         min_subject_sample_number=config['min_subject_sample_number'],
         k_support=config['k_support'],
         k_query=config['k_query'],
@@ -335,7 +334,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
     # MAML specific parameters
     print(f"[Pretraining][MAML] Run configuration")
-    print(f"\t- Update: {'Almost-No-Inner-Loop' if config['inner_adapt'] == 'head' else 'encoder and prediction head'}{' with LoRA' if config['use_lora'] else ''}")
+    print(f"\t- Update: {'Almost-No-Inner-Loop' if config['inner_adapt'] == 'head' else 'encoder and prediction head'}")
     print(f"\t- Epochs: {meta_epochs}")
     print(f"\t- Meta LR schedule: {meta_lr_schedule} - base LR {config['meta_lr']} / min LR {config['meta_lr_scheduler_eta_min']}")
     print(f"\t- Inner LR schedule: {inner_lr_schedule} - LR {config['inner_lr']}")
@@ -374,6 +373,9 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         epoch_support_loss_meter.reset()
         epoch_meta_loss_meter.reset()
         
+        # Epoch-level storage for ΔSBP
+        epoch_delta_sbp_values = []
+        
         # Log current hyperparameters
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
         writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
@@ -400,25 +402,23 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                 adapted_model.train()
                 
                 # Query loss before adaptation (step 0) — keep for logging and optional MSL include
-                with torch.no_grad():
-                    # Merge LoRA weights for inference if LoRA is applied
-                    # N.B.: using class name instead of isinstance because of clone few lines above
-                    if config['use_lora']:
-                        adapted_model.module.encoder.merge_lora()
-                    
+                with torch.no_grad():                    
                     out_q0 = adapted_model(qX)  # Use current meta-parameters
                     loss_q0 = F.smooth_l1_loss(out_q0, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q0, qY)
                 task_query_pre_losses.append(loss_q0.item())
+                
+                # ---- Task-level SBP drift (ΔSBP) ----
+                with torch.no_grad():
+                    sbp_support_mean = sY.mean()
+                    sbp_query_mean   = qY.mean()
+                    delta_sbp = torch.abs(sbp_query_mean - sbp_support_mean)
+                    epoch_delta_sbp_values.append(delta_sbp.item())
                 
                 support_losses = []
                 per_step_query_losses = []
 
                 # Inner loop
-                for step in range(current_inner_steps):
-                    # Unmerge LoRA weights for training
-                    if config['use_lora']:
-                        adapted_model.module.encoder.unmerge_lora()
-                    
+                for step in range(current_inner_steps):                    
                     # --- support forward ---
                     out_s = adapted_model(sX)
                     loss_s = F.smooth_l1_loss(out_s, sY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_s, sY)
@@ -426,10 +426,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
 
                     # FOMAML from l2l
                     adapted_model.adapt(loss_s)
-                    
-                    # Merge LoRA weights for inference
-                    if config['use_lora']:
-                        adapted_model.module.encoder.merge_lora()
                     
                     # Evaluate query using the updated fast_weights (multi-step loss)
                     out_q_step = adapted_model(qX)
@@ -468,6 +464,24 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         avg_train_query_loss = epoch_query_loss_meter.avg
         avg_train_support_loss = epoch_support_loss_meter.avg
         avg_train_meta_loss = epoch_meta_loss_meter.avg
+        
+        if len(epoch_delta_sbp_values) > 0:
+            writer.add_scalar(
+                'drift/delta_sbp_epoch_mean',
+                np.mean(epoch_delta_sbp_values),
+                epoch
+            )
+            writer.add_scalar(
+                'drift/delta_sbp_epoch_std',
+                np.std(epoch_delta_sbp_values),
+                epoch
+            )
+
+            writer.add_histogram(
+                'drift/delta_sbp_epoch_hist',
+                np.array(epoch_delta_sbp_values),
+                epoch
+            )
         
         # Run validation
         val_loss = evaluate_maml_with_bp_metrics(model, val_dataloader, device, config)
@@ -590,7 +604,14 @@ def evaluate_maml_with_bp_metrics(model, dataloader, device, config, test=False,
             adapted_prediction_head = copy.deepcopy(model.prediction_head).to(device)
 
             # Build inner optimizer with correct parameter groups & LRs
-            inner_opt = build_inner_optimizer(adapted_encoder, adapted_prediction_head, base_lr=config['eval_lr'], config=config)
+            inner_opt = build_inner_optimizer(
+                adapted_encoder, 
+                adapted_prediction_head, 
+                base_lr=config['eval_lr'], 
+                mode=config['inner_adapt'],
+                opt_type=config['inner_opt'].lower(),   
+                config=config
+            )
             
             adapted_encoder.train()
             adapted_prediction_head.train()
@@ -603,10 +624,6 @@ def evaluate_maml_with_bp_metrics(model, dataloader, device, config, test=False,
                 inner_opt.zero_grad()
                 loss_s.backward()
                 inner_opt.step()
-
-            # Merge LoRA weights for inference
-            if config['use_lora']:
-                adapted_encoder.merge_lora()
 
             # --- Query evaluation ---
             adapted_encoder.eval()

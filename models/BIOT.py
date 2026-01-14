@@ -6,7 +6,7 @@ import torch.nn as nn
 from linear_attention_transformer import LinearAttentionTransformer
 from torchinfo import summary
 from thop import profile, clever_format
-from component_factory import BPRegressor, AttentionPool
+from component_factory import BPRegressor
 
 
 class PatchFrequencyEmbedding(nn.Module):

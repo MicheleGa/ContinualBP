@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, filtfilt, correlate, welch, resample
+from scipy.signal import butter, cheby2, sosfiltfilt, filtfilt, correlate, welch, resample
 from scipy.interpolate import PchipInterpolator
 import matplotlib.pyplot as plt
 import pywt
@@ -629,6 +629,67 @@ def butterworth_filtering(signal, fs=125, level=4, low_freq=0.5, high_freq=8, pl
         plt.close()
         
     return denoised_signal
+
+def cheby2_filtering(signal, fs=125, level=4, rs=20, low_freq=0.5, high_freq=8, plot=False, title='Cheby2', savepath='./figs'):
+    r"""
+    Denoises a signal using a 4-th order bandpass Chebyshev Type II filter.
+    Default bandpass frequency range is 0.5-8 Hz.
+    Source: https://www.frontiersin.org/journals/digital-health/articles/10.3389/fdgth.2022.1090854/full
+    
+    Parameters
+    ------------
+    signal (numpy.array): 
+        Input signal of shape (sequence_length,).
+    fs (int, optional): 
+        Sampling frequency in Hz. Default is 125.
+    level (int, optional): 
+        Order of the Chebyshev filter. Default is 4.
+    rs (float, optional): 
+        Minimum attenuation required in the stop band (dB). Default is 20.
+    low_freq (float, optional): 
+        Lower cutoff frequency in Hz. Default is 0.5.
+    high_freq (float, optional):
+        Upper cutoff frequency in Hz. Default is 8.
+    plot (bool, optional):
+        If True, plots the original and denoised signals. Default is False.
+    title (str, optional):
+        Title prefix for saved plots. Default is 'Cheby2'.
+    savepath (str, optional):
+        Directory path to save plots. Default is './figs'.
+        
+    Returns
+    ------------
+    numpy.array: Denoised signal of the same shape as the input.
+    """
+    sequence_length = len(signal)
+    
+    # Chebyshev-II filter
+    sos = cheby2(level, rs, [low_freq, high_freq], btype='bp', analog=False, output='sos', fs=fs)
+    
+    # Zero-phase filtering
+    filtered_signal = sosfiltfilt(sos, signal)
+    
+    # Optional plotting
+    if plot:
+        time = np.linspace(0, sequence_length / fs, sequence_length)
+
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 1, 1)
+        plt.plot(time, signal, label='Original Signal')
+        plt.title('Original Signal')
+        plt.legend()
+
+        plt.subplot(2, 1, 2)
+        plt.plot(time, filtered_signal, label='Filtered Signal', color='orange')
+        plt.title('Cheby2 Signal')
+        plt.legend()
+        plt.xlabel('Time (seconds)')
+        plt.tight_layout()
+        os.makedirs(savepath, exist_ok=True)
+        plt.savefig(os.path.join(savepath, f'{title}_noisy_vs_denoised.jpg'))
+        plt.close()
+        
+    return filtered_signal
 
 
 def high_freq_butterworth(signal, fs=125, order=4, cutoff_freq=35.0, plot=False, title='Signal_LP', savepath='./figs'):

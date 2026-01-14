@@ -2,7 +2,7 @@ import os
 import argparse
 import pickle
 import numpy as np
-import random
+from collections import defaultdict, Counter
 import lmdb
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -11,8 +11,8 @@ from sklearn.model_selection import train_test_split
 from preprocessing_utils.data_visualization import (
     plot_signals, plot_subject_sample_distribution, plot_age_gender_distribution,
     plot_train_val_test_samples_distribution, calculate_dataloaders_mean_std,     
+    plot_drift_regime_counts, plot_sbp_drift_distribution
 )
-from preprocessing_utils.split import split_train_val_test
 
 
 class PhysioDataset(Dataset):
@@ -25,6 +25,7 @@ class PhysioDataset(Dataset):
                  input_seq_len_s=5, 
                  ecg=False, 
                  min_subject_sample_number=0, 
+                 drift_aware=False,
                  plot=False, 
                  savepath='./figs'):
         super(PhysioDataset, self).__init__()
@@ -54,6 +55,7 @@ class PhysioDataset(Dataset):
         self.savepath = savepath
 
         # Dataset split
+        self.drift_aware = drift_aware
         self.total_subject_n = len(self.subjects_for_pretraining)
         self.pretraining_split_ratio = pretraining_split_ratio # To divide pretraining from personalization, and then to divide the pretraining dataset
         self.meta_split_ratio = meta_split_ratio
@@ -63,10 +65,15 @@ class PhysioDataset(Dataset):
                 plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, f'pretraining_subject_sample_distribution_min_sample_{self.min_subject_sample_number}.jpg'))
             else:
                 plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, 'pretraining_subject_sample_distribution.jpg'))
-        
-        print(f"[PhysioDataset] Initialized with following configuration")
+        with open('./patient_ids.txt', "w") as f:
+            for subject_id in self.subjects_for_pretraining:
+                f.write(f"{subject_id}\n")
+        print(f"[PhysioDataset] Initialized with following configuration:")
         print(f"\t-Total Subjects: {len(self.subjects_for_pretraining)}")
         print(f"\t-Total Samples: {len(self.index_by_sample_id)}")
+        
+        print("[PhysioDataset] Computing SBP drift information for each subject ...")
+        self.subject_drift_info = self.compute_subject_sbp_drift()
                     
     def check_subjects_list(self, min_subject_sample_number=0):
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
@@ -89,6 +96,106 @@ class PhysioDataset(Dataset):
                 if len(self.index_by_subject_id[subject]) > min_subject_sample_number:
                     self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
 
+    def compute_subject_sbp_drift(self):
+        drift_info = {}
+
+        for subject_id, sample_ids in self.index_by_subject_id.items():
+            sbps = []
+
+            for sid in sample_ids:
+                sbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{sid}-sbp".encode()), dtype="float32"))
+                sbps.append(sbp)
+            sbps = np.asarray(sbps, dtype=np.float32)
+            
+            if len(sbps) < 2:
+                continue
+
+            drift_info[subject_id] = {
+                "sbp_std_over_time": float(np.std(sbps)),
+                "sbp_range": float(np.max(sbps) - np.min(sbps)),
+                "num_samples": len(sbps)
+            }
+
+        return drift_info
+
+    def drift_aware_train_split(self, train_subjects, train_drift_info):
+        """
+        Split training subjects into supervised and meta-learning sets
+        in a drift-aware manner.
+
+        Args:
+            train_subjects (list): subject IDs in training split
+            train_drift_info (dict): subject_id -> {
+                "sbp_std_over_time": float,
+                "drift_regime": "low" | "medium" | "high"
+            }
+
+        Returns:
+            supervised_subjects (list)
+            meta_learning_subjects (list)
+        """
+
+        rng = np.random.default_rng(self.seed)
+
+        # Group subjects by drift regime
+        regime_groups = defaultdict(list)
+        for sid in train_subjects:
+            info = train_drift_info.get(sid)
+            if info is None:
+                raise ValueError(f"Subject {sid} has no drift info")
+            regime = info["drift_regime"]
+            regime_groups[regime].append(sid)
+
+        # Shuffle each regime group for randomness
+        for regime in regime_groups:
+            rng.shuffle(regime_groups[regime])
+
+        total_train = len(train_subjects)
+        target_meta = int(round(self.meta_split_ratio * total_train))
+
+        regimes = ["low", "medium", "high"]
+        per_regime_target = target_meta // 3
+        remainder = target_meta % 3
+
+        meta_subjects = []
+
+        # First pass: equal quota per regime
+        for regime in regimes:
+            available = regime_groups.get(regime, [])
+            take = min(len(available), per_regime_target)
+            meta_subjects.extend(available[:take])
+            regime_groups[regime] = available[take:]
+
+        # Second pass: distribute remainder fairly
+        if remainder > 0:
+            # pool remaining subjects across regimes
+            leftovers = []
+            for regime in regimes:
+                leftovers.extend(regime_groups.get(regime, []))
+
+            rng.shuffle(leftovers)
+            meta_subjects.extend(leftovers[:remainder])
+
+            # Remove taken remainder subjects from regime_groups
+            taken_set = set(meta_subjects)
+            for regime in regimes:
+                regime_groups[regime] = [
+                    s for s in regime_groups.get(regime, []) if s not in taken_set
+                ]
+
+        # Remaining subjects go to supervised learning
+        supervised_subjects = []
+        for remaining in regime_groups.values():
+            supervised_subjects.extend(remaining)
+
+        # Safety checks
+        assert len(meta_subjects) == target_meta
+        assert len(meta_subjects) + len(supervised_subjects) == total_train
+        assert len(set(meta_subjects).intersection(supervised_subjects)) == 0
+
+        return supervised_subjects, meta_subjects
+
+    
     def get_pretraining_samplers(self):
         """Get train/val/test samplers for pretraining dataset"""
             
@@ -109,12 +216,59 @@ class PhysioDataset(Dataset):
             random_state=self.seed
             ) 
         
-        self.supervised_pretrain_subjects, self.meta_learning_subjects = train_test_split(
-            self.pretraining_train_subjects,
-            test_size=self.meta_split_ratio,
-            random_state=self.seed
-        )
+        train_drift_info = {k: v for k, v in self.subject_drift_info.items() if k in self.pretraining_train_subjects}
+        
+        values = np.array([v["sbp_std_over_time"] for v in train_drift_info.values()])
+        q25, q75 = np.percentile(values, [25, 75])
+        
+        for subject_id, info in train_drift_info.items():
+            if info["sbp_std_over_time"] <= q25:
+                info["drift_regime"] = "low"
+            elif info["sbp_std_over_time"] >= q75:
+                info["drift_regime"] = "high"
+            else:
+                info["drift_regime"] = "medium"
+                
+        if self.drift_aware:    
+            self.supervised_pretrain_subjects, self.meta_learning_subjects = self.drift_aware_train_split(
+                self.pretraining_train_subjects,
+                train_drift_info
+            )
+        else:
+            self.supervised_pretrain_subjects, self.meta_learning_subjects = train_test_split(
+                self.pretraining_train_subjects,
+                test_size=self.meta_split_ratio,
+                random_state=self.seed
+            )
 
+        def regime_counts(subjects, drift_info):
+            return Counter(
+                drift_info[s]["drift_regime"]
+                for s in subjects
+                if s in drift_info
+            )
+
+        print("[PhysioDataset] Meta-learning regimes:", regime_counts(self.meta_learning_subjects, train_drift_info))
+        print("[PhysioDataset] Supervised regimes:", regime_counts(self.supervised_pretrain_subjects, train_drift_info))
+        
+        if self.plot:
+            plot_drift_regime_counts(
+                train_drift_info,
+                self.pretraining_train_subjects,
+                q25=q25,
+                q75=q75,
+                title='drift_regime_counts_pretraining_train_split',
+                savepath=self.savepath
+            )
+            
+            plot_sbp_drift_distribution(
+                train_drift_info,
+                self.pretraining_train_subjects,
+                title='sbp_drift_distribution_pretraining_train_split',
+                savepath=self.savepath
+            )
+                
+        
         print("[PhysioDataset] Pretraining subjects per split")
         print(f"\t-# of train subjects: {len(self.pretraining_train_subjects)}")
         print(f"\t\t-# supervised pretrain subjects: {len(self.supervised_pretrain_subjects)}")
@@ -230,6 +384,7 @@ def parseargs():
     parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit')
     parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=False, help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
+    parser.add_argument('--drift_aware', action=argparse.BooleanOptionalAction, default=False, help='sample training subjects according to their SBP drift over time or nots')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size')
     parser.add_argument('--plot_aug', action=argparse.BooleanOptionalAction, default=False, help='plot signal augmentations or not')
     parser.add_argument('--loader_worker', default=8, type=int, help='number of loader workers')
@@ -253,6 +408,8 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         min_subject_sample_number=args.min_subject_sample_number,
+        drift_aware=args.drift_aware,
+        meta_split_ratio=args.meta_train_split_ratio,
         plot=args.plot, 
         savepath=root_figs_folder
     )
@@ -284,18 +441,11 @@ if __name__ == "__main__":
         else:
             print('No index file provided...')
             
-        if args.mix_pretraining_subject_samples:
-            calculate_dataloaders_mean_std(
-                dataloaders=[supervised_train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
-                savepath=root_figs_folder
-                ) 
-        else:
-            calculate_dataloaders_mean_std(
-                dataloaders=[supervised_train_dataloader, valid_dataloader, test_dataloader], 
-                dataloaders_names=['No-Mix-Pretraining-Train', 'No-Mix-Pretraining-Val', 'No-Mix-Pretraining-Test'], 
-                savepath=root_figs_folder
-                )
+        calculate_dataloaders_mean_std(
+            dataloaders=[supervised_train_dataloader, valid_dataloader, test_dataloader], 
+            dataloaders_names=['Pretraining-Train', 'Pretraining-Val', 'Pretraining-Test'], 
+            savepath=root_figs_folder
+            ) 
 
         if args.ecg:            
             plot_signals(

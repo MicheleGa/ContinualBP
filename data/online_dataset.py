@@ -3,10 +3,15 @@ import argparse
 import pickle
 import pprint
 import numpy as np
+import pandas as pd
 import lmdb
 import torch
 from torch.utils.data import Dataset
-from preprocessing_utils.data_visualization import plot_subject_sample_distribution, plot_consecutive_runs_all, plot_subject_annotation_runs, plot_run_length_statistics
+from preprocessing_utils.data_visualization import (
+    plot_subject_sample_distribution, plot_consecutive_runs_all, 
+    plot_subject_annotation_runs, plot_run_length_statistics,
+    plot_pareto_frontier
+)
 
 
 class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid openinng the LMDB environment two times (would raise errors)
@@ -335,7 +340,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         print(f"[Filtering] Subjects remaining: {len(self.subjects_for_personalization)} (removed {len(subjects_to_remove)})")
 
 
-    def get_subject_runs(self, subject_id, window_length, adapt_size: int = 32, val_size: int = 32, block_length: int = 128):
+    def get_subject_runs(self, subject_id, window_length, adapt_size: int = 16, val_size: int = 16, block_length: int = 32, split_blocks: int = 1):
         r"""
         Build subject runs using fixed interleaved adaptation/validation windows.
 
@@ -344,20 +349,31 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         subject_id : int
             Subject identifier from the dataset.
         adapt_size : int, optional
-            Number of windows per adaptation (train) block. Default=32.
+            Number of windows per adaptation (train) block.
         val_size : int, optional
-            Number of windows per validation (test) block. Default=32.
+            Number of windows per validation (test) block.
         block_length : int, optional
             Minimum number of windows in a run to be considered. Default=200.
+        split_blocks : int, optional
+            Number of interleaved train/test blocks to create for each block.
 
         Returns
         -------
         runs : list of dict
-            Each dict has:
-            - "train": list of sample IDs for adaptation
-            - "test": list of sample IDs for validation
-            - "all": list of all sample IDs in the block (train + test)
         """
+        
+        assert adapt_size == val_size, "Currently only equal adapt/val sizes are supported"
+        
+        if split_blocks < 1:
+            raise ValueError("split_blocks must be >= 1")
+
+        if adapt_size % split_blocks != 0:
+            raise ValueError(f"adapt_size ({adapt_size}) must be divisible by split_blocks ({split_blocks})")
+
+        if val_size % split_blocks != 0:
+            raise ValueError(f"val_size ({val_size}) must be divisible by split_blocks ({split_blocks})")
+
+        
         # Get samples of a subject
         index_list = list(self.index_by_subject_id[subject_id])
 
@@ -378,21 +394,58 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             block_size = adapt_size + val_size
             n_blocks = run_len // block_size
 
+            adapt_sub = adapt_size // split_blocks
+            val_sub = val_size // split_blocks
+
             for b in range(n_blocks):
-                start = b * block_size
-                train_segment = run_samples[start : start + adapt_size]
-                test_segment = run_samples[start + adapt_size : start + block_size]
+                block_start = b * block_size
+                block_samples = run_samples[block_start : block_start + block_size]
 
-                if len(train_segment) == adapt_size and len(test_segment) == val_size:
-                    subject_runs.append({
-                        "r_idx": r_idx,
-                        "b_idx": b,
-                        "train": train_segment,
-                        "test": test_segment,
-                        "all": train_segment + test_segment
-                    })
+                cursor = 0
+                for s in range(split_blocks):
+                    train_segment = block_samples[cursor : cursor + adapt_sub]
+                    cursor += adapt_sub
 
+                    test_segment = block_samples[cursor : cursor + val_sub]
+                    cursor += val_sub
+
+                    if len(train_segment) == adapt_sub and len(test_segment) == val_sub:
+                        subject_runs.append({
+                            "r_idx": r_idx,
+                            "b_idx": b,
+                            "s_idx": s, 
+                            "train": train_segment,
+                            "test": test_segment,
+                            "all": train_segment + test_segment
+                        })
+                    
         return subject_runs
+
+
+def pareto_frontier(df):
+    pareto_points = []
+
+    for _, row in df.iterrows():
+        dominated = False
+
+        for _, other in df.iterrows():
+            if (
+                other["N_patients"] >= row["N_patients"] and
+                other["A"] >= row["A"] and
+                other["B"] >= row["B"] and
+                (
+                    other["N_patients"] > row["N_patients"] or
+                    other["A"] > row["A"] or
+                    other["B"] > row["B"]
+                )
+            ):
+                dominated = True
+                break
+
+        if not dominated:
+            pareto_points.append(row)
+
+    return pd.DataFrame(pareto_points)
 
 
 def parseargs():
@@ -411,6 +464,7 @@ def parseargs():
     parser.add_argument('--validation_batch_size', default=16, type=int, help='batch size for personalization')
     parser.add_argument('--num_train_val', default=2, type=int, help='number of training and validation phases per block')
     parser.add_argument('--valid_runs_number', default=2, type=int, help='valid runs number')
+    parser.add_argument('--split_blocks', default=1, type=int, help='number of train/test sub part of a block')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     args = parser.parse_args()
@@ -450,7 +504,8 @@ if __name__ == "__main__":
             window_length=args.input_seq_len_s, 
             adapt_size=args.personalization_batch_size, 
             val_size=args.validation_batch_size, 
-            block_length=block_length
+            block_length=block_length,
+            split_blocks=args.split_blocks
             )
     
         # Save the list of dictionaries, namely runs
@@ -471,9 +526,108 @@ if __name__ == "__main__":
     plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if block_length == 0 else f'all_subjects_run_lengths_{block_length}.jpg'))
 
     # Plot the Annotation statistics for the runs
-    runs = online_physio_dataset.get_subject_runs(subject_id, window_length=args.input_seq_len_s, adapt_size=args.personalization_batch_size, val_size=args.validation_batch_size, block_length=block_length)
+    runs = online_physio_dataset.get_subject_runs(
+        subject_id, 
+        window_length=args.input_seq_len_s, 
+        adapt_size=args.personalization_batch_size, 
+        val_size=args.validation_batch_size, 
+        block_length=block_length,
+        split_blocks=args.split_blocks
+    )
     
     plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"), show_bp_plot=args.plot)
     
     # Plot run length statistics across subjects
     plot_run_length_statistics(online_physio_dataset, savepath=root_figs_folder, keep_longest=False)
+    
+    # Choose a suitable value for the number of runs and number of train/val per run so that the number of aptietns is maximized
+    # -> find the pareto-frontier
+    A_values = range(1, 14)      # valid_runs_number (abrupt shifts)
+    B_values = range(1, 11)      # num_train_val (consecutive windows)
+
+    results = []
+    
+    for A in A_values:
+        for B in B_values:
+
+            args.valid_runs_number = A
+            args.num_train_val = B
+
+            block_length = args.num_train_val * (
+                args.personalization_batch_size + args.validation_batch_size
+            )
+
+            online_physio_dataset = OnlineSubjectDataset(
+                seed=args.seed,
+                lmdb_folder=os.path.join(args.dataset_folder, args.name),
+                fs=args.fs,
+                input_seq_len_s=args.input_seq_len_s,
+                ecg=args.ecg,
+                savepath=root_figs_folder,
+                block_length=block_length,
+                valid_runs_number=args.valid_runs_number
+            )
+
+            N = len(online_physio_dataset.subjects_for_personalization)
+
+            results.append({
+                "A": A,
+                "B": B,
+                "N_patients": N
+            })
+
+    
+    # Cvt ot dataframe
+    df = pd.DataFrame(results)
+    
+    # Extract the apreto frontier
+    pareto_df = pareto_frontier(df)
+    
+    feasible_df = df[df["N_patients"] >= 85]
+    pareto_feasible = pareto_df[pareto_df["N_patients"] >= 85].copy()
+    
+    pareto_feasible["balance"] = abs(
+        pareto_feasible["A"] - pareto_feasible["B"]
+    )
+    
+    # Select config (balance A and B as much as possible, then max A)   
+    selected = (
+        pareto_feasible
+        .sort_values(["balance", "A"], ascending=[True, False])
+        .iloc[0]
+    )
+    
+    # Abrupt-shift-stressed: maximize A, then minimize B
+    abrupt_shift_stressed = (
+        pareto_feasible
+        .sort_values(["A", "B"], ascending=[False, True])
+        .iloc[0]
+    )
+
+    # Gradual-shift-stressed: maximize B, then minimize A
+    gradual_shift_stressed = (
+        pareto_feasible
+        .sort_values(["B", "A"], ascending=[False, True])
+        .iloc[0]
+    )
+    
+    # Plot the pareto frontier
+    plot_pareto_frontier(
+        df,
+        pareto_feasible,
+        selected,
+        abrupt_shift_stressed,
+        gradual_shift_stressed,
+        savepath=os.path.join(
+            root_figs_folder,
+            "pareto_frontier_valid_runs_vs_train_val_blocks.png"
+        )
+    )
+    
+    print("[Pareto] Selected configurations with at least 85 patients:")
+    print("Balanced A/B:")
+    print(selected)
+    print("Abrupt-shift-stressed:")
+    print(abrupt_shift_stressed)
+    print("Gradual-shift-stressed:")
+    print(gradual_shift_stressed)

@@ -5,173 +5,128 @@ from torchinfo import summary
 from thop import profile, clever_format
 from component_factory import BPRegressor
 
-"""
-Simplified Proto encoder using:
-- Dilated ConvNeXt-style 1D blocks
-- Clean channel progression: 1 → 16 → 32 → 64 → 128
-- No conditional projection logic
-- Transformer encoder on top
-"""
 
-# ------------------------------------------------------
-# ConvNeXt-like 1D Block with dilation (simplified)
-# ------------------------------------------------------
-class ConvNeXtBlock1D(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size=7, dilation=1, expansion=4, downsample=True):
+class TemporalResBlock(nn.Module):
+    def __init__(self, inCh, outCh):
         super().__init__()
-        padding = ((kernel_size - 1) // 2) * dilation
 
-        # Depthwise conv
-        self.dwconv = nn.Conv1d(
-            in_ch, in_ch, kernel_size=kernel_size,
-            padding=padding, groups=in_ch, dilation=dilation
-        )
+        self.conv1 = nn.Conv1d(in_channels=inCh, out_channels=inCh, kernel_size=7, padding=3, groups=inCh)
+        self.gn1 = nn.GroupNorm(num_groups=min(8, inCh), num_channels=inCh)
+        self.relu1 = nn.ReLU()
 
-        # Residual channel mapping (always needed since channels always change)
-        self.res_conv = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+        self.l1 = nn.Linear(inCh, outCh)
+        self.relu2 = nn.ReLU()
 
-        # Normalization + MLP operate on (B, L, C)
-        self.norm = nn.LayerNorm(in_ch)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_ch, expansion * in_ch),
-            nn.GELU(),
-            nn.Linear(expansion * in_ch, in_ch),
-        )
+        self.l2 = nn.Linear(outCh, outCh)
+        self.gn3 = nn.GroupNorm(num_groups=min(8, outCh), num_channels=outCh)
 
-        # Final 1×1 to match output channels
-        self.pw_conv = nn.Conv1d(in_ch, out_ch, kernel_size=1)
-
-        self.down = nn.AvgPool1d(kernel_size=2, stride=2) if downsample else nn.Identity()
+        self.convres = nn.Conv1d(inCh, outCh, kernel_size=1)
+        self.gnres = nn.GroupNorm(num_groups=min(8, outCh), num_channels=outCh)
+    
+        self.reluout = nn.ReLU()
+        self.pool = nn.AvgPool1d(kernel_size=2, stride=2)
 
     def forward(self, x):
-        # x: (B, C, L)
-        res = self.res_conv(x)
+        y = self.conv1(x)
+        y = self.gn1(y)
+        y = self.relu1(y)
 
-        y = self.dwconv(x)
-        y = y.permute(0, 2, 1)      # (B, L, C)
-        y = self.norm(y)
-        y = self.mlp(y)
-        y = y.permute(0, 2, 1)      # (B, C, L)
-        y = self.pw_conv(y)
+        y = y.permute(0, 2, 1)
+        y = self.l1(y)
+        y = self.relu2(y)
+        y = self.l2(y)
+        y = y.permute(0, 2, 1)
+        y = self.gn3(y)
 
-        y = y + res
-        y = self.down(y)
-        return y
+        res = self.convres(x)
+        res = self.gnres(res)
+
+        out = self.reluout(y + res)
+        out = self.pool(out)
+
+        return out
 
 
-# ------------------------------------------------------
-# Temporal Stack (channel progression fixed)
-# ------------------------------------------------------
 class TemporalBlock(nn.Module):
-    def __init__(self, embed_dim=128):
-        super().__init__()
-        self.b0 = ConvNeXtBlock1D(1, 32, kernel_size=7, dilation=1)
-        self.b1 = ConvNeXtBlock1D(32, 64, kernel_size=7, dilation=2)
-        self.b2 = ConvNeXtBlock1D(64, 128, kernel_size=7, dilation=4)
-        self.b3 = ConvNeXtBlock1D(128, embed_dim, kernel_size=7, dilation=8)
+    def __init__(self):
+        super(TemporalBlock, self).__init__()
+
+        self.tresblock0 = TemporalResBlock(1, 32)
+        self.tresblock1 = TemporalResBlock(32, 64)
+        self.tresblock2 = TemporalResBlock(64, 128)
+        self.tresblock3 = TemporalResBlock(128, 128)
 
     def forward(self, x):
-        # Accepts (B,T) or (B,1,T)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        elif x.dim() == 3 and x.shape[1] != 1:
-            x = x[:, :1, :]
-
-        y = self.b0(x)
-        y = self.b1(y)
-        y = self.b2(y)
-        y = self.b3(y)
-
-        # Output: (B,128,L) → (B,L,128)
-        return y.permute(0, 2, 1)
-
-
-# ------------------------------------------------------
-# Transformer Encoder
-# ------------------------------------------------------
-class TransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=128, num_heads=4, num_layers=2, ff_mult=4, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                'attn': nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout),
-                'norm1': nn.LayerNorm(embed_dim),
-                'ff': nn.Sequential(
-                    nn.Linear(embed_dim, ff_mult * embed_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(ff_mult * embed_dim, embed_dim),
-                ),
-                'norm2': nn.LayerNorm(embed_dim)
-            })
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, x):
-        for block in self.layers:
-            attn_out, _ = block['attn'](x, x, x)
-            x = block['norm1'](x + attn_out)
-            ff_out = block['ff'](x)
-            x = block['norm2'](x + ff_out)
-        return x
-
-
-# ------------------------------------------------------
-# Full Feature Generator (ConvNeXt → Transformer)
-# ------------------------------------------------------
+        x = torch.unsqueeze(x, dim=-1).permute(0, 2, 1)
+        y = self.tresblock0(x)
+        y = self.tresblock1(y)
+        y = self.tresblock2(y)
+        y = self.tresblock3(y)
+        y = y.permute(0, 2, 1)
+        return y
+   
 class GenSignalFeatures(nn.Module):
     def __init__(self, embed_dim=128):
         super().__init__()
-        self.temporal = TemporalBlock(embed_dim=embed_dim)     # outputs 128-dim features
 
-        self.transformer = TransformerEncoder(embed_dim=embed_dim, num_heads=4, num_layers=2)
+        self.temporalblock = TemporalBlock()
+
+        self.t_gru = nn.GRU(input_size=embed_dim, hidden_size=embed_dim, batch_first=True)
+        self.t_ln = nn.LayerNorm(embed_dim)
 
     def forward(self, signal):
-        x = self.temporal(signal)          # (B,L,128)
-        x = self.transformer(x)            # (B,L,E)
-        return x
 
+        feature_t = self.temporalblock(signal)          # shape [B, T, C]
 
-# ------------------------------------------------------
-# Proto model
-# ------------------------------------------------------
+        o0, h0 = self.t_gru(feature_t)                  # shape [B, T, C]
+        y = self.t_ln(o0)                               # LayerNorm on features
+
+        return y
+
 class Proto(nn.Module):
-    def __init__(self, ecg=False, fs=125, input_seq_len_s=10, embed_dim=128):
-        super().__init__()
-        self.input_seq_len = fs * input_seq_len_s
+    def __init__(self, 
+                 ecg=False,  
+                 fs=125, 
+                 input_seq_len_s=10,
+                 embed_dim=256):
+        super(Proto, self).__init__()
+        self.input_seq_len = input_seq_len_s * fs
         self.ecg = ecg
-        self.embed_dim = 2 * embed_dim if ecg else embed_dim
-        self.in_channels = 2 if ecg else 1
-
-        self.ppg_f = GenSignalFeatures(embed_dim)
-        if ecg:
-            self.ecg_f = GenSignalFeatures(embed_dim)
-
-    def forward(self, x):
-        if x.dim() == 2:
-            x = x.unsqueeze(-1)
-        if x.dim() != 3:
-            raise ValueError("Input must be [B,T,C] or [B,C,T]")
-
-        # Ensure (B,C,T)
-        if x.shape[1] == self.input_seq_len and x.shape[2] == self.in_channels:
-            x = x.permute(0, 2, 1)
-        if x.shape[1] != self.in_channels:
-            raise ValueError("Channel mismatch")
-
-        ppg = self.ppg_f(x[:, 0, :])
-        ppg = torch.mean(ppg, dim=1)
-
+        self.embed_dim = 2 * embed_dim if self.ecg else embed_dim
+        self.in_channels = 2 if self.ecg else 1
+                        
+        self.ppg_feature_gen = GenSignalFeatures(embed_dim=embed_dim)
+        
         if self.ecg:
-            ecg = self.ecg_f(x[:, 1, :])
-            ecg = torch.mean(ecg, dim=1)
-            return torch.cat((ppg, ecg), dim=-1)
-        return ppg
+            self.ecg_feature_gen = GenSignalFeatures(embed_dim=embed_dim)
+            
+    def forward(self, x):        
+        if len(x.shape) == 2:
+            x = x.unsqueeze(-1)
+        
+        if len(x.shape) != 3:
+            raise ValueError("Input tensor must have shape [B, T, C] or [B, C, T]")
+        
+        if (x.shape[1] == self.input_seq_len and x.shape[2] == self.in_channels):
+            x = x.permute(0, 2, 1)
+        
+        if (x.shape[1] != self.in_channels or x.shape[2] != self.input_seq_len):
+            raise ValueError("Input tensor dimension mismatch")
 
+        ppg_feats = self.ppg_feature_gen(x[:,0,:])
+        if self.ecg:
+            ecg_feats = self.ecg_feature_gen(x[:,1,:])
+            features = torch.cat((
+                torch.mean(ppg_feats, dim=1), 
+                torch.mean(ecg_feats, dim=1)
+                ), 
+                dim=-1)
+        else:
+            features = torch.mean(ppg_feats, dim=1)
+        
+        return features # features shape: [B, feat_dim]
+    
 
-# ------------------------------------------------------
-# CLI + model profiling
-# ------------------------------------------------------
 def parseargs():
     p = argparse.ArgumentParser()
     p.add_argument('--batch_size', default=16, type=int)
@@ -184,18 +139,23 @@ def parseargs():
 
 if __name__ == "__main__":
     args = parseargs()
+    
     encoder = Proto(args.ecg, args.fs, args.input_seq_len_s, args.embed_dim)
-
     x = torch.rand((args.batch_size, args.input_seq_len_s * args.fs, 2 if args.ecg else 1))
 
     print("\n--- Encoder Summary ---")
     summary(encoder, input_data=[x], col_names=("input_size","output_size","num_params","mult_adds"))
 
     macs, params = profile(encoder, inputs=(x,))
-    print("MACs, Params:", clever_format([macs, params], "%.3f"))
-
+    macs, params = clever_format([macs, params], "%.7f")
+    print(f'Proto Encoder has {params} params and {macs} MACs.')
+    
     head = BPRegressor(encoder.embed_dim, 3)
     y = torch.rand((args.batch_size, encoder.embed_dim))
 
     print("\n--- Head Summary ---")
-    summary(head, input_data=[y])
+    summary(head, input_data=[y], col_names=("input_size","output_size","num_params","mult_adds"))
+    
+    macs, params = profile(head, inputs=(y,))
+    macs, params = clever_format([macs, params], "%.7f")
+    print(f'Proto Head has {params} params and {macs} MACs.')

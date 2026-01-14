@@ -10,7 +10,7 @@ import numpy as np
 from scipy.signal import resample_poly
 from pyampd.ampd import find_peaks
 import wfdb
-from utils.preprocessing_utils import *
+from signal_processing import *
 
 
 def process_subject(subject_path, subject_id, args, savepath, result_queue, required_signals=['II'], optional_signals=['RESP'], min_signal_duration=8, nans_th=0.05, flat_th=0.05):

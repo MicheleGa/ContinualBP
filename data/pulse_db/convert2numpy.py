@@ -154,8 +154,11 @@ def preprocess_subject(mat_path, out_folder):
         data = loadmat(mat_path)
         segs = data['Subj_Wins']
         subject_id = os.path.basename(mat_path).replace(".mat", "")
+        out_file = os.path.join(out_folder, subject_id + ".npz")
         
+        # Extract ABP data
         abp = np.array(segs['ABP_Raw'])
+        
         n_segments = abp.shape[0]
         
         if len(abp.shape) < 3:
@@ -164,8 +167,8 @@ def preprocess_subject(mat_path, out_folder):
         
         # Extract signals
         signals = np.concatenate([
-            np.array(segs['ECG_F']),
-            np.array(segs['PPG_F']),
+            np.array(segs['ECG_Record_F']),
+            np.array(segs['PPG_Record_F']),
             abp
         ], axis=1)  # (n_segments, 3, 1250)
         
@@ -190,9 +193,9 @@ def preprocess_subject(mat_path, out_folder):
         #print('SBP shape:', sbp.shape)
         #print('DBP shape:', dbp.shape)
         #print('MAP shape:', map.shape)
-        #print('Age shape:', age)
-        #print('Gender shape:', gender)
-        
+        #print('Age:', age)
+        #print('Gender:', gender)
+
         #results = check_record_continuity(timestamps=timestamps)
         #visualize_gaps(results)
         
@@ -210,8 +213,7 @@ def preprocess_subject(mat_path, out_folder):
         #                            for disc in results['discontinuities']])
         #    print(f"Estimated total missing time: {total_missing_time:.6f} seconds")
         
-        out_file = os.path.join(out_folder, subject_id + ".npz")
-        
+        # Save to compressed npz
         np.savez_compressed(
             out_file,
             signals=signals.astype(np.float32),

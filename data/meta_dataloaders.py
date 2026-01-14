@@ -224,7 +224,7 @@ class MetaTaskDataset(Dataset):
             # This should not happen because we filtered runs by length >= total_needed at init,
             # but double-check to be safe.
             raise ValueError(f"Chosen run is too short for patient {pid} (run_len={run_len} < needed={total_needed})")
-
+        
         # Choose a chronological slice inside the run: start index in [0, run_len - total_needed]
         max_start = run_len - total_needed
         if max_start == 0:
@@ -263,6 +263,7 @@ def build_meta_splits_and_loaders(
     ecg: bool = False,
     pretraining_split_ratio=(0.7, 0.1, 0.2),
     meta_split_ratio: float = 0.2,
+    drift_aware: bool = False,
     min_subject_sample_number: int = 0,
     loader_workers: int = 4,
     # meta/task params
@@ -283,6 +284,7 @@ def build_meta_splits_and_loaders(
         lmdb_folder=lmdb_folder,
         pretraining_split_ratio=list(pretraining_split_ratio),
         meta_split_ratio=meta_split_ratio,
+        drift_aware=drift_aware,
         fs=fs,
         input_seq_len_s=input_seq_len_s,
         ecg=ecg,
@@ -383,6 +385,10 @@ def parseargs():
     parser.add_argument('--fs', type=int, default=125, help='signals frequency')
     parser.add_argument('--input_seq_len_s', type=int, default=10, help='single window duration')
     parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
+    parser.add_argument('--pretraining_tr_val_tt_split_ratio', default='0.7,0.15,0.15', type=str, help='ratio for train, validation, and test split, comma separated')
+    parser.add_argument('--meta_train_split_ratio', default=0.2, type=float, help='percentage of subjects to extract from the training subjects for meta-learning')
+    parser.add_argument('--min_subject_sample_number', default=0, type=int, help='minimum number of samples per subject to consider it valid, 0 means no limit; given the support and query sample number, it is set to 15')
+    parser.add_argument('--drift_aware', action=argparse.BooleanOptionalAction, default=False, help='sample training subjects according to their SBP drift over time or nots')
     parser.add_argument('--k_support', type=int, default=16, help='meta-learning support set size')
     parser.add_argument('--k_query', type=int, default=16, help='meta-learning query set size')
     parser.add_argument('--meta_batch_size', type=int, default=4, help='meta batch size')
@@ -408,8 +414,9 @@ if __name__ == "__main__":
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
-        pretraining_split_ratio=(0.7, 0.1, 0.2),
-        meta_split_ratio=0.2,
+        pretraining_split_ratio=tuple(map(float, args.pretraining_tr_val_tt_split_ratio.split(','))),
+        meta_split_ratio=args.meta_train_split_ratio,
+        drift_aware=args.drift_aware,
         k_support=args.k_support,
         k_query=args.k_query,
         meta_batch_size=args.meta_batch_size,

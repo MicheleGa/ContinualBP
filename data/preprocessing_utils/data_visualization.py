@@ -1,9 +1,11 @@
 import os
+from pathlib import Path
 from collections import Counter
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator
 import seaborn as sns
 import torch
 from torch.utils.data import DataLoader, SubsetRandomSampler
@@ -818,6 +820,7 @@ def plot_subject_annotation_runs(dataset, subject_id, blocks, savepath="subject_
                    c=[colors_runs[i]], label=f'Run {run_idx}', alpha=0.7, s=30)
     
     ax1.set_ylabel('Block Number')
+    ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
     ax1.set_title('Window Index vs Block Number')
     ax1.grid(True, alpha=0.3)
     ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -862,10 +865,7 @@ def plot_subject_annotation_runs(dataset, subject_id, blocks, savepath="subject_
     plt.tight_layout()
     
     # Save the figure
-    if not show_bp_plot:
-        plt.savefig(savepath)
-    else:
-        plt.show()
+    plt.savefig(savepath)
     plt.close()
 
 
@@ -1006,31 +1006,28 @@ def plot_meta_dataset_run_distribution(meta_ds, dataset_name="train", savepath='
     plt.close()
 
 
-def plot_blockwise_mae(per_block_stats, subject_id, savepath=None):
-    """
+def plot_blockwise_mae(per_block_stats, index_to_plot, subject_id, savepath):
+    r"""
     Plot MAE with errorbars per baseline for a subject.
     This function is intentionally standalone so you can move it to data_visualization.py
     Expected input format: per_block_stats is a dict mapping baseline -> {'mae': list, 'std': list}
     """
-    blocks = len(next(iter(per_block_stats.values()))['mae'])
+    blocks = len(next(iter(per_block_stats.values()))[f'{index_to_plot}_mae'])
     x = np.arange(1, blocks + 1)
     plt.figure(figsize=(12,8))
     for b in per_block_stats.keys():
-        mae_arr = per_block_stats[b]['mae']
-        std_arr = per_block_stats[b]['std']
+        mae_arr = per_block_stats[b][f'{index_to_plot}_mae']
+        std_arr = per_block_stats[b][f'{index_to_plot}_std']
         mae_plot = np.array([np.nan if v is None else v for v in mae_arr])
         std_plot = np.array([np.nan if v is None else v for v in std_arr])
         plt.errorbar(x, mae_plot, yerr=std_plot, label=b, marker='o')
     plt.xlabel('Block index (chronological)')
     plt.ylabel('MAE (with STD errorbars)')
-    plt.title(f'Subject {subject_id} - Blockwise test MAE per baseline')
+    plt.title(f'Subject {subject_id} - Blockwise {index_to_plot} test MAE per baseline')
     plt.legend()
     plt.tight_layout()
-    if savepath is not None:
-        plt.savefig(savepath)
-        plt.close()
-    else:
-        plt.show()
+    plt.savefig(savepath)
+    plt.close()
         
         
 def plot_age_gender_distribution(valid_subjects, index_file_path, savepath="./figs", filename=""):
@@ -1212,4 +1209,247 @@ def plot_update_summary_table(updates_dict, save_path):
     plt.xticks(rotation=20, ha="right")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+
+def plot_feature_distance_over_time(feature_df, subject_id, baseline, savepath):
+
+    x = np.arange(len(feature_df))
+
+    plt.figure(figsize=(12, 8))
+    plt.plot(x, feature_df["train_scaled"], label="Train", marker="o")
+    plt.plot(x, feature_df["test_scaled"], label="Test", marker="x")
+    plt.xlabel("Streamed block index")
+    plt.ylabel("Scaled feature distance")
+    plt.title(f"Feature drift — Subject {subject_id} — {baseline}")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=300)
+    plt.close()
+    
+
+def plot_sbp_drift_distribution(drift_info, subject_ids, title, savepath):
+    values = np.array([
+        drift_info[s]["sbp_std_over_time"]
+        for s in subject_ids
+        if s in drift_info
+    ])
+
+    q25, q50, q75 = np.percentile(values, [25, 50, 75])
+
+    plt.figure(figsize=(10, 7))
+    plt.hist(values, bins=30, alpha=0.7, edgecolor="black")
+
+    for q, label in zip([q25, q50, q75], ["25%", "50%", "75%"]):
+        plt.axvline(q, linestyle="--", label=label)
+
+    plt.xlabel("SBP temporal drift (std over time)")
+    plt.ylabel("Number of subjects")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(savepath, f"{title}.png"), dpi=300)
+    plt.close()
+
+
+def plot_drift_regime_counts(drift_info, subject_ids, q25, q75, title, savepath):
+    regimes = []
+
+    for s in subject_ids:
+        if s not in drift_info:
+            raise ValueError(f"Subject {s} not found in drift_info.")
+
+        v = drift_info[s]["sbp_std_over_time"]
+        if v <= q25:
+            regimes.append("Low")
+        elif v <= q75:
+            regimes.append("Medium")
+        else:
+            regimes.append("High")
+
+    counts = Counter(regimes)
+
+    plt.figure(figsize=(10, 8))
+    plt.bar(counts.keys(), counts.values())
+    plt.ylabel("Number of subjects")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(savepath, f"{title}.png"), dpi=300)
+    plt.close()
+    
+    
+def plot_sbp_drift_over_time(df: pd.DataFrame, subject_id: str, savepath: str):
+    fig, axs = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    axs[0].plot(df["batch_mean_sbp"], label="Batch mean SBP")
+    axs[0].plot(df["rolling_mean_sbp"], label="Rolling mean SBP", linestyle="--")
+    axs[0].set_ylabel("SBP (mmHg)")
+    axs[0].legend()
+    axs[0].grid(True)
+    
+    axs[1].plot(df["abs_drift_sbp"], color="orange")
+    axs[1].set_ylabel("Absolute drift (mmHg)")
+    axs[1].grid(True)
+
+    axs[2].plot(df["rel_drift_sbp"], color="red")
+    axs[2].set_ylabel("Relative drift")
+    axs[2].set_xlabel("Personalization step")
+    axs[2].grid(True)
+    
+    fig.suptitle(f"SBP Drift - Patient {subject_id}")
+    plt.tight_layout()
+    plt.savefig(savepath)
+    plt.close()
+
+
+def plot_sbp_abs_rel_drift_distributions(
+    master_df,
+    savepath,
+    filename_prefix="sbp_drift"
+):
+    savepath = Path(savepath)
+
+    abs_drift = master_df["abs_drift_sbp"].values
+    rel_drift = master_df["rel_drift_sbp"].values
+
+    # -----------------------------
+    # Plot 1: Absolute drift
+    # -----------------------------
+    plt.figure(figsize=(10, 8))
+    sns.histplot(abs_drift, bins=40, kde=True)
+    plt.xlabel("Absolute SBP drift (mmHg)")
+    plt.ylabel("Count")
+    plt.title("Absolute SBP Drift Distribution")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(savepath / f"{filename_prefix}_abs_drift.png", dpi=300)
+    plt.close()
+
+    # -----------------------------
+    # Plot 2: Relative drift + percentiles
+    # -----------------------------
+    percentiles = [50, 70, 80, 90]
+    pct_vals = np.percentile(rel_drift, percentiles)
+
+    plt.figure(figsize=(10, 8))
+    sns.histplot(rel_drift, bins=40, kde=True)
+
+    for p, v in zip(percentiles, pct_vals):
+        plt.axvline(v, linestyle="--", label=f"{p}th: {v:.3f}")
+
+    plt.xlabel("Relative SBP drift")
+    plt.ylabel("Count")
+    plt.title("Relative SBP Drift Distribution")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(savepath / f"{filename_prefix}_rel_drift.png", dpi=300)
+    plt.close()
+    
+
+def plot_param_updates(df, subject_id, save_path):
+    
+    MODE_COLORS = {
+        "head": '#AEC6CF',       # pastel blue
+        "temporal": '#A8E6CF',   # pastel green
+        "all": '#FFD1DC'         # pastel pink
+    }
+
+
+    # Sort by true chronological order
+    sort_cols = [c for c in ["r_idx", "b_idx", "s_idx"] if c in df.columns]
+    df = df.sort_values(sort_cols)
+
+    x = df["s_idx"].values
+    y = df["fraction_updated"].values
+    modes = df["update_mode"].values
+    colors = [MODE_COLORS[m] for m in modes]
+
+    plt.figure(figsize=(12, 5))
+
+    plt.bar(
+        x,
+        y,
+        color=colors,
+        edgecolor="black",
+        linewidth=0.4
+    )
+
+    # Legend (manual)
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=MODE_COLORS[m])
+        for m in MODE_COLORS
+    ]
+    labels = list(MODE_COLORS.keys())
+    plt.legend(handles, labels, title="Update mode")
+
+    plt.xlabel("Adaptation step index (s_idx)")
+    plt.ylabel("Updated parameters (%)")
+    plt.title(f"Adaptive parameter updates — Subject {subject_id}")
+
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def plot_pareto_frontier(
+    df,
+    pareto_df,
+    selected,
+    shift_stressed,
+    calibration_stressed,
+    savepath,
+    min_patients=85
+):
+
+    plt.figure(figsize=(10, 8))
+
+    pareto_feasible = pareto_df[pareto_df["N_patients"] >= min_patients]
+
+    # Background: all configurations
+    plt.scatter(
+        df["A"], df["B"],
+        color="lightgray", alpha=0.4,
+        label="All configurations"
+    )
+
+    # Feasible Pareto points
+    plt.scatter(
+        pareto_feasible["A"], pareto_feasible["B"],
+        s=120, color="red",
+        label="≥ 85 patients"
+    )
+
+    # Balanced configuration (main)
+    plt.scatter(
+        selected["A"], selected["B"],
+        s=220, marker="^",
+        color="blue",
+        label="balanced"
+    )
+
+    # Shift-stressed configuration
+    plt.scatter(
+        shift_stressed["A"], shift_stressed["B"],
+        s=220, marker="^",
+        color="green",
+        label="Abrupt-Shift-Focused"
+    )
+
+    # Calibration-stressed configuration
+    plt.scatter(
+        calibration_stressed["A"], calibration_stressed["B"],
+        s=220, marker="^",
+        color="orange",
+        label="Gradual-Shift-Focused"
+    )
+
+    plt.xlabel("Minimum abrupt shifts per subject")
+    plt.ylabel("Minimum consecutive blocks per subject")
+    plt.title("Pareto frontier under AAMI/BHS constraint")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=300)
     plt.close()
