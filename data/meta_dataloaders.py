@@ -1,22 +1,18 @@
-from collections import defaultdict
 import os 
 import argparse
-from distutils.util import strtobool
-import argparse
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 from dataset import PhysioDataset  
-from preprocessing_utils.augmentations import get_ppg_augmentations, get_ecg_augmentations
+from preprocessing_utils.data_visualization import plot_age_gender_distribution, calculate_dataloaders_mean_std, plot_meta_dataset_run_distribution
 
 
 def _stack_batch(batch):
     """
     Normalize (X, Y) pairs into tensors with shapes:
       - X: (B, C, T)
-      - Y: (B, 3)   for sig2sig=False
-      - Y: (B, T) + (B, 3) for sig2sig=True
+      - Y: (B, 3)   
     """
     xs = [b[0] for b in batch]
     ys = [b[1] for b in batch]
@@ -41,59 +37,211 @@ def _stack_batch(batch):
     
     return X, Y
 
+
 class MetaTaskDataset(Dataset):
     """
     Each __getitem__ returns ONE TASK for meta-learning:
         - Pick a patient (domain)
-        - Sample K support windows and Q query windows from that patient
+        - Sample K support windows and K_query query windows chronologically
+          from one contiguous run of that patient
         - Return ((X_s, Y_s), (X_q, Y_q), patient_id)
+    Implementation steps:
+      1) Remove patients with fewer than k_support + k_query samples
+      2) Precompute chronological runs per patient using timestamps in LMDB
+      3) Remove runs shorter than k_support + k_query
+      4) Remove patients without any valid runs
+      5) At sampling time: choose a run reproducibly, choose a chronological slice
     """
-
     def __init__(
         self,
         base_dataset: PhysioDataset,
         patient_ids: List[str],
         k_support: int = 8,
         k_query: int = 8,
-        allow_replacement: bool = False
+        window_length: int = 10,   # seconds (used to determine contiguous runs)
     ):
         super().__init__()
         self.ds = base_dataset
-        self.patient_ids = list(patient_ids)
-        self.k_support = k_support
-        self.k_query = k_query
-        self.allow_replacement = allow_replacement
-        self.rng = np.random.default_rng(base_dataset.seed)
+        self.orig_patient_ids = list(patient_ids)
+        self.k_support = int(k_support)
+        self.k_query = int(k_query)
+        self.window_length = float(window_length)
+        self.total_needed = self.k_support + self.k_query
 
-        # Patient → list of sample_ids
+        # Reproducible RNG (seeded from base dataset)
+        # Note: when using multiple DataLoader workers you may want to reseed per worker.
+        self.rng = np.random.default_rng(getattr(base_dataset, "seed"))
+
+        # Patient → list of sample_ids (as provided by PhysioDataset)
         self.index_by_subject_id = self.ds.index_by_subject_id
+
+        print(f"[MetaTaskDataset] Dataset initialized with {len(self.orig_patient_ids)} patients.")
+
+        # 1) Filter patients with insufficient total samples
+        filtered_patients = []
+        for pid in self.orig_patient_ids:
+            sample_ids = list(self.index_by_subject_id.get(pid))
+            if len(sample_ids) >= self.total_needed:
+                filtered_patients.append(pid)
+            # else: excluded
+        print(f"[MetaTaskDataset] {len(filtered_patients)} patients remain after filtering by total samples >= {self.total_needed}.")
+
+        # 2) Precompute runs for each remaining patient
+        runs_by_patient = {}
+        for pid in filtered_patients:
+            sample_ids = list(self.index_by_subject_id.get(pid))
+            runs = self.find_consecutive_runs(sample_ids, window_length=self.window_length)
+            
+            # Filter runs by minimum length requirement
+            valid_runs = [r for r in runs if r["length"] >= self.total_needed]
+            if len(valid_runs) > 0:
+                runs_by_patient[pid] = valid_runs
+            # else: patient will be excluded (no runs long enough)
+        print(f"[MetaTaskDataset] {len(runs_by_patient)} patients remain after filtering runs by length >= {self.total_needed}.")
+
+        # 3) Remove patients without valid runs
+        self.patient_ids = sorted([pid for pid, patient_runs in runs_by_patient.items() if len(patient_runs) > 0])
+        self.runs_by_patient = {pid: runs_by_patient[pid] for pid in self.patient_ids}
+        print(f"[MetaTaskDataset] {len(self.patient_ids)} patients remain after final filtering by the number of runs per patient.")
+        
+        if len(self.patient_ids) == 0:
+            raise ValueError(
+                f"No patients left after filtering. Need at least one patient with >= {self.total_needed} samples "
+                f"and at least one run of length >= {self.total_needed}."
+            )
+
+        # For debug/visibility
+        print(f"[MetaTaskDataset] Initialized with {len(self.patient_ids)} patients (k_support={self.k_support}, k_query={self.k_query}).")
+
+    def find_consecutive_runs(self, sample_list, window_length):
+        """
+        Find runs of chronologically consecutive windows for a list of sample ids.
+
+        Returns a list of dictionaries with keys:
+          - start_idx, end_idx, length, start_time, end_time, sample_ids (ordered chronologically)
+        """
+        if sample_list is None:
+            return []
+
+        samples = list(sample_list)
+        n = len(samples)
+        if n == 0:
+            return []
+
+        valid_samples = []
+
+        # Expect PhysioDataset to expose an opened LMDB transaction as `lmdbtxn`
+        lmdbtxn = getattr(self.ds, "lmdbtxn")
+        if lmdbtxn is None:
+            # If PhysioDataset doesn't expose a transaction, raise a clear error.
+            raise RuntimeError("[MetaTaskDataset] PhysioDataset must expose `lmdbtxn` (an open LMDB transaction) for timestamp reads.")
+
+        # Read timestamps for each sample. Keep those with valid timestamps.
+        for sid in samples:
+            key = f"{sid}-timestamp".encode()
+            raw = lmdbtxn.get(key)
+            if raw is None:
+                raise ValueError(f"[MetaTaskDataset] Sample {sid} missing timestamp in LMDB.")
+            ts = np.squeeze(np.frombuffer(raw, dtype="float32"))
+            if ts.size == 0:
+                raise ValueError(f"[MetaTaskDataset] Sample {sid} has empty timestamp in LMDB.")
+            valid_samples.append((sid, float(ts[0]), float(ts[-1])))
+
+        if len(valid_samples) == 0:
+            return []
+
+        # Unpack and sort by start time
+        sample_ids = [x[0] for x in valid_samples]
+        starts = np.array([x[1] for x in valid_samples], dtype=float)
+        ends = np.array([x[2] for x in valid_samples], dtype=float)
+
+        order = np.argsort(starts)
+        sorted_ids = [sample_ids[i] for i in order]
+        sorted_starts = starts[order]
+        sorted_ends = ends[order]
+
+        # Single-window case -> single run
+        if len(sorted_starts) <= 1:
+            return [{
+                "start_idx": 0,
+                "end_idx": 0,
+                "length": 1,
+                "start_time": float(sorted_starts[0]),
+                "end_time": float(sorted_ends[0]),
+                "sample_ids": [sorted_ids[0]]
+            }]
+
+        # Compute diffs of consecutive START times
+        diffs = np.diff(sorted_starts)
+
+        # Threshold: if gap between starts larger than window_length + 0.5s -> break
+        threshold = float(window_length) + 0.5
+
+        runs = []
+        run_start = 0
+        for i, gap in enumerate(diffs):
+            if gap > threshold:
+                run_end = i
+                runs.append({
+                    "start_idx": run_start,
+                    "end_idx": run_end,
+                    "length": run_end - run_start + 1,
+                    "start_time": float(sorted_starts[run_start]),
+                    "end_time": float(sorted_ends[run_end]),
+                    "sample_ids": sorted_ids[run_start:run_end+1]
+                })
+                run_start = i + 1
+
+        # Add last run
+        if run_start <= len(sorted_ids) - 1:
+            runs.append({
+                "start_idx": run_start,
+                "end_idx": len(sorted_ids) - 1,
+                "length": len(sorted_ids) - run_start,
+                "start_time": float(sorted_starts[run_start]),
+                "end_time": float(sorted_ends[-1]),
+                "sample_ids": sorted_ids[run_start:]
+            })
+
+        return runs
+
+    def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
+        """
+        Sample disjoint support/query windows from one chronological run of patient `pid`.
+        Returns (support_ids, query_ids), both lists of sample ids in chronological order.
+        """
+        runs = self.runs_by_patient.get(pid)
+        if not runs:
+            raise ValueError(f"No valid runs for patient {pid} at sampling time.")
+
+        # choose a run randomly among valid runs (reproducible via self.rng)
+        run = self.rng.choice(runs)
+        sample_ids = run["sample_ids"]
+        run_len = len(sample_ids)
+        total_needed = self.total_needed
+
+        if run_len < total_needed:
+            # This should not happen because we filtered runs by length >= total_needed at init,
+            # but double-check to be safe.
+            raise ValueError(f"Chosen run is too short for patient {pid} (run_len={run_len} < needed={total_needed})")
+
+        # Choose a chronological slice inside the run: start index in [0, run_len - total_needed]
+        max_start = run_len - total_needed
+        if max_start == 0:
+            start_idx = 0
+        else:
+            start_idx = int(self.rng.integers(0, max_start + 1))  # inclusive of max_start
+
+        support_ids = sample_ids[start_idx:start_idx + self.k_support]
+        query_ids = sample_ids[start_idx + self.k_support:start_idx + total_needed]
+
+        return support_ids, query_ids
 
     def __len__(self):
         return len(self.patient_ids)
 
-    def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
-        """
-        Sample disjoint support/query windows for one patient.
-        - Support: k_support random sample_ids
-        - Query: k_query random sample_ids (disjoint from support)
-        """
-        sample_ids = list(self.index_by_subject_id[pid])
-        n_total = len(sample_ids)
-        total_needed = self.k_support + self.k_query
-
-        if self.allow_replacement or total_needed > n_total:
-            # Fallback: sample with replacement
-            chosen = self.rng.choice(sample_ids, size=total_needed, replace=True)
-            return list(chosen[:self.k_support]), list(chosen[self.k_support:])
-
-        # Sample without replacement: disjoint sets
-        chosen = self.rng.choice(sample_ids, size=total_needed, replace=False)
-        support_ids = list(chosen[:self.k_support])
-        query_ids   = list(chosen[self.k_support:])
-        
-        return support_ids, query_ids
-
     def __getitem__(self, idx):
+        # Map idx to a patient (wrap-around if needed)
         pid = self.patient_ids[idx % len(self.patient_ids)]
         support_ids, query_ids = self._sample_indices_for_patient(pid)
 
@@ -104,26 +252,25 @@ class MetaTaskDataset(Dataset):
         Xq, Yq = _stack_batch(query_batch)    # [k_query, C, T]
 
         return (Xs, Ys), (Xq, Yq), pid
-        
+
 
 def build_meta_splits_and_loaders(
     lmdb_folder: str,
+    root_figs_folder: str = './',
     seed: int = 42,
     fs: int = 125,
     input_seq_len_s: int = 10,
     ecg: bool = False,
-    sig2sig: bool = False,
     pretraining_split_ratio=(0.7, 0.1, 0.2),
-    mix_pretraining_subject_samples: bool = False,
+    meta_split_ratio: float = 0.2,
     min_subject_sample_number: int = 0,
     loader_workers: int = 4,
     # meta/task params
-    k_support: int = 8,
-    k_query: int = 8,
-    meta_batch_size: int = 16,
-    tasks_per_epoch_train: Optional[int] = None,
-    tasks_per_epoch_val: Optional[int] = None,
-    tasks_per_epoch_test: Optional[int] = None,
+    k_support: int = 16,
+    k_query: int = 16,
+    meta_batch_size: int = 4,
+    plot: bool = False,
+    index_file_name: str = ''
 ):
     """
     Returns:
@@ -135,92 +282,113 @@ def build_meta_splits_and_loaders(
         seed=seed,
         lmdb_folder=lmdb_folder,
         pretraining_split_ratio=list(pretraining_split_ratio),
-        mix_pretraining_subject_samples=mix_pretraining_subject_samples,
+        meta_split_ratio=meta_split_ratio,
         fs=fs,
         input_seq_len_s=input_seq_len_s,
         ecg=ecg,
-        sig2sig=sig2sig,
         min_subject_sample_number=min_subject_sample_number,
         plot=False,
         savepath="./figs"
     )
 
     # 2) Use its split function to partition subjects (domain split). This fills:
-    #    self.pretraining_train_subjects / val / test (when mix_pretraining_subject_samples=False)
+    #    supervised train & meta learning subjects / val / test 
     _ = base_ds.get_pretraining_samplers()
 
-    if mix_pretraining_subject_samples:
-        raise ValueError(
-            "For meta-learning you should set mix_pretraining_subject_samples=False "
-            "so that each split uses different SUBJECTS (domains)."
-        )
-
-    train_ids = base_ds.pretraining_train_subjects
+    _ = base_ds.supervised_pretrain_subjects
+    meta_train_ids = base_ds.meta_learning_subjects
     val_ids = base_ds.pretraining_val_subjects
     test_ids = base_ds.pretraining_test_subjects
 
     # 3) Create MetaTaskDatasets for each split
+    print(f"[MetaTaskDataset] Building meta train dataset ...")
     meta_train_ds = MetaTaskDataset(
         base_dataset=base_ds,
-        patient_ids=train_ids,
+        patient_ids=meta_train_ids,
         k_support=k_support,
         k_query=k_query,
-        allow_replacement=False
+        window_length=input_seq_len_s
     )
+    print(f"[MetaTaskDataset] Meta train dataset has {len(meta_train_ds)} patients.")
+    
+    print(f"[MetaTaskDataset] Building meta val dataset ...")
     meta_val_ds = MetaTaskDataset(
         base_dataset=base_ds,
         patient_ids=val_ids,
         k_support=k_support,
         k_query=k_query,
-        allow_replacement=False
+        window_length=input_seq_len_s
     )
+    print(f"[MetaTaskDataset] Meta val dataset has {len(meta_val_ds)} patients.")
+    
+    print(f"[MetaTaskDataset] Building meta test dataset ...")
     meta_test_ds = MetaTaskDataset(
         base_dataset=base_ds,
         patient_ids=test_ids,
         k_support=k_support,
         k_query=k_query,
-        allow_replacement=False
+        window_length=input_seq_len_s
     )
+    print(f"[MetaTaskDataset] Meta test dataset has {len(meta_test_ds)} patients.")
 
-    # 4) DataLoaders: each batch = 1 task (support, query, pid).
-    #    Set batch_size=1; number of tasks per epoch = len(dataset) by default (one per patient).
-    def _mk_loader(ds, tasks_per_epoch, batch_size=1):
-        # To cap per-epoch tasks, we can wrap the dataset so __len__ reports a custom size.
-        if tasks_per_epoch is not None:
-            class _LenWrap(Dataset):
-                def __init__(self, base, length):
-                    self.base = base; self.length = length
-                def __len__(self): return self.length
-                def __getitem__(self, i): return self.base[i]
-            ds = _LenWrap(ds, tasks_per_epoch)
-        return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=loader_workers, pin_memory=True)
-
-    meta_train_loader = _mk_loader(meta_train_ds, tasks_per_epoch_train, batch_size=meta_batch_size)
-    meta_val_loader   = _mk_loader(meta_val_ds, tasks_per_epoch_val, batch_size=1)  # keep =1 for adaptation
-    meta_test_loader  = _mk_loader(meta_test_ds, tasks_per_epoch_test, batch_size=1)
+    # 4) DataLoaders: each batch = many tasks (meta-batch).
+    #    Set shuffle=True so patient tasks are shuffled across epochs; each patient
+    #    contributes equally (MetaTaskDataset has one entry per patient).
+    meta_train_loader = DataLoader(meta_train_ds, batch_size=meta_batch_size, shuffle=True, num_workers=loader_workers, pin_memory=True)
+    meta_val_loader = DataLoader(meta_val_ds, batch_size=1, num_workers=loader_workers, pin_memory=True)  # keep batch_size=1 for adaptation
+    meta_test_loader = DataLoader(meta_test_ds, batch_size=1, num_workers=loader_workers, pin_memory=True)  # keep batch_size=1 for adaptation
 
     split_ids = {
-        "train_ids": train_ids,
-        "val_ids": val_ids,
-        "test_ids": test_ids,
+        "train_ids": meta_train_ds.patient_ids,
+        "val_ids": meta_val_ds.patient_ids,
+        "test_ids": meta_test_ds.patient_ids
     }
+    
+    if plot:     
+        if index_file_name != '':
+            # Meta-train ds
+            print(f'[MetaTaskDataset] Plot age, gender, and run length distributions of subjects from meta train ds')
+            plot_age_gender_distribution(meta_train_ds.patient_ids, index_file_name, savepath=root_figs_folder, filename='meta_train_ds_')
+            plot_meta_dataset_run_distribution(meta_train_ds, dataset_name="meta_train_ds", savepath=root_figs_folder)
+            
+            # Meta-val ds
+            print(f'[MetaTaskDataset] Plot age, gender, and run length distributions of subjects from meta val ds')
+            plot_age_gender_distribution(meta_val_ds.patient_ids, index_file_name, savepath=root_figs_folder, filename='meta_val_ds_')
+            plot_meta_dataset_run_distribution(meta_val_ds, dataset_name="meta_val_ds", savepath=root_figs_folder)
+            
+            # Meta-test ds
+            print(f'[MetaTaskDataset] Plot age, gender, and run length distributions of subjects from meta test ds')
+            plot_age_gender_distribution(meta_test_ds.patient_ids, index_file_name, savepath=root_figs_folder, filename='meta_test_ds_')
+            plot_meta_dataset_run_distribution(meta_test_ds, dataset_name="meta_test_ds", savepath=root_figs_folder)
+        
+            calculate_dataloaders_mean_std(
+                dataloaders=[meta_train_loader, meta_val_loader, meta_test_loader], 
+                dataloaders_names=['Meta-Pretraining-Train', 'Meta-Pretraining-Val', 'Meta-Pretraining-Test'], 
+                savepath=root_figs_folder,
+                meta_dataloader=True
+            ) 
+        else:
+            print('No index file provided...')
+    
     return base_ds, meta_train_loader, meta_val_loader, meta_test_loader, split_ids
 
 
 def parseargs():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="MetaTaskDataset")
     
     parser.add_argument('--dataset_folder', default='./lmdb', type=str, help='path to the dataset to analyze')
+    parser.add_argument('--figs_folder', default='./data_figs', type=str, help='where to save graphs from dataset analysis')
     parser.add_argument('--dataset_name', default='test', type=str, help='name of the processed dataset')
     parser.add_argument('--seed', type=int, default=42, help='seed')
     parser.add_argument('--fs', type=int, default=125, help='signals frequency')
     parser.add_argument('--input_seq_len_s', type=int, default=10, help='single window duration')
-    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
-    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
+    parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
     parser.add_argument('--k_support', type=int, default=16, help='meta-learning support set size')
-    parser.add_argument('--k_query', type=int, default=32, help='meta-learning query set size')
+    parser.add_argument('--k_query', type=int, default=16, help='meta-learning query set size')
     parser.add_argument('--meta_batch_size', type=int, default=4, help='meta batch size')
     parser.add_argument('--workers', type=int, default=2, help='parallel data loaders')
+    parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=False, help='plot dataset overview or not')
+    parser.add_argument('--index_file_name', default='', type=str, help='name of the dataset index file')
     
     return parser.parse_args()
     
@@ -229,29 +397,33 @@ if __name__ == "__main__":
     
     args = parseargs()
 
+    root_figs_folder = os.path.join(args.figs_folder, args.dataset_name) 
+    if not os.path.exists(root_figs_folder):
+        os.makedirs(root_figs_folder)
+    
     base_ds, train_loader, val_loader, test_loader, splits = build_meta_splits_and_loaders(
         lmdb_folder=os.path.join(args.dataset_folder, args.dataset_name),
+        root_figs_folder=root_figs_folder,
         seed=args.seed,
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
-        sig2sig=args.sig2sig,
         pretraining_split_ratio=(0.7, 0.1, 0.2),
-        mix_pretraining_subject_samples=False,     # IMPORTANT for meta-learning to test on unseen subjects
+        meta_split_ratio=0.2,
         k_support=args.k_support,
         k_query=args.k_query,
         meta_batch_size=args.meta_batch_size,
-        loader_workers=args.workers
+        loader_workers=args.workers,
+        plot=args.plot,
+        index_file_name=args.index_file_name
     )
-
-    print(f"#Patients: train={len(splits['train_ids'])}, val={len(splits['val_ids'])}, test={len(splits['test_ids'])}")
 
     # --- Pull ONE TASK from train_loader and print shapes/values ---
     task_batch = next(iter(train_loader))
 
     (Xs, Ys), (Xq, Yq), pid = task_batch
     
-    print(f"[Task patient id] {pid}")
+    print(f"Task patient ids: {pid}")
     print(f"Support X shape: {tuple(Xs.shape)}")
     print(f"Support Y shape: {tuple(Ys.shape)}")
     print(f"Query X shape: {tuple(Xq.shape)}")

@@ -1,9 +1,7 @@
 import os
 import argparse
-from distutils.util import strtobool
 import pickle
 import pprint
-import random
 import numpy as np
 import lmdb
 import torch
@@ -16,9 +14,8 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
                  seed, 
                  lmdb_folder, 
                  fs=125, 
-                 input_seq_len_s=5, 
+                 input_seq_len_s=10, 
                  ecg=False, 
-                 sig2sig=False,
                  min_subject_sample_number=0, 
                  plot=False, 
                  savepath='./figs'):
@@ -42,7 +39,6 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
                 
         # Which input data to load (PPG or PPG + ECG), PPG is always loaded
         self.ecg = ecg
-        self.sig2sig = sig2sig
         self.fs = fs
         self.input_seq_len_s = input_seq_len_s
         
@@ -131,39 +127,34 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
         
         # Cast to torch tensor
         signals = torch.tensor(sig)
-            
-        if self.sig2sig:
-            # Make arrays writable
-            abp = np.require(abp, requirements=['O', 'W'])
-            abp.setflags(write=1)
-            
-            # Cast to torch tensor
-            annotation = torch.tensor(abp)
-        else:
-            # Make arrays writable
-            sbp = np.require(sbp, requirements=['O', 'W'])
-            sbp.setflags(write=1)
-            dbp = np.require(dbp, requirements=['O', 'W'])
-            dbp.setflags(write=1)
-            map = np.require(map, requirements=['O', 'W'])
-            map.setflags(write=1)
-            
-            # Cast to torch tensor
-            annotation = torch.stack([
-                torch.tensor(sbp), 
-                torch.tensor(dbp), 
-                torch.tensor(map)
-            ], dim=-1)
+          
+        # Make arrays writable
+        sbp = np.require(sbp, requirements=['O', 'W'])
+        sbp.setflags(write=1)
+        dbp = np.require(dbp, requirements=['O', 'W'])
+        dbp.setflags(write=1)
+        map = np.require(map, requirements=['O', 'W'])
+        map.setflags(write=1)
+        
+        # Cast to torch tensor
+        annotation = torch.stack([
+            torch.tensor(sbp), 
+            torch.tensor(dbp), 
+            torch.tensor(map)
+        ], dim=-1)
 
         return signals, annotation, timestamp
         
 
 class OnlineSubjectDataset(OnlineDatasetBase):
-    def __init__(self, min_run_length, *args, **kwargs):
+    def __init__(self, block_length, valid_runs_number, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.min_run_length = min_run_length        
-        self.filter_subjects_by_min_run_length(self.min_run_length, kwargs['input_seq_len_s'])
+        self.filter_subjects_by_min_run_length(
+            window_length=kwargs['input_seq_len_s'], 
+            block_length=block_length,
+            valid_runs_number=valid_runs_number
+            )
 
     def find_consecutive_runs(self, sample_list, window_length):
         """
@@ -272,60 +263,79 @@ class OnlineSubjectDataset(OnlineDatasetBase):
 
         return runs
 
-    def filter_subjects_by_min_run_length(self, min_run_length, window_length):
-        """
-        Filter subjects so that only runs of length >= min_run_length are kept.
-        Subjects with fewer than 2 runs meeting the minimum length are removed entirely.
+    def filter_subjects_by_min_run_length(self, window_length, block_length, valid_runs_number):
+        r"""
+        Filters subjects based on:
+        1. Run length sufficient to contain `num_phases` train/val phases.
+        2. At least `valid_runs_number` such runs per subject.
+        3. Each valid run is *trimmed* so that only the first
+            `num_phases * (adapt_size + val_size)` windows are kept.
 
-        Updates:
-            - self.subject_adjacent_samples
-            - self.index_by_subject_id
-            - self.subjects_for_personalization
+        A run is valid if:
+            len(run) >= block_length
 
         Parameters
         ----------
-        min_run_length : int
-            Minimum run length to keep.
+        window_length : int
+            Length of each input window in seconds.
+        block_length : int
+            Number of windows for the training and validation parts of each run.
+        valid_runs_number : int
+            Minimum number of valid runs required for a subject to be kept.
         """
+
         subjects_to_remove = []
 
+        print(f"[Filtering] Required windows per run: {block_length}")
+        print(f"[Filtering] Required runs per subject: {valid_runs_number}")
+
         for subj in list(self.subjects_for_personalization):
-            # Get all samples of a subject
-            index_list = list(self.index_by_subject_id[subj])
-            if len(index_list) <= min_run_length:
+
+            sample_ids = list(self.index_by_subject_id[subj])
+            if len(sample_ids) < block_length:
                 subjects_to_remove.append(subj)
                 continue
 
-            # Find consecutive runs and their lengths (runs contain actual sample ids)
-            runs = self.find_consecutive_runs(index_list, window_length)
+            # 1) Identify raw runs
+            runs = self.find_consecutive_runs(sample_ids, window_length)
 
-            # Collect sample ids of runs that satisfy the length constraint
-            keep_samples = []
             valid_runs = []
+            kept_sample_ids = []
+
+            # 2) Keep only runs long enough AND trim them
             for r in runs:
-                if r["length"] >= min_run_length:
-                    keep_samples.extend(r["sample_ids"])
-                    valid_runs.append(r)
+                if r["length"] >= block_length:
 
-            # Require at least two valid runs to keep the subject
-            if len(valid_runs) >= 2:
-                # Update the index_by_subject_id mapping to only contain the kept (chronological) samples
-                self.index_by_subject_id[subj] = keep_samples
-            else:
+                    # --- trim run to first block_length windows ---
+                    trimmed_samples = r["sample_ids"][:block_length]
+
+                    valid_runs.append(trimmed_samples)
+                    kept_sample_ids.extend(trimmed_samples)
+                    
+                    # Maintain only required number of valid runs
+                    if len(valid_runs) >= valid_runs_number:
+                        break
+
+            # 3) Check if enough valid runs exist for this subject
+            if len(valid_runs) < valid_runs_number:
                 subjects_to_remove.append(subj)
+                continue
 
-        # Remove subjects with insufficient valid runs
+            # 4) Keep only chronologically ordered subset of valid samples
+            kept_sample_ids = sorted(set(kept_sample_ids))
+            self.index_by_subject_id[subj] = kept_sample_ids
+
+        # Remove subjects without enough valid runs
         for subj in subjects_to_remove:
             if subj in self.index_by_subject_id:
                 del self.index_by_subject_id[subj]
             if subj in self.subjects_for_personalization:
                 self.subjects_for_personalization.remove(subj)
 
-        print(f"Filtered dataset: {len(self.subjects_for_personalization)} subjects remain "
-            f"(removed {len(subjects_to_remove)} subjects with fewer than 2 runs ≥ {min_run_length})")
+        print(f"[Filtering] Subjects remaining: {len(self.subjects_for_personalization)} (removed {len(subjects_to_remove)})")
 
 
-    def get_subject_runs(self, subject_id, window_length, adapt_size: int = 32, val_size: int = 32, min_block_length: int = 128):
+    def get_subject_runs(self, subject_id, window_length, adapt_size: int = 32, val_size: int = 32, block_length: int = 128):
         r"""
         Build subject runs using fixed interleaved adaptation/validation windows.
 
@@ -337,7 +347,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             Number of windows per adaptation (train) block. Default=32.
         val_size : int, optional
             Number of windows per validation (test) block. Default=32.
-        min_block_length : int, optional
+        block_length : int, optional
             Minimum number of windows in a run to be considered. Default=200.
 
         Returns
@@ -361,8 +371,8 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             run_len = len(run_samples)
 
             # Skip runs shorter than required minimum (should not happen as get_subject_runs should be called after the initial filtering of subjects)
-            if run_len < min_block_length:
-                raise ValueError(f"Run length {run_len} is shorter than minimum required {min_block_length}")
+            if run_len < block_length:
+                raise ValueError(f"Run length {run_len} is shorter than minimum required {block_length}")
 
             # Segment into interleaved adaptation/testing blocks
             block_size = adapt_size + val_size
@@ -386,7 +396,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
 
 
 def parseargs():
-    parser = argparse.ArgumentParser(description="Dataset overview")
+    parser = argparse.ArgumentParser(description="OnlineSubjectDataset")
 
     parser.add_argument('--dataset_folder', default='./lmdb', type=str, help='path to the dataset to analyze')
     parser.add_argument('--name', default='test', type=str, help='name of the processed dataset')
@@ -394,12 +404,13 @@ def parseargs():
     parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--fs', default=125, type=int, help='signal sampling frequency')
     parser.add_argument('--input_seq_len_s', default=10, type=int, help='input sequence length in seconds')
-    parser.add_argument('--min_run_length', default=128, type=int, help='minimum number of samples per subject to consider it valid for doing online learning, 0 means no limit')
-    parser.add_argument('--plot', default='False', type=lambda x: bool(strtobool(x)), help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
-    parser.add_argument('--ecg', default='False', type=lambda x: bool(strtobool(x)), help='whether to load only ecg or not')
-    parser.add_argument('--sig2sig', default='False', type=lambda x: bool(strtobool(x)), help='whether to aggregate the annotation over the whole analysis window or not')
-    parser.add_argument('--save_run', default='False', type=lambda x: bool(strtobool(x)), help='whether to save a specific subject run to a pickle dict or not')
-    parser.add_argument('--batch_size', default=32, type=int, help='batch size')
+    parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=False, help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
+    parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
+    parser.add_argument('--save_run', action=argparse.BooleanOptionalAction, default=False, help='whether to save a specific subject run to a pickle dict or not')
+    parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size')
+    parser.add_argument('--validation_batch_size', default=16, type=int, help='batch size for personalization')
+    parser.add_argument('--num_train_val', default=2, type=int, help='number of training and validation phases per block')
+    parser.add_argument('--valid_runs_number', default=2, type=int, help='valid runs number')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     args = parser.parse_args()
@@ -413,17 +424,19 @@ if __name__ == "__main__":
     root_figs_folder = os.path.join(args.save_path, args.name)
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
-
+        
+    block_length = args.num_train_val * (args.personalization_batch_size + args.validation_batch_size)
+    
     # Instantiate OnlinePhysioDataset (the base for continual learning)
     online_physio_dataset = OnlineSubjectDataset(
         seed=args.seed,
         lmdb_folder=os.path.join(args.dataset_folder, args.name),
         fs=args.fs,
         input_seq_len_s=args.input_seq_len_s,
-        min_run_length=args.min_run_length,
         ecg=args.ecg,
-        sig2sig=args.sig2sig,
-        savepath=root_figs_folder
+        savepath=root_figs_folder,
+        block_length=block_length,
+        valid_runs_number=args.valid_runs_number
     )
     
     # Notice that at this point subjects with insufficient runs have been removed
@@ -432,7 +445,13 @@ if __name__ == "__main__":
     
     if args.save_run:
         import pickle
-        runs = online_physio_dataset.get_subject_runs(subject_id, window_length=args.input_seq_len_s, adapt_size=args.batch_size, val_size=args.batch_size, min_block_length=args.min_run_length)
+        runs = online_physio_dataset.get_subject_runs(
+            subject_id, 
+            window_length=args.input_seq_len_s, 
+            adapt_size=args.personalization_batch_size, 
+            val_size=args.validation_batch_size, 
+            block_length=block_length
+            )
     
         # Save the list of dictionaries, namely runs
         with open(f"../notebooks/data/{subject_id}_runs.pkl", "wb") as f:
@@ -449,10 +468,10 @@ if __name__ == "__main__":
         all_runs.append(runs)
 
     # Plot distribution across all subjects
-    plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if args.min_run_length == 0 else f'all_subjects_run_lengths_{args.min_run_length}.jpg'))
+    plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if block_length == 0 else f'all_subjects_run_lengths_{block_length}.jpg'))
 
     # Plot the Annotation statistics for the runs
-    runs = online_physio_dataset.get_subject_runs(subject_id, window_length=args.input_seq_len_s, adapt_size=args.batch_size, val_size=args.batch_size, min_block_length=args.min_run_length)
+    runs = online_physio_dataset.get_subject_runs(subject_id, window_length=args.input_seq_len_s, adapt_size=args.personalization_batch_size, val_size=args.validation_batch_size, block_length=block_length)
     
     plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"), show_bp_plot=args.plot)
     

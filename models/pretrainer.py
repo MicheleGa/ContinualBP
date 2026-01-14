@@ -11,9 +11,10 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from data.dataset import PhysioDataset
 from data.meta_dataloaders import build_meta_splits_and_loaders
-from models.MAMLLearner import MAMLLearner
+from models.maml import MAML
+from models.component_factory import Model
 from training_utils.helpers import (
-    save_status, load_status, count_parameters, LSLRStepSize,
+    save_status, load_status, count_parameters,
     get_encoder_architecture, get_prediction_head_architecture, 
     get_meta_lr, get_inner_lr, get_inner_steps, build_inner_optimizer, 
     get_msl_weights, compute_embedding_stats
@@ -30,15 +31,14 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
         seed=config['seed'],
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
         pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],
+        meta_split_ratio=config['meta_train_split_ratio'],
         fs=config['fs'],
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
-        sig2sig=config['sig2sig'],
         min_subject_sample_number=config['min_subject_sample_number']
     )
         
-    (pre_train_sampler, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
+    (pre_train_sampler, _, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
     
     pre_train_dataloader = DataLoader(pretrain_ds, sampler=pre_train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
     pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
@@ -109,10 +109,8 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             # Zero gradients
             optimizer_stage1.zero_grad()
 
-            # Standard forward pass without contrastive learning
-            # the prediction head will sequence the T dimension when sig2sig False, this is why there is no mean()
-            feats = encoder(signals) # [B, T, D]
-            outputs = prediction_head(feats) # [B, 3] or [B, T]
+            feats = encoder(signals) # [B, 256]
+            outputs = prediction_head(feats) # [B, 3]
                 
             # Supervised regression loss
             loss = F.smooth_l1_loss(outputs, targets) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(outputs, targets)
@@ -194,20 +192,10 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     signals, _ = example_input_batch
     signals = signals.to(device)
 
-    # Define full model (encoder + prediction_head) -> important tolog a single graph to tensorboard
-    class FullModel(torch.nn.Module):
-        def __init__(self, encoder, prediction_head):
-            super().__init__()
-            self.encoder = encoder
-            self.prediction_head = prediction_head
-
-        def forward(self, x):
-            feats = self.encoder(x)
-            return self.prediction_head(feats)
-
-    full_model = FullModel(encoder, prediction_head).to(device)
+    full_model = Model(encoder, prediction_head).to(device)
     # Log whole graph
-    writer.add_graph(full_model, signals)
+    if model_name != "Proto": # Skip Proto as it has MHA which is not traced with add_graph
+        writer.add_graph(full_model, signals)
     
     # Meters    
     test_losses = AverageMeter(name='pre_train_test/loss')
@@ -225,8 +213,8 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     test_map_me_stds = AverageMeter(name='pre_train_test/map_me_std')
     
     # Record outputs and targets
-    all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float) if config['sig2sig'] else np.empty((0, 3), dtype=float) # Assuming SBP/DBP/MAP output shape is 3
-    all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float) if config['sig2sig'] else np.empty((0, 3), dtype=float)
+    all_test_outputs = np.empty((0, 3), dtype=float) 
+    all_test_targets = np.empty((0, 3), dtype=float)
         
     with torch.no_grad():
         for batch_idx, batch in enumerate(pre_test_dataloader):
@@ -294,8 +282,10 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         model=encoder, optimizer=None, scheduler=None, 
         checkpoint_path=checkpoint_path, config=config
     )
+    if config['use_lora']:
+        encoder.attach_lora(r=config['lora_r'], alpha=config['lora_alpha'])
     encoder.eval()
-    print(f"[Pretraining][MAML] Stage-1 encoder weights loaded ✅")
+    print(f"[Pretraining][MAML] Stage-1 encoder weights initialized ✅")
     
     # Load best prediction head
     prediction_head = get_prediction_head_architecture(config)
@@ -305,16 +295,23 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         checkpoint_path=checkpoint_path, config=config
     )
     prediction_head.eval()
-    print(f"[Pretraining][MAML] Stage-1 prediction head weights loaded ✅")
+    print(f"[Pretraining][MAML] Stage-1 prediction head weights initialized ✅")
     
-    # Create enhanced learner wrapper and move to device
-    learner = MAMLLearner(encoder, prediction_head).to(device)
-    
-    # Count trainable parameters
-    learner_trainable, learner_non_trainable = count_parameters(learner)
+    # Count trainable params
+    model = Model(encoder, prediction_head)
+    model_trainable, model_non_trainable = count_parameters(model)
     print(f"[Pretraining][MAML] Parameter count:")
-    print(f"\t- MAML learner: {learner_trainable:,} trainable, {learner_non_trainable:,} non-trainable")
-        
+    print(f"\t- Model: {model_trainable:,} trainable, {model_non_trainable:,} non-trainable")
+    
+    # FOMAML from learn2learn
+    model = MAML(
+        model, 
+        lr=config['inner_lr'], 
+        first_order=True, 
+        anil=(config['inner_adapt'] == 'head'), 
+        lora=config['use_lora']
+    ).to(device)
+
     # MAML meta-dataloader setup
     _, train_dataloader, val_dataloader, test_dataloader, _ = build_meta_splits_and_loaders(
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
@@ -322,9 +319,8 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         fs=config['fs'],
         input_seq_len_s=config['input_seq_len_s'],
         ecg=config['ecg'],
-        sig2sig=config['sig2sig'],
         pretraining_split_ratio=list(map(float, config['pretraining_tr_val_tt_split_ratio'].split(','))),
-        mix_pretraining_subject_samples=config['mix_pretraining_subject_samples'],     # IMPORTANT for meta-learning to test on unseen subjects, must be False
+        meta_split_ratio=config['meta_train_split_ratio'],
         min_subject_sample_number=config['min_subject_sample_number'],
         k_support=config['k_support'],
         k_query=config['k_query'],
@@ -333,22 +329,21 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
     # Hyperparams / defaults
     meta_epochs = config.get('max_meta_epochs')
-    grad_clip_norm = config.get('grad_clip') 
     meta_lr_schedule = config.get('meta_lr_schedule')
     inner_lr_schedule = config.get('inner_lr_schedule')
     inner_steps_schedule = config.get('inner_steps_schedule')
     
     # MAML specific parameters
     print(f"[Pretraining][MAML] Run configuration")
-    print(f"\t- Update: {'Almost-No-Inner-Loop' if config['inner_adapt'] == 'head' else 'encoder and prediction head'}")
+    print(f"\t- Update: {'Almost-No-Inner-Loop' if config['inner_adapt'] == 'head' else 'encoder and prediction head'}{' with LoRA' if config['use_lora'] else ''}")
     print(f"\t- Epochs: {meta_epochs}")
     print(f"\t- Meta LR schedule: {meta_lr_schedule} - base LR {config['meta_lr']} / min LR {config['meta_lr_scheduler_eta_min']}")
     print(f"\t- Inner LR schedule: {inner_lr_schedule} - LR {config['inner_lr']}")
     print(f"\t- Inner steps schedule: {inner_steps_schedule} - Steps {config['inner_steps']}")
     
     # Meta-optimizer for the meta-parameters
-    model_param_list = list(learner.parameters())
-    meta_optimizer = torch.optim.AdamW(model_param_list, lr=get_meta_lr(0, config), weight_decay=config['weight_decay'])
+    model_param_list = list(model.parameters())
+    meta_optimizer = torch.optim.Adam(model_param_list, lr=get_meta_lr(0, config), weight_decay=config['weight_decay'])
     
     # Meters
     best_val = float("+inf")
@@ -359,9 +354,8 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     # ==== Train/Val ====
     # Outer loop
     for epoch in range(meta_epochs):
-
-        # Train
-        learner.train()
+        
+        model.train()
 
         # Set schedules / hyperparams for this epoch
         current_meta_lr = get_meta_lr(epoch, config)
@@ -373,14 +367,12 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
             param_group['lr'] = current_meta_lr
 
         # Get MSL weights for post-update steps (and optionally pre-update)
-        include_pre = bool(config.get('msl_include_pre'))
-        msl_weights = get_msl_weights(epoch, config, current_inner_steps, include_pre=include_pre)
+        msl_weights = get_msl_weights(epoch, config, current_inner_steps)
     
         # Reset meters
         epoch_query_loss_meter.reset()
         epoch_support_loss_meter.reset()
         epoch_meta_loss_meter.reset()
-        grad_norms = []
         
         # Log current hyperparameters
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
@@ -403,81 +395,44 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                 sX, sY = Xs[t].to(device).float(), Ys[t].to(device).float()
                 qX, qY = Xq[t].to(device).float(), Yq[t].to(device).float()
                 
+                # Copy current meta-parameters to the fast weights
+                adapted_model = model.clone()
+                adapted_model.train()
+                
                 # Query loss before adaptation (step 0) — keep for logging and optional MSL include
                 with torch.no_grad():
-                    out_q0 = learner(qX)  # Use current meta-parameters
+                    # Merge LoRA weights for inference if LoRA is applied
+                    # N.B.: using class name instead of isinstance because of clone few lines above
+                    if config['use_lora']:
+                        adapted_model.module.encoder.merge_lora()
+                    
+                    out_q0 = adapted_model(qX)  # Use current meta-parameters
                     loss_q0 = F.smooth_l1_loss(out_q0, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q0, qY)
                 task_query_pre_losses.append(loss_q0.item())
-
-                # Initialize fast_weights from current learner parameters **without detaching**.
-                # IMPORTANT: keep same cloning/behavior as before to avoid changing other parts.
-                # We follow your original approach: start from a clone list of parameters.
-                fast_weights = [p.clone() for p in learner.parameters()]
+                
                 support_losses = []
                 per_step_query_losses = []
 
-                # If include_pre is True, include pre-adapt loss as first entry (so weights align)
-                if include_pre:
-                    per_step_query_losses.append(loss_q0)
-
+                # Inner loop
                 for step in range(current_inner_steps):
+                    # Unmerge LoRA weights for training
+                    if config['use_lora']:
+                        adapted_model.module.encoder.unmerge_lora()
+                    
                     # --- support forward ---
-                    out_s = learner(sX, fast_weights)    
+                    out_s = adapted_model(sX)
                     loss_s = F.smooth_l1_loss(out_s, sY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_s, sY)
                     support_losses.append(loss_s.item())
 
-                    # grads wrt fast_weights
-                    opt_idx, opt_params = zip(
-                        *[(i, w) for i, w in enumerate(fast_weights)
-                          if w.requires_grad and torch.is_floating_point(w)]
-                    )
-                    grads = torch.autograd.grad(
-                        loss_s,
-                        opt_params,
-                        create_graph=False,
-                        retain_graph=True,
-                        allow_unused=True
-                    )
-
-                    # Update with grad clipping
-                    deltas = []
-                    for g in grads:
-                        if g is None:
-                            deltas.append(None)
-                        else:
-                            deltas.append(current_inner_lr * g)
-
-                    # Clip norm
-                    eps = torch.finfo(torch.float32).eps
-                    sq_sum = 0.0
-                    for d in deltas:
-                        if d is not None:
-                            sq_sum = sq_sum + (d.detach() ** 2).sum()
-                    global_norm = torch.sqrt(sq_sum + eps)
-                    clip_coef = (grad_clip_norm / (global_norm + eps)).clamp(max=1.0)
-
-                    scaled_deltas = []
-                    for d in deltas:
-                        if d is None:
-                            scaled_deltas.append(None)
-                        else:
-                            scaled_deltas.append(d * clip_coef)
-
-                    new_fast_weights = []
-                    d_iter = iter(scaled_deltas)
-                    for i, w in enumerate(fast_weights):
-                        if i in opt_idx:
-                            d = next(d_iter)
-                            if d is not None:
-                                new_fast_weights.append(w - d)
-                            else:
-                                new_fast_weights.append(w)
-                        else:
-                            new_fast_weights.append(w)
-                    fast_weights = new_fast_weights
-                        
+                    # FOMAML from l2l
+                    adapted_model.adapt(loss_s)
+                    
+                    # Merge LoRA weights for inference
+                    if config['use_lora']:
+                        adapted_model.module.encoder.merge_lora()
+                    
                     # Evaluate query using the updated fast_weights (multi-step loss)
-                    out_q_step = learner(qX, fast_weights)
+                    out_q_step = adapted_model(qX)
                     loss_q_step = F.smooth_l1_loss(out_q_step, qY) if config['criterion'] == 'SmoothL1Loss' else F.mse_loss(out_q_step, qY)
                     per_step_query_losses.append(loss_q_step)
 
@@ -501,33 +456,27 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
                 epoch_support_loss_meter.update(np.mean(support_losses) if len(support_losses) > 0 else 0.0, 1)
                 
             # End tasks in meta-batch: do meta-backward on accumulated meta_loss
-            # Note: since we use first-order derivatives (use_second_order=False in autograd), create_graph was False above,
-            # so second-order contributions are omitted.
             meta_loss.backward()
 
-            # Gradient clipping and meta step
-            total_norm = torch.nn.utils.clip_grad_norm_(learner.parameters(), grad_clip_norm)
-            grad_norms.append(total_norm.item())
-
+            # Meta step
             meta_optimizer.step()
 
+            # Logging
             epoch_meta_loss_meter.update(meta_loss.item(), 1)
 
         # ---- After training batches (end of epoch) ----
         avg_train_query_loss = epoch_query_loss_meter.avg
         avg_train_support_loss = epoch_support_loss_meter.avg
         avg_train_meta_loss = epoch_meta_loss_meter.avg
-        avg_grad_norm = np.mean(grad_norms)
-
+        
         # Run validation
-        val_loss = evaluate_maml_with_bp_metrics(learner, val_dataloader, device, config)
+        val_loss = evaluate_maml_with_bp_metrics(model, val_dataloader, device, config)
 
         # Logging 
         writer.add_scalar('meta/train_query_loss_epoch', avg_train_query_loss, epoch)
         writer.add_scalar('meta/train_support_loss_epoch', avg_train_support_loss, epoch)
         writer.add_scalar('meta/train_meta_loss_epoch', avg_train_meta_loss, epoch)
         writer.add_scalar('meta/val_loss_epoch', val_loss, epoch)
-        writer.add_scalar('meta/grad_norm_epoch', avg_grad_norm, epoch)
         writer.add_scalar('meta/meta_lr', current_meta_lr, epoch)
         writer.add_scalar('meta/inner_lr', current_inner_lr, epoch)
         writer.add_scalar('meta/inner_steps', current_inner_steps, epoch)
@@ -538,7 +487,6 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
             f"train_query_loss {avg_train_query_loss:.5f}, "
             f"train_meta_loss {avg_train_meta_loss:.5f}, "
             f"val_loss {val_loss:.5f}, "
-            f"grad_norm {avg_grad_norm:.3f}, "
             f"meta_lr {current_meta_lr:.5f}, "
             f"inner_lr {current_inner_lr:.5f}, "
             f"inner_steps {current_inner_steps}"
@@ -548,7 +496,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         if val_loss < best_val:
             save_ckpt = {
                 'epoch': epoch,
-                'learner_state_dict': learner.state_dict(),
+                'learner_state_dict': model.state_dict(),
                 'meta_optimizer_state_dict': meta_optimizer.state_dict(),
                 'config': config,
                 'val_loss': val_loss
@@ -565,10 +513,10 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
     # Load best model
     best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_maml"), weights_only=False)
-    learner.load_state_dict(best_ckpt['learner_state_dict'])
+    model.load_state_dict(best_ckpt['learner_state_dict'])
     
     # Saving feature statistics for intiializing the drift detector during the personalization step
-    baseline_mean, baseline_std = compute_embedding_stats(learner.encoder, train_dataloader, device)
+    baseline_mean, baseline_std = compute_embedding_stats(model.encoder, train_dataloader, device)
 
     # Save to file for personalization later on
     stats_ckpt = {
@@ -579,9 +527,9 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     print(f"[Pretraining][MAML] Embedding stats saved to {save_name}_embedding_stats.npz ✅")
     
     # ==== Test ====
-    learner = learner.to(device)
+    model = model.to(device)
     all_test_targets, all_test_outputs = evaluate_maml_with_bp_metrics(
-        learner, 
+        model, 
         test_dataloader, 
         device, 
         config, 
@@ -600,11 +548,11 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     print(f"[Pretraining][MAML] === MAML end ====")
     
     
-def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=False, writer=None):
+def evaluate_maml_with_bp_metrics(model, dataloader, device, config, test=False, writer=None):
     """
     Evaluation function for MAML learner
     """
-    learner.eval()
+    model.eval()
     
     if test:
         # Meters    
@@ -622,8 +570,8 @@ def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=Fals
         test_dbp_me_stds = AverageMeter(name='pre_train_test/dbp_me_std')
         test_map_me_stds = AverageMeter(name='pre_train_test/map_me_std')
     
-        all_test_outputs = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float) if config['sig2sig'] else np.empty((0, 3), dtype=float) # Assuming SBP/DBP/MAP output shape is 3
-        all_test_targets = np.empty((0, config['input_seq_len_s'] * config['fs']), dtype=float) if config['sig2sig'] else np.empty((0, 3), dtype=float)
+        all_test_outputs = np.empty((0, 3), dtype=float) 
+        all_test_targets = np.empty((0, 3), dtype=float)
         
     else:
         val_losses = AverageMeter(name='meta/val_loss')
@@ -638,8 +586,8 @@ def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=Fals
 
             # --- Build adapted copy of learner ---
             # Deepcopy to avoid polluting outer model
-            adapted_encoder = copy.deepcopy(learner.encoder).to(device)
-            adapted_prediction_head = copy.deepcopy(learner.prediction_head).to(device)
+            adapted_encoder = copy.deepcopy(model.encoder).to(device)
+            adapted_prediction_head = copy.deepcopy(model.prediction_head).to(device)
 
             # Build inner optimizer with correct parameter groups & LRs
             inner_opt = build_inner_optimizer(adapted_encoder, adapted_prediction_head, base_lr=config['eval_lr'], config=config)
@@ -655,6 +603,10 @@ def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=Fals
                 inner_opt.zero_grad()
                 loss_s.backward()
                 inner_opt.step()
+
+            # Merge LoRA weights for inference
+            if config['use_lora']:
+                adapted_encoder.merge_lora()
 
             # --- Query evaluation ---
             adapted_encoder.eval()
@@ -696,19 +648,19 @@ def evaluate_maml_with_bp_metrics(learner, dataloader, device, config, test=Fals
     if test:
         
         # Log test metrics
-        writer.add_scalar('test/loss_final', test_losses.avg, config.get('max_training_epochs'))
-        writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, config['max_training_epochs'])
-        writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, config['max_training_epochs'])
-        writer.add_scalar('test/map_mae_final', test_map_maes.avg, config['max_training_epochs'])
-        writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, config['max_training_epochs'])
-        writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, config['max_training_epochs'])
-        writer.add_scalar('test/map_me_final', test_map_mes.avg, config['max_training_epochs'])
-        writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['max_training_epochs'])
-        writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['max_training_epochs'])
-        writer.add_scalar('test/map_mae_std_final', test_map_mae_stds.avg, config['max_training_epochs'])
-        writer.add_scalar('test/sbp_me_std_final', test_sbp_me_stds.avg, config['max_training_epochs'])
-        writer.add_scalar('test/dbp_me_std_final', test_dbp_me_stds.avg, config['max_training_epochs'])
-        writer.add_scalar('test/map_me_std_final', test_map_me_stds.avg, config['max_training_epochs'])
+        writer.add_scalar('test/loss_final', test_losses.avg, config.get('max_meta_epochs'))
+        writer.add_scalar('test/sbp_mae_final', test_sbp_maes.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/dbp_mae_final', test_dbp_maes.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/map_mae_final', test_map_maes.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/sbp_me_final', test_sbp_mes.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/dbp_me_final', test_dbp_mes.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/map_me_final', test_map_mes.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/sbp_mae_std_final', test_sbp_mae_stds.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/dbp_mae_std_final', test_dbp_mae_stds.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/map_mae_std_final', test_map_mae_stds.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/sbp_me_std_final', test_sbp_me_stds.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/dbp_me_std_final', test_dbp_me_stds.avg, config['max_meta_epochs'])
+        writer.add_scalar('test/map_me_std_final', test_map_me_stds.avg, config['max_meta_epochs'])
         
         return all_test_targets, all_test_outputs
 

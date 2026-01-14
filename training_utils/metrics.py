@@ -84,72 +84,22 @@ def get_metric_values(loss, outputs, targets, config):
         dict: 
             A dictionary containing computed metric values.
     """
-    if config['sig2sig']:
-        targets_sbp_values = []
-        targets_dbp_values = []
-        targets_map_values = []
-        for el in range(targets.shape[0]):
-            try:
-                sbp, dbp, _, _ = compute_sp_dp(targets[el].cpu().numpy(), fs=config['fs'])
-                map = (2 * dbp + sbp) / 3
-            except:
-                sbp, dbp, map = -1, -1, -1
-            targets_sbp_values.extend([sbp])
-            targets_dbp_values.extend([dbp])
-            targets_map_values.extend([map])
-        
-        outputs_sbp_values = []
-        outputs_dbp_values = []
-        outputs_map_values = []
-        for el in range(outputs.shape[0]):
-            # May raise error for bad shaped signals
-            try:
-                sbp, dbp, _, _ = compute_sp_dp(outputs[el].cpu().numpy(), fs=config['fs'])
-                map = (2 * dbp + sbp) / 3
-            except:
-                sbp, dbp, map = -1, -1, -1
-            outputs_sbp_values.extend([sbp])
-            outputs_dbp_values.extend([dbp])
-            outputs_map_values.extend([map])
-
-        targets_sbp_values = torch.tensor(targets_sbp_values, device=targets.device)
-        targets_dbp_values = torch.tensor(targets_dbp_values, device=targets.device)        
-        targets_map_values = torch.tensor(targets_map_values, device=targets.device)        
-        outputs_sbp_values = torch.tensor(outputs_sbp_values, device=outputs.device)
-        outputs_dbp_values = torch.tensor(outputs_dbp_values, device=outputs.device)
-        outputs_map_values = torch.tensor(outputs_map_values, device=outputs.device)
-        
-        metric_values = {
-            'loss': loss.item(),
-            'sbp_mae': torch.mean(torch.abs(outputs_sbp_values - targets_sbp_values)).item(),
-            'dbp_mae': torch.mean(torch.abs(outputs_dbp_values - targets_dbp_values)).item(),
-            'map_mae': torch.mean(torch.abs(outputs_map_values - targets_map_values)).item(),
-            'sbp_me': torch.mean(outputs_sbp_values - targets_sbp_values).item(),
-            'dbp_me': torch.mean(outputs_dbp_values - targets_dbp_values).item(),
-            'map_me': torch.mean(outputs_map_values - targets_map_values).item(),
-            'sbp_mae_std': torch.std(torch.abs(outputs_sbp_values - targets_sbp_values)).item(),
-            'dbp_mae_std': torch.std(torch.abs(outputs_dbp_values - targets_dbp_values)).item(),
-            'map_mae_std': torch.std(torch.abs(outputs_map_values - targets_map_values)).item(),
-            'sbp_me_std': torch.std(outputs_sbp_values - targets_sbp_values).item(),
-            'dbp_me_std': torch.std(outputs_dbp_values - targets_dbp_values).item(),
-            'map_me_std': torch.std(outputs_map_values - targets_map_values).item(),
-        }
-    else:
-        metric_values = {
-            'loss': loss.item(),
-            'sbp_mae': torch.mean(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
-            'dbp_mae': torch.mean(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
-            'map_mae': torch.mean(torch.abs(outputs[:, 2] - targets[:, 2])).item(),
-            'sbp_me': torch.mean(outputs[:, 0] - targets[:, 0]).item(),
-            'dbp_me': torch.mean(outputs[:, 1] - targets[:, 1]).item(),
-            'map_me': torch.mean(outputs[:, 2] - targets[:, 2]).item(),
-            'sbp_mae_std': torch.std(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
-            'dbp_mae_std': torch.std(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
-            'map_mae_std': torch.std(torch.abs(outputs[:, 2] - targets[:, 2])).item(),
-            'sbp_me_std': torch.std(outputs[:, 0] - targets[:, 0]).item(),
-            'dbp_me_std': torch.std(outputs[:, 1] - targets[:, 1]).item(),
-            'map_me_std': torch.std(outputs[:, 2] - targets[:, 2]).item(),
-        }
+    
+    metric_values = {
+        'loss': loss.item(),
+        'sbp_mae': torch.mean(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
+        'dbp_mae': torch.mean(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
+        'map_mae': torch.mean(torch.abs(outputs[:, 2] - targets[:, 2])).item(),
+        'sbp_me': torch.mean(outputs[:, 0] - targets[:, 0]).item(),
+        'dbp_me': torch.mean(outputs[:, 1] - targets[:, 1]).item(),
+        'map_me': torch.mean(outputs[:, 2] - targets[:, 2]).item(),
+        'sbp_mae_std': torch.std(torch.abs(outputs[:, 0] - targets[:, 0])).item(),
+        'dbp_mae_std': torch.std(torch.abs(outputs[:, 1] - targets[:, 1])).item(),
+        'map_mae_std': torch.std(torch.abs(outputs[:, 2] - targets[:, 2])).item(),
+        'sbp_me_std': torch.std(outputs[:, 0] - targets[:, 0]).item(),
+        'dbp_me_std': torch.std(outputs[:, 1] - targets[:, 1]).item(),
+        'map_me_std': torch.std(outputs[:, 2] - targets[:, 2]).item(),
+    }
     return metric_values
 
 
@@ -299,9 +249,6 @@ def aami_grade(differences, mean_threshold=5, std_dev_threshold=8):
 
     if abs(mean_diff) <= mean_threshold and std_dev <= std_dev_threshold:
         return "Acceptable"
-    elif (abs(mean_diff) <= mean_threshold and std_dev > std_dev_threshold) or \
-        (abs(mean_diff) > mean_threshold and std_dev <= std_dev_threshold):
-        return "Potentially Acceptable"
     else:
         return "Unacceptable"
     
@@ -314,39 +261,11 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
     if not os.path.exists(figure_savepath) and plot:
         os.makedirs(figure_savepath)
 
-    if config['sig2sig']:
-        # Extract SBP/DBP from reconstructed waveforms
-        outputs_sbp_values, outputs_dbp_values = [], []
-        for el in range(outputs.shape[0]):
-            try:
-                sbp, dbp, _, _ = compute_sp_dp(outputs[el], fs=config['fs'])
-            except Exception:
-                sbp, dbp = -1, -1
-            outputs_sbp_values.append(sbp)
-            outputs_dbp_values.append(dbp)
+    outputs_sbp_values, outputs_dbp_values = outputs[:, 0], outputs[:, 1]
+    targets_sbp_values, targets_dbp_values = targets[:, 0], targets[:, 1]
 
-        targets_sbp_values, targets_dbp_values = [], []
-        for el in range(targets.shape[0]):
-            try:
-                sbp, dbp, _, _ = compute_sp_dp(targets[el], fs=config['fs'])
-            except Exception:
-                sbp, dbp = -1, -1
-            targets_sbp_values.append(sbp)
-            targets_dbp_values.append(dbp)
-
-        outputs_sbp_values = np.array(outputs_sbp_values)
-        outputs_dbp_values = np.array(outputs_dbp_values)
-        targets_sbp_values = np.array(targets_sbp_values)
-        targets_dbp_values = np.array(targets_dbp_values)
-
-        sbp_errors = targets_sbp_values - outputs_sbp_values
-        dbp_errors = targets_dbp_values - outputs_dbp_values
-    else:
-        outputs_sbp_values, outputs_dbp_values = outputs[:, 0], outputs[:, 1]
-        targets_sbp_values, targets_dbp_values = targets[:, 0], targets[:, 1]
-
-        sbp_errors = targets_sbp_values - outputs_sbp_values
-        dbp_errors = targets_dbp_values - outputs_dbp_values
+    sbp_errors = targets_sbp_values - outputs_sbp_values
+    dbp_errors = targets_dbp_values - outputs_dbp_values
 
     # ---- LOSS ----
     if config['criterion'] == 'MSELoss':
@@ -406,35 +325,32 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
     return metrics
 
 
-def compute_transfer_metrics_blockwise(err_after_list):
+def compute_transfer_metrics_from_matrix(errors_matrix):
     """
-    Compute CL metrics (BWT, FWT, AA) for block-based continual learning.
+    Compute continual learning metrics (AA, BWT) for error-based metrics (lower = better).
 
     Parameters
     ----------
-    err_after_list : list of float
-        Validation errors after adaptation for each block.
+    errors_matrix : np.ndarray, shape (T, T)
+        errors_matrix[t, i] = MAE on test set of block i after finishing adaptation on block t.
 
     Returns
     -------
-    metrics : dict
-        {
-          "BWT": float,
-          "AA": float
-        }
+    dict : {'AA': float, 'BWT': float}
     """
-    B = len(err_after_list)
-    metrics = {}
+    T = errors_matrix.shape[0]
+    # Average final MAE (lower = better)
+    final_row = errors_matrix[T - 1, :]
+    AA = float(np.nanmean(final_row))
 
-    # Average accuracy (mean error after adaptation)
-    metrics["AA"] = float(np.mean(err_after_list))
+    # Backward Transfer (ΔMAE): positive = forgetting, negative = improvement
+    diag = np.array([errors_matrix[i, i] for i in range(T)])
+    bwt_vals = []
+    for i in range(T - 1):
+        final_err = errors_matrix[T - 1, i]
+        init_err = diag[i]
+        if not np.isnan(final_err) and not np.isnan(init_err):
+            bwt_vals.append(final_err - init_err)
+    BWT = float(np.mean(bwt_vals)) if len(bwt_vals) > 0 else None
 
-    # Backward Transfer (forgetting)
-    if B > 1:
-        final_errs = err_after_list[-1]
-        bwt_vals = [err_after_list[i] - final_errs for i in range(B-1)]
-        metrics["BWT"] = float(np.mean(bwt_vals))
-    else:
-        metrics["BWT"] = None
-
-    return metrics    
+    return {"AA": AA, "BWT": BWT}
