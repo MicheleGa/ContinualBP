@@ -5,9 +5,8 @@ This is a PyTorch implementation of the Continual Learning (CL) experiments with
 Readme Overview:
 
 1) Environment Setup
-2) Data Provisioning and Preprocessing
-3) Model Development 
-4) Example Usage
+2) Data Provisioning & Preprocessing
+3) Framework Execution
 
 Repository filetree:
 
