@@ -21,6 +21,17 @@ from models.component_factory import BPRegressor
 
 
 def analyze_logs_and_plot(log_file_path, fig_root):
+    r"""
+    Parses blood pressure estimation log files to extract performance metrics and generates summary plots.
+    
+    Parameters
+    ------------
+    log_file_path (str): 
+        The file path to the raw text logs containing subject results and baseline metrics.
+        
+    fig_root (str): 
+        The root directory where baseline-specific subfolders, CSV summaries, and PNG plots will be saved.
+    """
     
     print("[Log Analysis] Analyzing log files ...")
     for baseline_name in [
@@ -147,9 +158,9 @@ def analyze_logs_and_plot(log_file_path, fig_root):
         if "subject" in current:
             records.append(current)
 
-        # ---------------------------
+        # ----------------
         # Create DataFrame
-        # ---------------------------
+        # ----------------
         df = pd.DataFrame(records)
 
         # N.B. — filter only continual_replay baseline
@@ -218,17 +229,28 @@ def analyze_logs_and_plot(log_file_path, fig_root):
 
         
 def aggregate_patient_level_target_statistics_and_plot(fig_root, exp_fig_root):
+    r"""
+    Aggregates patient-specific blood pressure statistics to analyze how temporal drift and variability correlate with personalization performance.
+    
+    Parameters
+    ------------
+    fig_root (str): 
+        The root directory containing baseline folders and previously generated MAE summary CSVs.
+        
+    exp_fig_root (str): 
+        The source directory where individual subject CSV files containing target statistics over time are stored.
+    """
     
     print("[Result Analysis] Patient level SBP statistics vs SBP MAE ...")
     for baseline_name in [
-        #'no_adapt',
-        #'first_batch_finetune',
-        #'online',
-        #'online_from_scratch',
+        'no_adapt',
+        'first_batch_finetune',
+        'online',
+        'online_from_scratch',
         'feature_replay',
-        #'lwf',
-        #'ewc',
-        #'agem'
+        'lwf',
+        'ewc',
+        'agem'
     ]:
         baseline_fig_root = os.path.join(fig_root, baseline_name)
 
@@ -368,13 +390,42 @@ def aggregate_patient_level_target_statistics_and_plot(fig_root, exp_fig_root):
     
 
 def bytes_from_params(n_params, precision_bits):
+    r"""
+    Calculates the memory footprint in bytes based on the number of parameters and their bit precision.
+    
+    Parameters
+    ------------
+    n_params (int): 
+        The total count of parameters in the model or dataset.
+        
+    precision_bits (int): 
+        The number of bits used per parameter (e.g., 32 for float32, 16 for float16).
+        
+    Returns
+    ------------
+    output param 1:
+        The total size in bytes as an integer.   
+    """
     return int(n_params * (precision_bits // 8))
 
 
 def calculate_activation_memory(model, dummy_input):
     r"""
-    Calculate total activation memory during forward pass.
+    Calculates the total memory occupied by activations during a single forward pass.
     Source: https://huggingface.co/blog/train_memory
+    
+    Parameters
+    ------------
+    model (torch.nn.Module): 
+        The neural network model to be analyzed.
+        
+    dummy_input (torch.Tensor): 
+        A sample input tensor of the appropriate shape for the model's forward pass.
+        
+    Returns
+    ------------
+    output param 1:
+        The total activation memory in bytes as an integer.   
     """
     activation_sizes = []
 
@@ -408,6 +459,32 @@ def calculate_activation_memory(model, dummy_input):
 
 
 def collect_subject_metrics(exp_root, total_adapt_macs, total_adapt_prediction_macs, total_test_macs, drift_aware=False):
+    r"""
+    Aggregates computational complexity metrics and adaptation statistics across all processed subjects.
+    
+    Parameters
+    ------------
+    exp_root (str): 
+        The root directory containing individual subject folders and their corresponding update logs.
+        
+    total_adapt_macs (float): 
+        The number of Multiply-Accumulate operations (MACs) required for a single update.
+        
+    total_adapt_prediction_macs (float): 
+        The number of MACs required for a prediction during the adaptation phase per block.
+        
+    total_test_macs (float): 
+        The number of MACs required for a prediction during the testing phase per block.
+        
+    drift_aware (bool): 
+        A flag indicating whether the data collection is part of a drift-aware adaptation strategy.
+        
+    Returns
+    ------------
+    output param 1:
+        A pandas DataFrame containing subject IDs, update counts, and total MAC counts for each patient.   
+    """
+    
     rows = []
 
     for subj_dir in os.listdir(exp_root):
@@ -450,20 +527,64 @@ def collect_subject_metrics(exp_root, total_adapt_macs, total_adapt_prediction_m
 
 
 def read_feature_replay_aa(csv_path):
+    r"""
+    Extracts the mean Average Accuracy (AA) for the feature replay baseline from a results CSV.
+    
+    Parameters
+    ------------
+    csv_path (str): 
+        The file path to the CSV containing performance metrics for various baselines.
+        
+    Returns
+    ------------
+    output param 1:
+        The mean Average Accuracy value as a float.   
+    """
     df = pd.read_csv(csv_path)
     aa_value = df.loc[df["Baseline"] == "feature_replay", "AA_mean"].iloc[0]
     return aa_value
 
 
 def relative_degradation(aware, unaware):
-    """
+    r"""
+    Calculates the percentage change in performance between aware and unaware drift updates.
     Positive value = worse performance (higher AA).
     Negative value = improvement.
+    
+    Parameters
+    ------------
+    aware (float): 
+        The metric value (e.g., Average Accuracy) from the drift-aware model.
+        
+    unaware (float): 
+        The metric value from the standard or drift-unaware model used as a baseline.
+        
+    Returns
+    ------------
+    output param 1: 
+        The relative change expressed as a percentage.   
     """
     return (aware - unaware) / unaware * 100
 
 
 def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, exp_fig_root_drift_aware):
+    r"""
+    Profiles the computational resources and memory footprint of the Continual Learning algorithm (Feature Replay) and generates comparative reports between drift-aware and drift-unaware settings.
+    
+    Parameters
+    ------------
+    config_file_path (str): 
+        Path to the YAML configuration file containing model architecture and training hyperparameters.
+        
+    root_savepath (str): 
+        The primary directory where the resource usage profiles and generated plots will be stored.
+        
+    exp_fig_root (str): 
+        The directory containing experiment results for the standard (drift-unaware) baseline.
+        
+    exp_fig_root_drift_aware (str): 
+        The directory containing experiment results for the drift-aware adaptation strategy.
+    """
     
     OUT_FIG_ROOT = os.path.join(root_savepath, "resource_usage_profile")
     os.makedirs(OUT_FIG_ROOT, exist_ok=True)
@@ -829,10 +950,13 @@ def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, exp_fi
         df_analysis["num_updates_aware"],
         alpha=0.7
     )
+    
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
 
-    plt.xlabel("SBP temporal variability (mmHg)")
-    plt.ylabel("Number of drift-aware updates")
-    plt.title("Update frequency vs SBP variability")
+    plt.xlabel("SBP drift (mmHg)", fontsize=14)
+    plt.ylabel("Number of drift-aware updates", fontsize=14)
+    plt.title("Update frequency vs SBP drift", fontsize=16)
     plt.tight_layout()
     plt.savefig(
         os.path.join(root_savepath, "feature_replay", "updates_vs_sbp_variability.png"),
@@ -856,10 +980,14 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()
     
+    # Collect metrics from the experiment log file and organize them in CSVs
     analyze_logs_and_plot(args.log_file_path, args.fig_root)
     
+    # Aggregates results over patients and correlates them to SBP variability
     aggregate_patient_level_target_statistics_and_plot(args.fig_root, args.exp_fig_root)
     
+    # Computational and storage resources of the Feature Replay algorithm
+    # -> NOTE: the resource cost of other baselines may be estimated with future expansion of the codebase
     resource_usage_profile(args.config_yaml_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
     
         

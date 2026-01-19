@@ -225,7 +225,7 @@ To download them, enter the *data/pulse_db* folder:
 
 ```bash
 cd ./data/pulse_db
-./downaload_and_unzip.sh
+./download_and_unzip.sh
 ```
 
 The downlaod process may take a while and can also fail as reported in the Pulse DB, github [repo](https://github.com/pulselabteam/PulseDB).

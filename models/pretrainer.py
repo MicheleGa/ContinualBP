@@ -23,10 +23,33 @@ from training_utils.metrics import AverageMeter, get_metric_values, call_metric
 
 
 def pre_training(save_name, checkpoint_path, writer, model_name, config, device):
+    r"""
+    Executes the supervised pre-training phase for blood pressure estimation, involving 
+    encoder and prediction head training followed by comprehensive performance evaluation.
     
+    Parameters
+    ------------
+    save_name (str): 
+        The base name used for saving the best-performing model checkpoints.
+        
+    checkpoint_path (str): 
+        The directory path where model weights and training states are stored.
+        
+    writer (torch.utils.tensorboard.SummaryWriter): 
+        TensorBoard logger for tracking training/validation losses and performance metrics.
+        
+    model_name (str): 
+        The identifier for the model architecture being trained (e.g., "Proto").
+        
+    config (dict): 
+        Configuration dictionary containing hyperparameters, dataset paths, and training settings.
+        
+    device (torch.device): 
+        The computational device (CPU or CUDA) on which the tensors and model will be loaded.
+    """
     print(f"[Pretraining][Stage 1] ==== Supervised stage start ====")
     
-    # Instantiate the dataset again, but this time without the contrastive flag
+    # Instantiate the dataset
     pretrain_ds = PhysioDataset(
         seed=config['seed'],
         lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
@@ -63,12 +86,12 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     stage1_pre_train_scheduler_eta_min = config.get('stage1_pre_train_scheduler_eta_min')
     weight_decay = config.get('weight_decay')
     
-    # Train encoder
+    # Set all the encoder parameters to trainable
     for param in encoder.parameters():
         if (param.is_floating_point() or param.is_complex()):
             param.requires_grad = True
 
-    # Train regression head
+    # Set all the prediction head parameters to trainable
     for param in prediction_head.parameters():
         if (param.is_floating_point() or param.is_complex()):
             param.requires_grad = True
@@ -110,7 +133,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             # Zero gradients
             optimizer_stage1.zero_grad()
 
-            feats = encoder(signals) # [B, 256]
+            feats = encoder(signals) # [B, 128]
             outputs = prediction_head(feats) # [B, 3]
                 
             # Supervised regression loss
@@ -121,7 +144,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             # Optimizer step
             optimizer_stage1.step()
             
-            # Logg batch loss
+            # Log batch loss
             train_losses.update(loss.item(), signals.size(0))
             writer.add_scalar('pre_train_stage1/train_loss', loss.item(), epoch * len(pre_train_dataloader) + batch_idx)
         
@@ -195,8 +218,8 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
     full_model = Model(encoder, prediction_head).to(device)
     # Log whole graph
-    if model_name != "Proto": # Skip Proto as it has MHA which is not traced with add_graph
-        writer.add_graph(full_model, signals)
+    # -> NOTE: may fail for models with nn.Transformer modules (as MHA blocks  are not treacable with add_graph)
+    writer.add_graph(full_model, signals)
     
     # Meters    
     test_losses = AverageMeter(name='pre_train_test/loss')
@@ -273,7 +296,30 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
 
 
 def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, device):
+    r"""
+    Executes the Meta-Learning phase using First-Order MAML to optimize the model for rapid 
+    adaptation to new subjects or data distributions.
     
+    Parameters
+    ------------
+    save_name (str): 
+        The base name used for saving the best-performing meta-checkpoints and embedding statistics.
+        
+    checkpoint_path (str): 
+        The directory path where model weights and meta-training states are stored.
+        
+    writer (torch.utils.tensorboard.SummaryWriter): 
+        TensorBoard logger for tracking meta-losses, inner-loop statistics, and drift metrics.
+        
+    model_name (str): 
+        The identifier for the model architecture being trained (e.g., "Proto").
+        
+    config (dict): 
+        Configuration dictionary containing meta-learning hyperparameters (inner/outer LRs, steps, batch sizes).
+        
+    device (torch.device): 
+        The computational device (CPU or CUDA) on which the tensors and model will be loaded.
+    """
     print(f"[Pretraining][MAML] ==== MAML start ====")
     
     # Load best encoder
@@ -563,8 +609,35 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
     
 def evaluate_maml_with_bp_metrics(model, dataloader, device, config, test=False, writer=None):
-    """
-    Evaluation function for MAML learner
+    r"""
+    Evaluates the MAML learner by performing task-specific adaptation in an inner loop 
+    and measuring performance on a query set using blood pressure estimation metrics.
+    
+    Parameters
+    ------------
+    model (torch.nn.Module): 
+        The meta-model (encoder and prediction head) to be evaluated.
+        
+    dataloader (torch.utils.data.DataLoader): 
+        A meta-dataloader providing batches of support and query sets for different tasks.
+        
+    device (torch.device): 
+        The computational device (CPU or CUDA) for tensor operations.
+        
+    config (dict): 
+        Configuration dictionary containing evaluation hyperparameters (adaptation steps, learning rate, criterion).
+        
+    test (bool): 
+        If True, returns comprehensive prediction arrays and logs final metrics. If False, returns average validation loss.
+        
+    writer (torch.utils.tensorboard.SummaryWriter, optional): 
+        TensorBoard logger for recording final test performance metrics.
+        
+    Returns
+    ------------
+    output param 1:
+        If test=True: A tuple containing (all_test_targets, all_test_outputs) as numpy arrays.
+        If test=False: The average validation loss across all tasks as a float.   
     """
     model.eval()
     

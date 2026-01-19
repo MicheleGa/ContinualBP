@@ -212,6 +212,7 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()
 
+    # Instantiate encoder and profile its MACs/bytes on a dummy input
     encoder = BIOT(
         ecg=args.ecg, 
         fs=args.fs, 
@@ -231,6 +232,7 @@ if __name__ == "__main__":
     macs, num_params = clever_format([macs, num_params], "%.7f")
     print(f'BIOT Encoder has {num_params} params and {macs} MACs.')
     
+    # Instantiate prediction head and profile its MACs/bytes on a dummy input
     prediction_head = BPRegressor(args.embed_dim, 3)
     input_tensor = torch.rand((args.batch_size, args.embed_dim))
     print("\n--- Model Prediction Head Summary ---")

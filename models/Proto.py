@@ -84,6 +84,9 @@ class GenSignalFeatures(nn.Module):
         return y
 
 class Proto(nn.Module):
+    r"""
+    ResGruNet with Group and Layer Normalization for streaming CL
+    """
     def __init__(self, 
                  ecg=False,  
                  fs=125, 
@@ -140,22 +143,20 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()
     
+    # Instantiate encoder and profile its MACs/bytes on a dummy input
     encoder = Proto(args.ecg, args.fs, args.input_seq_len_s, args.embed_dim)
     x = torch.rand((args.batch_size, args.input_seq_len_s * args.fs, 2 if args.ecg else 1))
-
     print("\n--- Encoder Summary ---")
     summary(encoder, input_data=[x], col_names=("input_size","output_size","num_params","mult_adds"))
-
     macs, params = profile(encoder, inputs=(x,))
     macs, params = clever_format([macs, params], "%.7f")
     print(f'Proto Encoder has {params} params and {macs} MACs.')
     
+    # Instantiate prediction head and profile its MACs/bytes on a dummy input
     head = BPRegressor(encoder.embed_dim, 3)
     y = torch.rand((args.batch_size, encoder.embed_dim))
-
     print("\n--- Head Summary ---")
     summary(head, input_data=[y], col_names=("input_size","output_size","num_params","mult_adds"))
-    
     macs, params = profile(head, inputs=(y,))
     macs, params = clever_format([macs, params], "%.7f")
     print(f'Proto Head has {params} params and {macs} MACs.')

@@ -272,7 +272,7 @@ def butter_lowpass_filter(data, lowcut, fs, order):
     
 
 def align_pair(abp, raw_ppg, windowing_time, fs):
-    """
+    r"""
     Align ABP and PPG signal passed as parameters using the maximum cross-correlation.
     Only PPG is shifted to align with ABP. The shift is limited to a second as maximum.
     Source: https://github.com/inventec-ai-center/bp-benchmark/blob/main/code/process/core/lib/preprocessing.py
@@ -314,7 +314,7 @@ def align_pair(abp, raw_ppg, windowing_time, fs):
 
 
 def autocorrelation_filter(ppg_signal, threshold=0.7, verbose=False, plot=False, title='Autocorrelation Filter', savepath='./figs'):
-    """
+    r"""
     Applies an autocorrelation filter to discard invalid PPG signals.
 
     Parameters
@@ -896,9 +896,6 @@ def rescale_to_unit(signal, plot=False, title='Rescaled [0,1]', savepath='./figs
     rescaled_signal = (signal - min_val) / range_val
 
     if plot:
-        import matplotlib.pyplot as plt
-        import os
-        
         plt.figure(figsize=(12, 6))
         plt.subplot(2, 1, 1)
         plt.plot(signal, label='Original Signal')
@@ -1052,9 +1049,6 @@ def percentile_normalize(signal, percentile=95, plot=False, title='Percentile No
     normalized_signal = signal / scale_val
 
     if plot:
-        import matplotlib.pyplot as plt
-        import os
-        
         plt.figure(figsize=(12, 6))
         plt.subplot(2, 1, 1)
         plt.plot(signal, label='Original Signal')

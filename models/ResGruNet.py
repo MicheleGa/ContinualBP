@@ -87,24 +87,7 @@ class GenSignalFeatures(nn.Module):
         y = self.t_bn1(y)
 
         return y
-    
-# Original BP regressor from: https://github.com/easyfan327/FewShotBP/blob/main/models/PPGECGNet_V0e2x1b.py
-#class BPRegressor(nn.Module):
-#    def __init__(self, input_dim, output_dim=3):
-#        super().__init__()
-#        self.regressor = nn.Sequential(
-#            nn.Flatten(),
-#            nn.Linear(input_dim, 64),
-#            nn.ReLU(),
-#            nn.Dropout(p=0.25),
-#            nn.Linear(64, output_dim),
-#        )
-#    
-#    def forward(self, x):
-#        if x.dim() != 2:
-#            raise ValueError(f"BPRegressor expected input dims 2 [btach dimension, feature dimension], got {list(x.shape)}")
-#        return self.regressor(x)
-    
+
 
 class ResGruNet(nn.Module):
     r"""
@@ -173,6 +156,7 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()  
 
+    # Instantiate encoder and profile its MACs/bytes on a dummy input
     encoder = ResGruNet(
         ecg=args.ecg, 
         fs=args.fs, 
@@ -186,6 +170,7 @@ if __name__ == "__main__":
     macs, num_params = clever_format([macs, num_params], "%.7f")
     print(f'ResGruNet Encoder has {num_params} params and {macs} MACs.')
     
+    # Instantiate prediction head and profile its MACs/bytes on a dummy input
     prediction_head = BPRegressor(2 * args.embed_dim if args.ecg else args.embed_dim, 3)
     input_tensor = torch.rand((args.batch_size, 2 * args.embed_dim if args.ecg else args.embed_dim))
     print("\n--- Model Prediction Head Summary ---")

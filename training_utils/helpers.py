@@ -361,7 +361,7 @@ def get_encoder_architecture(config):
 
 def get_prediction_head_architecture(config):
     r"""
-    Function to get the model prediction head architecture based on the configuration.
+    Function to get the model prediction head architecture based on the configuration dict.
     
     Parameters
     ------------
@@ -519,10 +519,9 @@ def build_inner_optimizer(
     config
 ):
     r"""
-    Build inner optimizer for meta-learning algorithms evaluation and deployment (not training, learn2learn library with autograd is employed for training).
+    Build inner optimizer for meta-learning algorithms evaluation and deployment (not pretraining, learn2learn library with autograd is employed for pretraining).
     Behaviors:
     - inner_adapt='all'  : adapt backbone + regressor
-    - inner_adapt='temporal'  : freeze backbone, adapt only the backbone GRU and LayerNorm + regressor
     - inner_adapt='head' : freeze backbone, adapt only regressor
     
     Parameters

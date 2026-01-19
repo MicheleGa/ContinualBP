@@ -11,6 +11,44 @@ from preprocessing_utils.signal_processing import percentile_normalize, standard
 
 
 def process_subject(subject_info, args, result_queue=None, savepath=''):
+    r"""
+    Processes all data segments for a single subject, performing signal normalization, 
+    blood pressure metric calculation, and data type conversion.
+
+    This function serves as the worker unit for the parallel preprocessing pipeline. 
+    It transforms raw data loaded from NPZ files into standardized tensors ready 
+    for storage in the LMDB database.
+
+    Processing Steps:
+    1.  **Signal Extraction**: Separates ECG and PPG channels from the signal matrix.
+    2.  **Normalization**: Applies the specified scaling method (Z-score, Min-max, 
+        or Percentile) to ensure signals are within a comparable range across subjects.
+    3.  **BP Metric Derivation**: Extracts Systolic (SBP) and Diastolic (DBP) values 
+        and calculates the Mean Arterial Pressure (MAP) using the standard formula.
+    4.  **Type Casting**: Converts all signals to `float32` to optimize storage 
+        efficiency and GPU compatibility.
+
+    Parameters
+    ------------
+    subject_info (dict): 
+        Metadata for the subject, including 'subject_id' and 'n_segments'.
+        
+    args (Namespace): 
+        Configuration arguments containing normalization type, sampling rate (fs), 
+        and input/output paths.
+        
+    result_queue (multiprocessing.Queue, optional): 
+        A thread-safe queue used to return the processed `subject_data` to the 
+        main process.
+        
+    savepath (str, optional): 
+        Directory path used for saving diagnostic plots if `args.plot` is enabled.
+
+    Returns
+    ------------
+    None: 
+        The result is placed into the `result_queue` if provided.
+    """
     subject_id = subject_info['subject_id']
     n_segments = subject_info['n_segments']
     
@@ -80,7 +118,35 @@ def process_subject(subject_info, args, result_queue=None, savepath=''):
 
 
 def preprocess_dataset(args):
+    r"""
+    Orchestrates the large-scale preprocessing of physiological signals (ECG, PPG, ABP) 
+    and serializes them into a high-performance LMDB database. 
     
+    The pipeline follows three main stages:
+    1.  **Parallel Processing**: Uses `joblib` to distribute subject-level signal 
+        processing (filtering, windowing, feature extraction) across multiple threads.
+    2.  **LMDB Serialization**: Collects processed windows and writes them to an 
+        LMDB environment, ensuring data is stored in a memory-mapped format for 
+        fast I/O.
+    3.  **Indexing**: Generates and stores lookup tables (`index_by_sample_id`, 
+        `index_by_subject_id`) to allow the PyTorch DataLoader to access specific 
+        samples or subjects in constant time.
+
+    Parameters
+    ------------
+    args (Namespace): 
+        A configuration object containing:
+        - `index_file_name`: CSV path containing subject metadata.
+        - `output_folder`: Destination for the LMDB database.
+        - `num_threads`: Number of parallel workers for processing.
+        - `plot`: Boolean to trigger a sample visualization for quality control.
+        - `figs_folder`: Directory to save diagnostic plots.
+
+    Returns
+    ------------
+    None: 
+        Results are written directly to disk in the form of an LMDB database file.
+    """
     # Load the subject index from the CSV file
     if not os.path.exists(args.index_file_name):
         print(f"Index file not found at {args.index_file_name}")

@@ -87,6 +87,28 @@ def plot_bp_pattern_distribution(dataloaders, dataloaders_names, savepath='./fig
         
 
 def _calculate_dataset_mean_std(sbp_values, dbp_values, map_values, name, savepath):
+    r"""
+    Calculates key descriptive statistics and generates a visualization of the 
+    distribution for SBP, DBP, and optionally MAP.
+
+    The function creates a density-normalized histogram with vertical markers for 
+    the mean ($\mu$), standard deviation ($\sigma$), and interquartile range (Q1, Q3). 
+    This is used to verify that the dataset split (Train/Val/Test) is balanced and 
+    covers the expected physiological range of blood pressure.
+
+    Parameters
+    ------------
+    sbp_values (list or np.array): 
+        Array of Systolic Blood Pressure labels in mmHg.
+    dbp_values (list or np.array): 
+        Array of Diastolic Blood Pressure labels in mmHg.
+    map_values (list or np.array): 
+        Array of Mean Arterial Pressure labels. Can be an empty list.
+    name (str): 
+        Descriptive name of the dataset (e.g., 'Pretraining-Train') for titles and filenames.
+    savepath (str): 
+        Directory path where the generated PNG distribution plot will be saved.
+    """
     sbp_values = np.array(sbp_values)
     dbp_values = np.array(dbp_values)
     map_values = np.array(map_values)
@@ -501,7 +523,29 @@ def plot_abp(signal : np.array, fs : int, flat_locs_sig : np.array = None, peaks
     
     
 def plot_augmented_views(aug_signal_0, aug_signal_1, title, savepath, ecg=False):
-    
+    r"""
+    Generates a comparative plot of two augmented views of the same signal 
+    segment for visual validation of augmentation strategies.
+
+    This function is particularly useful when debugging contrastive learning 
+    pipelines, where the goal is to ensure that augmentations are strong enough 
+    to be challenging but not so destructive that the underlying physiological 
+    features (like the PPG pulse or ECG R-peak) are lost.
+
+    Parameters
+    ------------
+    aug_signal_0 (torch.Tensor): 
+        The first augmented version of the signal. Expected shape is $(T, C)$.
+    aug_signal_1 (torch.Tensor): 
+        The second augmented version of the signal. Expected shape is $(T, C)$.
+    title (str): 
+        The filename and title for the generated plot.
+    savepath (str): 
+        Directory where the resulting PNG file will be stored.
+    ecg (bool, optional): 
+        If True, the function expects and plots both PPG and ECG channels. 
+        If False, only the PPG channel is plotted. Defaults to False.
+    """
     if ecg:
         _, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
 
@@ -529,8 +573,37 @@ def plot_augmented_views(aug_signal_0, aug_signal_1, title, savepath, ecg=False)
         plt.tight_layout()
         plt.savefig(os.path.join(savepath, f'{title}.png'), dpi=200)
         plt.close()
+        
 
 def plot_subject_validity_over_time(subject_id, subject_windows, window_length, fs, savepath):
+    r"""
+    Generates a longitudinal visualization of a subject's recording, overlaying 
+    physiological trends with data quality classifications.
+
+    The plot uses background color-coding (shading) to identify different data 
+    regimes, which is essential for semi-supervised or self-supervised learning 
+    strategies where unlabeled data must be distinguished from low-quality noise.
+
+    Data Regimes:
+    - **Supervised (Green)**: PPG, ECG, and ABP are all valid. Suitable for training.
+    - **Unlabeled (Blue)**: PPG and ECG are valid, but ABP is missing or corrupted. 
+      Suitable for self-supervised pre-training.
+    - **Invalid (Red)**: The input sensors (PPG or ECG) are corrupted. Must be discarded.
+
+    Parameters
+    ------------
+    subject_id (str/int): 
+        Identifier for the patient.
+    subject_windows (list): 
+        A list of dictionaries containing windowed data and validity flags 
+        ('abp_valid', 'ppg_valid', 'ecg_valid').
+    window_length (float): 
+        Duration of each window in seconds.
+    fs (int): 
+        Sampling frequency.
+    savepath (str): 
+        Directory where the resulting PNG plot will be saved.
+    """
     if not subject_windows:
         print(f"No valid windows to plot for Subject {subject_id}.")
         return
@@ -638,7 +711,7 @@ def plot_subject_validity_over_time(subject_id, subject_windows, window_length, 
     
     plt.tight_layout()
     plt.savefig(os.path.join(savepath, f'subject_{subject_id}_validity_plot.png'), dpi=1000)
-    plt.close() # Close the figure to free up memory
+    plt.close() 
     
 
 def plot_consecutive_runs_subject(runs, subject_id, savepath="subject_run_lengths.png"):
@@ -657,10 +730,6 @@ def plot_consecutive_runs_subject(runs, subject_id, savepath="subject_run_length
         The subject identifier.
     savepath : str, optional
         Path to save the generated figure (default="subject_run_lengths.png").
-
-    Returns
-    ------------
-    None (saves the plot to the specified savepath)
     """
     run_lengths = [r["length"] for r in runs]
     run_positions = [r["start_idx"] for r in runs]
@@ -700,10 +769,6 @@ def plot_consecutive_runs_all(all_runs, savepath="all_subjects_run_lengths.png")
                    ... ]
     savepath : str, optional
         Path to save the generated figure (default="all_subjects_run_lengths.png").
-
-    Returns
-    ------------
-    None (saves the plot to the specified savepath)
     """
     # Flatten run lengths across subjects
     all_lengths = [r["length"] for subj_runs in all_runs for r in subj_runs]
@@ -950,13 +1015,6 @@ def plot_meta_dataset_run_distribution(meta_ds, dataset_name="train", savepath='
     bin_width : int, optional
         Width of each bin (range of number of runs grouped together).
         Default is 10 (i.e., bins like 1-10, 11-20, etc.).
-
-    Returns
-    ----------
-    fig : matplotlib.figure.Figure
-        Matplotlib Figure object of the plot.
-    ax : matplotlib.axes.Axes
-        Matplotlib Axes object of the plot.
     """
     # Extract number of runs per patient
     patient_ids = list(meta_ds.runs_by_patient.keys())
@@ -1008,9 +1066,21 @@ def plot_meta_dataset_run_distribution(meta_ds, dataset_name="train", savepath='
 
 def plot_blockwise_mae(per_block_stats, index_to_plot, subject_id, savepath):
     r"""
-    Plot MAE with errorbars per baseline for a subject.
-    This function is intentionally standalone so you can move it to data_visualization.py
-    Expected input format: per_block_stats is a dict mapping baseline -> {'mae': list, 'std': list}
+    Generates a chronological performance plot showing the Mean Absolute Error (MAE) 
+    and variability (STD) for multiple baselines across sequential data blocks.
+
+    Parameters
+    ------------
+    per_block_stats (dict): 
+        A dictionary where keys are baseline names (e.g., 'EWC', 'MAML') and 
+        values are sub-dictionaries containing lists of MAE and STD values 
+        per chronological block.
+    index_to_plot (str): 
+        The specific metric to visualize, typically 'sbp', 'dbp', or 'map'.
+    subject_id (str/int): 
+        The unique identifier for the patient being analyzed.
+    savepath (str): 
+        The full destination path (including filename) for the output plot.
     """
     blocks = len(next(iter(per_block_stats.values()))[f'{index_to_plot}_mae'])
     x = np.arange(1, blocks + 1)
@@ -1051,10 +1121,6 @@ def plot_age_gender_distribution(valid_subjects, index_file_path, savepath="./fi
 
     savepath : str, optional
         Root folder where the figure will be saved. Defaults to "./figs".
-
-    Returns
-    ------------
-    None
     """
 
     # Load index file
@@ -1121,34 +1187,10 @@ def plot_update_summary_table(updates_dict, save_path):
         Dictionary mapping baseline names (str) → either:
           - int  (for per-subject number of updates)
           - dict with {"mean": float, "std": float} (for aggregated updates)
-        
-        Examples:
-        # Per-subject version
-        {
-            "no_adapt": 0,
-            "first_batch_finetune": 1,
-            "online_adapt": 10,
-            "online_from_scratch": 12,
-            "continual_replay": 8
-        }
-
-        # Aggregated version
-        {
-            "no_adapt": {"mean": 0.0, "std": 0.0},
-            "first_batch_finetune": {"mean": 1.0, "std": 0.0},
-            "online_adapt": {"mean": 9.8, "std": 1.2},
-            "online_from_scratch": {"mean": 11.7, "std": 2.1},
-            "continual_replay": {"mean": 7.9, "std": 1.5}
-        }
 
     save_path : str
         Path (including filename and extension) where the resulting figure will be saved.
         Example: "./figures/update_summary_subject_01.png"
-
-    Returns
-    --------------------
-    None
-        The function saves the generated figure to the specified path.
     """
     # Detect whether input is aggregated (dicts with mean/std) or per-subject (ints)
     first_val = next(iter(updates_dict.values()))
@@ -1213,7 +1255,23 @@ def plot_update_summary_table(updates_dict, save_path):
     
 
 def plot_feature_distance_over_time(feature_df, subject_id, baseline, savepath):
+    r"""
+    Visualizes the evolution of feature distances to detect physiological drift
+    across a subject data stream.
 
+    Parameters
+    ------------
+    feature_df (pd.DataFrame): 
+        A DataFrame containing the calculated distances. It must include:
+        - `train_scaled`: Scaled distances for training/calibration blocks.
+        - `test_scaled`: Scaled distances for upcoming test blocks.
+    subject_id (str/int): 
+        The unique identifier for the patient.
+    baseline (str): 
+        The name of the model or method used to generate the features.
+    savepath (str): 
+        The full destination path where the plot will be saved.
+    """
     x = np.arange(len(feature_df))
 
     plt.figure(figsize=(12, 8))
@@ -1230,6 +1288,29 @@ def plot_feature_distance_over_time(feature_df, subject_id, baseline, savepath):
     
 
 def plot_sbp_drift_distribution(drift_info, subject_ids, title, savepath):
+    r"""
+    Visualizes the distribution of within-subject SBP drift across a 
+    specific group of subjects.
+
+    This histogram helps identify whether the dataset consists mostly of 
+    physiologically stable subjects or highly volatile ones. The inclusion 
+    of quartile lines ($Q_{25}$, $Q_{50}$, $Q_{75}$) provides a clear 
+    benchmark for categorizing subjects into different "drift regimes" 
+    used in meta-learning or continual learning splits.
+
+    Parameters
+    ------------
+    drift_info (dict): 
+        A dictionary containing calculated drift metrics for all subjects, 
+        specifically looking for the 'sbp_std_over_time' key.
+    subject_ids (list): 
+        The list of subject IDs to include in this specific distribution plot 
+        (e.g., only the training set subjects).
+    title (str): 
+        The title of the plot and the base name for the saved file.
+    savepath (str): 
+        The directory path where the resulting PNG image will be stored.
+    """
     values = np.array([
         drift_info[s]["sbp_std_over_time"]
         for s in subject_ids
@@ -1254,6 +1335,32 @@ def plot_sbp_drift_distribution(drift_info, subject_ids, title, savepath):
 
 
 def plot_drift_regime_counts(drift_info, subject_ids, q25, q75, title, savepath):
+    r"""
+    Visualizes the count of subjects assigned to 'Low', 'Medium', and 'High' 
+    drift regimes based on pre-defined SBP drift thresholds.
+
+    This categorical visualization ensures that the data partitioning strategy 
+    (especially for drift-aware training) has resulted in a balanced 
+    distribution of physiological phenotypes. It helps researchers confirm 
+    that the model is being exposed to enough challenging (High-drift) 
+    scenarios during the pre-training or meta-learning phases.
+
+    Parameters
+    ------------
+    drift_info (dict): 
+        Dictionary containing the 'sbp_std_over_time' metric for all subjects.
+    subject_ids (list): 
+        The specific subset of subject IDs to be categorized and counted 
+        (e.g., the meta-learning pool).
+    q25 (float): 
+        The 25th percentile threshold; subjects below this are labeled 'Low' drift.
+    q75 (float): 
+        The 75th percentile threshold; subjects above this are labeled 'High' drift.
+    title (str): 
+        Title for the plot and the resulting filename.
+    savepath (str): 
+        Directory where the PNG plot will be stored.
+    """
     regimes = []
 
     for s in subject_ids:
@@ -1280,6 +1387,28 @@ def plot_drift_regime_counts(drift_info, subject_ids, q25, q75, title, savepath)
     
     
 def plot_sbp_drift_over_time(df: pd.DataFrame, subject_id: str, savepath: str):
+    r"""
+    Generates a multi-panel visualization of Systolic Blood Pressure trends 
+    and drift metrics over successive personalization steps.
+
+    The plot tracks three key perspectives:
+    1.  **Direct Trends**: Compares immediate batch averages against a smoothed 
+        rolling average to identify local volatility versus long-term trends.
+    2.  **Absolute Drift**: Measures the raw mmHg difference from the 
+        starting point, indicating the magnitude of physiological change.
+    3.  **Relative Drift**: Normalizes the change, which is used as 
+        a trigger for adaptation.
+
+    Parameters
+    ------------
+    df (pd.DataFrame): 
+        A DataFrame containing the columns: 'batch_mean_sbp', 'rolling_mean_sbp', 
+        'abs_drift_sbp', and 'rel_drift_sbp'.
+    subject_id (str): 
+        The unique identifier for the patient being visualized.
+    savepath (str): 
+        The full destination path where the plot image will be saved.
+    """
     fig, axs = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
     axs[0].plot(df["batch_mean_sbp"], label="Batch mean SBP")
@@ -1308,6 +1437,30 @@ def plot_sbp_abs_rel_drift_distributions(
     savepath,
     filename_prefix="sbp_drift"
 ):
+    r"""
+    Calculates and visualizes the statistical distributions of SBP drift across 
+    the entire dataset, identifying key population percentiles.
+
+    This function generates two distinct plots:
+    1.  **Absolute Drift**: A histogram of raw mmHg changes, useful for 
+        understanding clinical variance.
+    2.  **Relative Drift**: A histogram of normalized changes with specific 
+        percentile markers ($P_{50}, P_{70}, P_{80}, P_{90}$). These markers 
+        are often used as "trigger thresholds" for continual learning: for 
+        example, updating a model only when a patient's drift exceeds the 
+        80th percentile of the population.
+
+    Parameters
+    ------------
+    master_df (pd.DataFrame): 
+        The aggregated results DataFrame containing 'abs_drift_sbp' and 
+        'rel_drift_sbp' columns for all subjects.
+    savepath (str or Path): 
+        The directory where the distribution plots will be saved.
+    filename_prefix (str, optional): 
+        A prefix for the saved PNG files to differentiate between experimental 
+        runs. Defaults to "sbp_drift".
+    """
     savepath = Path(savepath)
 
     abs_drift = master_df["abs_drift_sbp"].values
@@ -1349,7 +1502,27 @@ def plot_sbp_abs_rel_drift_distributions(
     
 
 def plot_param_updates(df, subject_id, save_path):
-    
+    r"""
+    Generates a bar chart visualizing the history of parameter updates across 
+    adaptation steps for a specific subject.
+
+    The plot highlights the "budget" or "depth" of adaptation by coloring bars 
+    based on the `update_mode`. This is crucial for verifying that an adaptive 
+    system is correctly choosing between "shallow" updates (e.g., just the head) 
+    and "deep" updates (e.g., the whole model) based on the physiological drift.
+
+    Parameters
+    ------------
+    df (pd.DataFrame): 
+        DataFrame containing update logs. Must include:
+        - `s_idx`: The global adaptation step index.
+        - `fraction_updated`: The percentage of model parameters that were modified.
+        - `update_mode`: The category of update ('head', 'temporal', or 'all').
+    subject_id (str/int): 
+        Identifier for the patient currently being analyzed.
+    save_path (str): 
+        The full destination path where the plot image will be saved.
+    """
     MODE_COLORS = {
         "head": '#AEC6CF',       # pastel blue
         "temporal": '#A8E6CF',   # pastel green
@@ -1403,7 +1576,34 @@ def plot_pareto_frontier(
     savepath,
     min_patients=85
 ):
+    r"""
+    Visualizes the multi-objective optimization trade-off between subject 
+    inclusion and data quality constraints.
 
+    This scatter plot highlights configurations that are "non-dominated"—meaning 
+    you cannot improve one metric without degrading another. It specifically 
+    marks configurations used for different experimental settings (Mixed, 
+    Abrupt, and Gradual shifts) against the backdrop of all possible parameter 
+    combinations.
+
+    Parameters
+    ------------
+    df (pd.DataFrame): 
+        The full search space of all possible subject-inclusion configurations.
+    pareto_df (pd.DataFrame): 
+        The subset of configurations that lie on the Pareto frontier.
+    selected (pd.Series/dict): 
+        The specific configuration chosen for the 'Mixed-Shifts' experimental set.
+    shift_stressed (pd.Series/dict): 
+        The configuration chosen for the 'Abrupt-Shifts' (High volatility) set.
+    calibration_stressed (pd.Series/dict): 
+        The configuration chosen for the 'Gradual-Shifts' (Long-term stability) set.
+    savepath (str): 
+        The destination path where the plot image will be saved.
+    min_patients (int, optional): 
+        The threshold for feasibility (default=85). Only Pareto points meeting 
+        this count are highlighted in red.
+    """
     plt.figure(figsize=(10, 8))
 
     pareto_feasible = pareto_df[pareto_df["N_patients"] >= min_patients]
@@ -1422,34 +1622,38 @@ def plot_pareto_frontier(
         label="≥ 85 patients"
     )
 
-    # Balanced configuration (main)
+    # Mixed-Shifts configuration
     plt.scatter(
         selected["A"], selected["B"],
         s=220, marker="^",
         color="blue",
-        label="balanced"
+        label="Mixed-Shifts Set"
     )
 
-    # Shift-stressed configuration
+    # Abrupt-Shifts configuration
     plt.scatter(
         shift_stressed["A"], shift_stressed["B"],
         s=220, marker="^",
         color="green",
-        label="Abrupt-Shift-Focused"
+        label="Abrupt-Shifts Set"
     )
 
-    # Calibration-stressed configuration
+    # Gradual-Shifts configuration
     plt.scatter(
         calibration_stressed["A"], calibration_stressed["B"],
         s=220, marker="^",
         color="orange",
-        label="Gradual-Shift-Focused"
+        label="Gradual-Shifts Set"
     )
+    
+    # Increase tick label size
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
 
-    plt.xlabel("Minimum abrupt shifts per subject")
-    plt.ylabel("Minimum consecutive blocks per subject")
-    plt.title("Pareto frontier under AAMI/BHS constraint")
-    plt.legend(frameon=False)
+    plt.xlabel("Minimum abrupt shifts per subject", fontsize=14)
+    plt.ylabel("Minimum consecutive blocks per subject", fontsize=14)
+    plt.title("Pareto frontier under AAMI/BHS constraint", fontsize=16)
+    plt.legend(frameon=False, fontsize=12)
     plt.tight_layout()
     plt.savefig(savepath, dpi=300)
     plt.close()

@@ -28,12 +28,21 @@ class SBPDriftDetector:
         self.records = []
 
     def update(self, sbp_values: np.ndarray, step_idx: int):
-        """
-        Update drift statistics with a new training batch.
-
-        Args:
-            sbp_values: np.ndarray shape [N], SBP values for training block
-            step_idx: int, personalization block index
+        r"""
+        Updates drift statistics and rolling history using a new batch of SBP training data.
+        
+        Parameters
+        ------------
+        sbp_values (np.ndarray): 
+            An array of Systolic Blood Pressure values from the current training block.
+            
+        step_idx (int): 
+            The current personalization block or time-step index.
+            
+        Returns
+        ------------
+        output param 1:
+            A tuple containing the absolute drift (float) and the relative drift (float).   
         """
         if sbp_values.size == 0:
             return None
@@ -81,7 +90,7 @@ class ReservoirReplayBuffer:
     r"""
     Reservoir sampling based buffer for storing (feature, target) pairs.
     Uses reservoir sampling to maintain a uniform sample of seen examples under limited capacity.
-    Stores tensors on CPU detached to avoid GPU memory explosion.
+    Stores tensors on CPU (.detach()) to avoid GPU memory explosion.
     """
     def __init__(self, max_size=64):
         self.max_size = max_size
@@ -90,6 +99,17 @@ class ReservoirReplayBuffer:
         self.n_seen = 0  # total seen examples
 
     def add(self, feat_t, tgt_t):
+        r"""
+        Adds new examples to the buffer using reservoir sampling to maintain a uniform distribution.
+        
+        Parameters
+        ------------
+        feat_t (torch.Tensor): 
+            Batch of input features.
+            
+        tgt_t (torch.Tensor): 
+            Batch of corresponding targets/labels.
+        """
         # feat_t, tgt_t are torch tensors (batch x D) (batch x out_dim)
         feat_cpu = feat_t.detach().cpu()
         tgt_cpu = tgt_t.detach().cpu()
@@ -106,6 +126,19 @@ class ReservoirReplayBuffer:
                     self.targets[j] = tgt_cpu[i]
 
     def sample(self, k):
+        r"""
+        Randomly selects a subset of stored features and targets from the buffer.
+        
+        Parameters
+        ------------
+        k (int): 
+            The number of samples to retrieve.
+            
+        Returns
+        ------------
+        output param 1:
+            A tuple of (features, targets) as torch Tensors, or (None, None) if empty.   
+        """
         if len(self.features) == 0:
             return None, None
         k = min(k, len(self.features))
@@ -136,17 +169,20 @@ class Model(torch.nn.Module):
 # BP Prediction Head
 # ==================
 class BPRegressor(nn.Module):
-   def __init__(self, input_dim, output_dim=3):
-       super().__init__()
-       self.regressor = nn.Sequential(
-           nn.Flatten(),
-           nn.Linear(input_dim, 64),
-           nn.ReLU(),
-           nn.Dropout(p=0.25),
-           nn.Linear(64, output_dim),
-       )
-   
-   def forward(self, x):
-       if x.dim() != 2:
-           raise ValueError(f"BPRegressor expected input dims 2 [btach dimension, feature dimension], got {list(x.shape)}")
-       return self.regressor(x)
+    r"""
+    Source: https://github.com/easyfan327/FewShotBP/blob/main/models/PPGECGNet_V0e2x1b.py
+    """
+    def __init__(self, input_dim, output_dim=3):
+        super().__init__()
+        self.regressor = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(p=0.25),
+            nn.Linear(64, output_dim),
+        )
+    
+    def forward(self, x):
+        if x.dim() != 2:
+            raise ValueError(f"BPRegressor expected input dims 2 [btach dimension, feature dimension], got {list(x.shape)}")
+        return self.regressor(x)

@@ -619,12 +619,14 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()  
 
+    # TCN input parameters definition from those of argparse
     input_size = 2 if args.ecg else 1
     input_length = args.input_seq_len_s * args.fs
     output_size = args.embed_dim
     channel_sizes = [input_size, 16, 32, 48, 64, 96, output_size]
     kernel_size = [7] * 7                           
     
+    # Instantiate encoder and profile its MACs/bytes on a dummy input
     encoder = TCN(
         input_size=input_size,
         output_size=output_size,
@@ -639,6 +641,7 @@ if __name__ == "__main__":
     macs, num_params = clever_format([macs, num_params], "%.7f")
     print(f'TCN Encoder has {num_params} params and {macs} MACs.')
     
+    # Instantiate prediction head and profile its MACs/bytes on a dummy input
     prediction_head = BPRegressor(args.embed_dim, 3)
     input_tensor = torch.rand((args.batch_size, args.embed_dim))
     print("\n--- Model Prediction Head Summary ---")

@@ -9,10 +9,25 @@ from preprocessing_utils.data_visualization import plot_age_gender_distribution,
 
 
 def _stack_batch(batch):
-    """
-    Normalize (X, Y) pairs into tensors with shapes:
-      - X: (B, C, T)
-      - Y: (B, 3)   
+    r"""
+    Collates a list of individual samples into standardized batch tensors for 
+    the deep learning model.
+
+    Parameters
+    ------------
+    batch (list): 
+        A list of tuples $(X, Y)$ of length $B$ (batch size), where $X$ is the 
+        physiological signal and $Y$ represents the blood pressure targets.
+
+    Returns
+    ------------
+    output param 1 (torch.Tensor):
+        X tensor of shape $(B, C, T)$ where $B$ is batch size, $C$ is the number 
+        of channels (e.g., ECG, PPG), and $T$ is the number of time steps.
+        
+    output param 2 (torch.Tensor):
+        Y tensor of shape $(B, 3)$ representing the target Systolic, Diastolic, 
+        and Mean Arterial Pressure.
     """
     xs = [b[0] for b in batch]
     ys = [b[1] for b in batch]
@@ -50,7 +65,7 @@ class MetaTaskDataset(Dataset):
       2) Precompute chronological runs per patient using timestamps in LMDB
       3) Remove runs shorter than k_support + k_query
       4) Remove patients without any valid runs
-      5) At sampling time: choose a run reproducibly, choose a chronological slice
+      5) At sampling time: choose a run and a chronological slice
     """
     def __init__(
         self,
@@ -114,11 +129,24 @@ class MetaTaskDataset(Dataset):
         print(f"[MetaTaskDataset] Initialized with {len(self.patient_ids)} patients (k_support={self.k_support}, k_query={self.k_query}).")
 
     def find_consecutive_runs(self, sample_list, window_length):
-        """
-        Find runs of chronologically consecutive windows for a list of sample ids.
+        r"""
+        Identifies and groups segments of samples that form a continuous, 
+        uninterrupted chronological sequence.
 
-        Returns a list of dictionaries with keys:
-          - start_idx, end_idx, length, start_time, end_time, sample_ids (ordered chronologically)
+        Parameters
+        ------------
+        sample_list (list): 
+            A collection of sample IDs (integers) to be checked for continuity.
+            
+        window_length (float): 
+            The expected temporal duration of a single data window in seconds.
+
+        Returns
+        ------------
+        output param 1 (list):
+            A list of dictionaries, where each dictionary represents a continuous run. 
+            Keys include 'start_idx', 'end_idx', 'length', 'start_time', 'end_time', 
+            and the ordered 'sample_ids'.
         """
         if sample_list is None:
             return []
@@ -206,9 +234,31 @@ class MetaTaskDataset(Dataset):
         return runs
 
     def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
-        """
-        Sample disjoint support/query windows from one chronological run of patient `pid`.
-        Returns (support_ids, query_ids), both lists of sample ids in chronological order.
+        r"""
+        Extracts a continuous chronological slice of data from a patient's record 
+        to create a meta-learning task.
+
+        The method selects a random "run" (a continuous sequence of data) from the 
+        specified patient and then extracts a fixed-length window. This window is 
+        partitioned into:
+        1.  **Support Set**: The first $k_{support}$ samples used for rapid adaptation.
+        2.  **Query Set**: The subsequent $k_{query}$ samples used to calculate the 
+            meta-gradient and update the model's initial weights.
+
+        Parameters
+        ------------
+        pid (str): 
+            The unique patient identifier from which to sample.
+
+        Returns
+        ------------
+        output param 1 (List[int]):
+            support_ids: A list of sample IDs representing the "past" calibration 
+            data for the task.
+            
+        output param 2 (List[int]):
+            query_ids: A list of sample IDs representing the "future" evaluation 
+            data for the task.
         """
         runs = self.runs_by_patient.get(pid)
         if not runs:
@@ -273,9 +323,45 @@ def build_meta_splits_and_loaders(
     plot: bool = False,
     index_file_name: str = ''
 ):
-    """
-    Returns:
-        base_dataset, meta_train_loader, meta_val_loader, meta_test_loader, split_ids
+    r"""
+    Orchestrates the creation of meta-learning data loaders by partitioning 
+    subjects and wrapping them into task-based datasets.
+
+    The function executes four primary steps:
+    1.  **Base Initialization**: Creates a standard `PhysioDataset` to manage 
+        the raw LMDB connections.
+    2.  **Subject Partitioning**: Splits the subject pool into Train, Val, 
+        and Test sets at the subject level (preventing subject leakage).
+    3.  **Task Wrapping**: Wraps these subject sets into `MetaTaskDataset` 
+        objects which manage the $k$-shot support/query sampling.
+    4.  **Loader Construction**: Returns PyTorch DataLoaders where each 
+        batch contains multiple "tasks" (one task per patient).
+
+    Parameters
+    ------------
+    lmdb_folder (str): 
+        Path to the LMDB database containing the signal windows.
+    root_figs_folder (str): 
+        Directory where diagnostic plots and distributions will be saved.
+    k_support (int): 
+        Number of samples in the support set (calibration) for each meta-task.
+    k_query (int): 
+        Number of samples in the query set (evaluation) for each meta-task.
+    meta_batch_size (int): 
+        Number of tasks (patients) to include in a single meta-update batch.
+
+    Returns
+    ------------
+    output param 1 (PhysioDataset):
+        The underlying base dataset instance.
+    output param 2 (DataLoader):
+        The meta-training loader providing batches of tasks.
+    output param 3 (DataLoader):
+        The meta-validation loader (typically batch size 1).
+    output param 4 (DataLoader):
+        The meta-test loader (typically batch size 1).
+    output param 5 (dict):
+        A dictionary containing the subject IDs assigned to each split.
     """
 
     # 1) Instantiate existing PhysioDataset (reusing all its behaviors)

@@ -14,7 +14,8 @@ from preprocessing_utils.data_visualization import (
 )
 
 
-class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid openinng the LMDB environment two times (would raise errors)
+class OnlineDatasetBase(Dataset): 
+    '''No inheritance from PhysioDataset to avoid openinng the LMDB environment two times (would raise errors)'''
     def __init__(self,
                  seed, 
                  lmdb_folder, 
@@ -69,6 +70,23 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
         )
 
     def check_subjects_list(self, min_subject_sample_number=0):
+        r"""
+        Performs data integrity checks and balancing on the subject list to avoid
+        run-time errors during pre-training data loading.
+        
+        Parameters
+        ------------
+        min_subject_sample_number (int, optional): 
+            The minimum required number of signal windows a subject must have to remain 
+            in the dataset. If greater than 0, subjects exceeding this number will 
+            be truncated to this length for data balancing. Defaults to 0.
+
+        Returns
+        ------------
+        None: 
+            The method modifies the instance attributes `self.subjects_for_pretraining` 
+            and `self.index_by_subject_id` in-place.
+        """
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
         # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
         # with lmdbenv.begin(write=True) as txn: deos not make this check
@@ -93,7 +111,6 @@ class OnlineDatasetBase(Dataset): # No inheritance from PhysioDataset to avoid o
                     self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
 
     def __len__(self):
-        """Returns the total number of samples across all subjects available in the dataset."""
         return len(self.index_by_sample_id)
 
     def __getitem__(self, index):
@@ -162,22 +179,24 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             )
 
     def find_consecutive_runs(self, sample_list, window_length):
-        """
-        Find runs of chronologically consecutive windows for a list of sample ids.
+        r"""
+        Identifies and groups segments of samples that form a continuous, 
+        uninterrupted chronological sequence.
 
-        The function will:
-          - fetch timestamps for each sample id from the LMDB
-          - sort windows by their start timestamp
-          - compute time gaps between consecutive window starts
-          - group windows into runs when the gap <= threshold
+        Parameters
+        ------------
+        sample_list (list): 
+            A collection of sample IDs (integers) to be checked for continuity.
+            
+        window_length (float): 
+            The expected temporal duration of a single data window in seconds.
 
-        Returns a list of dictionaries, each with the following keys:
-          - start_idx: start index in the SORTED list
-          - end_idx: end index in the SORTED list
-          - length: number of windows in the run
-          - start_time: float (start time of run)
-          - end_time: float (end time of run)
-          - sample_ids: list of sample ids (ordered chronologically) in the run
+        Returns
+        ------------
+        output param 1 (list):
+            A list of dictionaries, where each dictionary represents a continuous run. 
+            Keys include 'start_idx', 'end_idx', 'length', 'start_time', 'end_time', 
+            and the ordered 'sample_ids'.
         """
         if sample_list is None:
             return []
@@ -423,6 +442,30 @@ class OnlineSubjectDataset(OnlineDatasetBase):
 
 
 def pareto_frontier(df):
+    r"""
+    Identifies the Pareto frontier (non-dominated set) from a DataFrame based on 
+    three maximization objectives.
+
+    A row is considered "dominated" if there exists another row that is at least 
+    as good in all objectives and strictly better in at least one. This function 
+    is essential for multi-objective decision making, such as finding the best 
+    performing models across multiple clinical metrics.
+
+    Objectives (all maximized):
+    1.  **N_patients**: Data volume or subject count.
+    2.  **A**: First performance metric (e.g., SBP Accuracy).
+    3.  **B**: Second performance metric (e.g., DBP Accuracy).
+
+    Parameters
+    ------------
+    df (pd.DataFrame): 
+        Input data containing at least the columns "N_patients", "A", and "B".
+
+    Returns
+    ------------
+    output param 1 (pd.DataFrame):
+        A DataFrame containing only the points that lie on the Pareto frontier.
+    """
     pareto_points = []
 
     for _, row in df.iterrows():

@@ -21,23 +21,31 @@ from data.preprocessing_utils.data_visualization import (
 )
 
 
-def compute_feature_distance(encoder, signals_batch, baseline_mean, baseline_std_l2, eps):
-    """
-    encoder: frozen feature extractor
-    signals_batch: torch.Tensor [B, ...]
-    """
-    encoder.eval()
-    with torch.no_grad():
-        z = encoder(signals_batch).detach().cpu().numpy()  # [B, D]
-
-    mean_z = np.mean(z, axis=0)                            # [D]
-    dist = np.linalg.norm(mean_z - baseline_mean)
-    scaled_dist = dist / (baseline_std_l2 + eps)
-
-    return dist, scaled_dist
-
-
 def analyze_annotation_stats(dataset, agg_dir, config):
+    r"""
+    Analyzes and logs blood pressure distribution statistics and Systolic Blood Pressure (SBP) 
+    drift across personalization subjects to determine threshold percentiles.
+    
+    Parameters
+    ------------
+    dataset (PhysioDataset): 
+        The dataset object containing physiology data and subject run information.
+        
+    agg_dir (str): 
+        The directory path where aggregated drift distribution plots will be saved.
+        
+    config (dict): 
+        Configuration dictionary containing hyperparameters such as window lengths, 
+        batch sizes, and plotting flags.
+        
+    Returns
+    ------------
+    output param 1:
+        The 50th percentile (low/medium threshold) of relative SBP drift across all subjects.
+        
+    output param 2:
+        The 80th percentile (medium/high threshold) of relative SBP drift across all subjects.   
+    """
     personalization_subjects = dataset.subjects_for_personalization
     
     for subject_counter, subject_id in enumerate(personalization_subjects):
@@ -184,12 +192,48 @@ def analyze_annotation_stats(dataset, agg_dir, config):
 
 def eval_model_on_runset(encoder, prediction_head, dataset, run_samples, device, config):
     r"""
-    Evaluation on SBP + DBP only (MAP excluded).
-
-    Returns:
-        sbp_mae, sbp_std,
-        dbp_mae, dbp_std,
-        outputs (N, 2), targets (N, 2)
+    Evaluates the model on a specific set of subject run samples, calculating Mean Absolute 
+    Error (MAE) and standard deviation for SBP and DBP.
+    
+    Parameters
+    ------------
+    encoder (torch.nn.Module): 
+        The feature extraction network.
+        
+    prediction_head (torch.nn.Module): 
+        The regression head that maps features to blood pressure values.
+        
+    dataset (PhysioDataset): 
+        The dataset instance used to retrieve signals and targets via indices.
+        
+    run_samples (list): 
+        A list of sample indices (IDs) representing the specific run to evaluate.
+        
+    device (torch.device): 
+        The computational device (CPU or CUDA) for tensor operations.
+        
+    config (dict): 
+        Configuration dictionary containing batch size and block split settings.
+        
+    Returns
+    ------------
+    output param 1:
+        SBP Mean Absolute Error (float).
+        
+    output param 2:
+        SBP Error Standard Deviation (float).
+        
+    output param 3:
+        DBP Mean Absolute Error (float).
+        
+    output param 4:
+        DBP Error Standard Deviation (float).
+        
+    output param 5:
+        Predicted SBP and DBP values as a numpy array of shape (N, 2).
+        
+    output param 6:
+        Ground truth SBP and DBP values as a numpy array of shape (N, 2).   
     """
 
     SBP_IDX = 0
@@ -245,7 +289,56 @@ def eval_model_on_runset(encoder, prediction_head, dataset, run_samples, device,
     )
 
 def personalize_no_adapt(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Performs the 'no adapt' personalization baseline by evaluating a pretrained model across 
+    sequential data blocks without updating weights to establish a performance floor.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial model containing the encoder and prediction head weights.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'no_adapt').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing access to subject-specific signals and labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific results and plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking metrics during the personalization process.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model inference.
+        
+    config (dict): 
+        Configuration dictionary containing sequence lengths, batch sizes, and block settings.
+        
+    low_thr (float, optional): 
+        The lower drift threshold for conditional adaptation logic (unused in this baseline).
+        
+    high_thr (float, optional): 
+        The upper drift threshold for conditional adaptation logic (unused in this baseline).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and STD calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
 
     # Savepath
@@ -372,7 +465,57 @@ def personalize_no_adapt(pretrained_learner, baseline, dataset, subject_id, subj
 
 
 def personalize_first_batch_finetune(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'First-Batch Fine-Tuning' personalization baseline where the model adapts 
+    once to the first available data block (or the first block exceeding a drift threshold) 
+    and then remains frozen for all subsequent blocks.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial meta-trained model containing the encoder and prediction head.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'first_batch_ft').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking training and validation loss during the one-time adaptation.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing personalization hyperparameters (learning rate, steps, criterion).
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger the one-time adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -667,7 +810,56 @@ def personalize_first_batch_finetune(pretrained_learner, baseline, dataset, subj
 
 
 def personalize_online(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'Online' personalization baseline where the model continuously adapts to new 
+    data blocks as they arrive, either at every step or based on a drift detection trigger.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial meta-trained model containing the encoder and prediction head.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'online_adaptation').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking training and validation loss for each online adaptation step.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing personalization hyperparameters (learning rate, steps, setup type).
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -953,7 +1145,57 @@ def personalize_online(pretrained_learner, baseline, dataset, subject_id, subj_d
 
 
 def personalize_online_from_scratch(fresh_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'Online From Scratch' personalization baseline. Unlike the 'online' 
+    baseline, this method begins with a randomly initialized (fresh) model and 
+    continually trains it on subject-specific data blocks as they arrive.
     
+    Parameters
+    ------------
+    fresh_learner (MAML or Model): 
+        A non-pretrained, randomly initialized model instance used as the starting point.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'online_from_scratch').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking training and validation loss for each online adaptation step.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing personalization hyperparameters (learning rate, steps, batch size).
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -1235,7 +1477,57 @@ def personalize_online_from_scratch(fresh_learner, baseline, dataset, subject_id
 
 
 def personalize_feature_replay(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'Feature Replay' personalization Cl algorithm that mitigates catastrophic 
+    forgetting by storing previously seen latent features in a reservoir buffer and 
+    interleaving them with current data during adaptation.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial meta-trained model containing the encoder and prediction head.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'feature_replay').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking training and validation loss during the adaptation steps.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing hyperparameters such as 'replay_buffer_size' and learning rates.
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -1540,7 +1832,58 @@ def personalize_feature_replay(pretrained_learner, baseline, dataset, subject_id
 
 
 def personalize_lwf(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'Learning without Forgetting' (LwF) personalization CL algorithm. This approach 
+    combines a standard supervised loss on new data with a distillation loss that 
+    constrains the current model to mimic the outputs of its previous iteration, 
+    thereby preserving prior knowledge without storing old data.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial meta-trained model containing the encoder and prediction head.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'lwf_adaptation').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking total loss, distillation loss, and validation performance.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing personalization hyperparameters including 'lwf_lambda'.
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -1843,7 +2186,56 @@ def personalize_lwf(pretrained_learner, baseline, dataset, subject_id, subj_dir,
 
 
 def personalize_ewc(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'Elastic Weight Consolidation' (EWC) personalization CL algorithm. This approach slows 
+    down learning on weights that are important for previous data blocks by adding a quadratic penalty based on the Fisher Information Matrix.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial meta-trained model containing the encoder and prediction head.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'ewc_adaptation').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking training loss (including EWC penalty) and validation loss.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing personalization hyperparameters including 'ewc_lambda'.
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -2169,7 +2561,59 @@ def personalize_ewc(pretrained_learner, baseline, dataset, subject_id, subj_dir,
 
 
 def personalize_agem(pretrained_learner, baseline, dataset, subject_id, subj_dir, writer, device, config, low_thr=None, high_thr=None):
+    r"""
+    Executes the 'Averaged Gradient Episodic Memory' (A-GEM) personalization CL algorithm. 
+    This method ensures that the update gradient for the current data block does not 
+    increase the loss on a reference set of previous data (stored in a replay buffer). 
+    If a conflict is detected (negative dot product), the gradient is projected onto 
+    the normal plane of the reference gradient.
     
+    Parameters
+    ------------
+    pretrained_learner (MAML or Model): 
+        The initial meta-trained model containing the encoder and prediction head.
+        
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'agem_adaptation').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    subj_dir (str): 
+        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+        
+    writer (SummaryWriter): 
+        TensorBoard logger for tracking training loss and gradient projection events.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing personalization hyperparameters like 'replay_buffer_size'.
+        
+    low_thr (float, optional): 
+        The lower relative drift threshold used to trigger adaptation in 'drift' setup.
+        
+    high_thr (float, optional): 
+        The upper relative drift threshold (maintained for interface consistency).
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
     # ---- INITIALIZATION ----
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
@@ -2504,7 +2948,38 @@ def personalize_agem(pretrained_learner, baseline, dataset, subject_id, subj_dir
 
 
 def personalization(tensorboard_path, config, device):
+    r"""
+    Orchestrates the personalization and continual learning evaluation of blood pressure 
+    estimation models. This function initializes datasets, loads a meta-pretrained model 
+    (MAML), and evaluates multiple adaptation baselines across a stream of subject data.
 
+    The function handles the full lifecycle of personalization:
+    1.  **Initialization**: Sets up fresh and meta-trained learners.
+    2.  **Drift Analysis**: Establishes thresholds for relative Blood Pressure drift.
+    3.  **Cross-Subject Iteration**: For each subject, it runs several baselines (No Adapt, 
+        Online, EWC, LwF, AGEM, etc.).
+    4.  **Logging & Visualization**: Generates block-wise MAE plots, update summaries, 
+        and Bland-Altman/AAMI performance metrics.
+    5.  **Aggregation**: Computes Average Accuracy (AA) and Backward Transfer (BWT) across 
+        the entire subject cohort.
+
+    Parameters
+    ------------
+    tensorboard_path (str): 
+        Path to save TensorBoard log files for monitoring training and validation loss.
+        
+    config (dict): 
+        Global configuration containing hyperparameters, paths, and model specifications.
+        Required keys include 'inner_adapt', 'pretrained_model_ckpt_path', and 'baselines'.
+        
+    device (torch.device): 
+        Hardware accelerator (CPU/CUDA) to be used for model adaptation and inference.
+
+    Returns
+    ------------
+    This function does not return values but writes CSV logs, metrics, and visualization 
+    plots to the directory specified in `config['figure_path']`.
+    """
     ## --- Personalization ---
 
     block_length = config['num_train_val'] * (config['personalization_batch_size'] + config['validation_batch_size'])
@@ -2555,6 +3030,7 @@ def personalization(tensorboard_path, config, device):
     personalization_subjects = online_physio_dataset.subjects_for_personalization
 
     # Baselines
+    # -> NOTE: code source https://github.com/GMvandeVen/continual-learning
     if config['model_name'] == 'BIOT' or config['model_name'] == 'ResGruNet' or config['model_name'] == 'TCN':
         # Reduced set of baselines for models from the literature to avoid long runtimes 
         baselines = [

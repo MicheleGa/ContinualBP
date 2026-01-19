@@ -1,0 +1,35 @@
+# Python packages
+__pycache__/
+data/__pycache__
+data/preprocessing_utils/__pycache__
+models/__pycache__
+training_utils/__pycache__
+
+# VSCode settings
+.vscode/
+
+# Python virtualenv
+venv/
+
+# Attempts records
+attempts/
+
+# Checkpoints
+checkpoints/
+
+# Datasets
+data/lmdb/*
+data/data_logs/*
+data/pulse_db/mimic_iii_npz/*
+data/pulse_db/vital_db_npz/*
+
+# Figures
+figs/
+
+# Logs
+logs/
+
+# Tensorboard logs
+tensorboard/
+
+

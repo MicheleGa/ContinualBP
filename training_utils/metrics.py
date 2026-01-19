@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import pyCompare
 from sklearn.metrics import r2_score
 import torch
-from data.preprocessing_utils.signal_processing import compute_sp_dp
 
 
 class AverageMeter(object):
@@ -122,12 +121,45 @@ def update_meter(meter, metric_values, batch_size):
 
 
 def numpy_mse_loss(outputs, targets):
-    """Calculates MSE loss using NumPy."""
+    r"""
+    Calculates the Mean Squared Error (MSE) between predictions and ground truth labels using NumPy.
+    
+    Parameters
+    ------------
+    outputs (numpy.ndarray): 
+        The predicted values from the model.
+        
+    targets (numpy.ndarray): 
+        The actual ground truth values.
+        
+    Returns
+    ------------
+    output param 1:
+        The computed MSE loss as a floating-point scalar.   
+    """
     return np.mean((outputs - targets)**2)
 
 
 def numpy_smooth_l1_loss(outputs, targets, beta=1.0):
-    """Calculates Smooth L1 loss using NumPy."""
+    r"""
+    Calculates the Smooth L1 loss (Huber loss variation) between predictions and targets using NumPy.
+    
+    Parameters
+    ------------
+    outputs (numpy.ndarray): 
+        The predicted values from the model.
+        
+    targets (numpy.ndarray): 
+        The actual ground truth values.
+        
+    beta (float): 
+        The threshold at which the loss transitions from quadratic to linear.
+        
+    Returns
+    ------------
+    output param 1:
+        The computed Smooth L1 loss as a floating-point scalar.   
+    """
     absolute_error = np.abs(outputs - targets)
     quadratic_error = 0.5 * absolute_error**2 / beta
     linear_error = absolute_error - 0.5 * beta
@@ -255,8 +287,30 @@ def aami_grade(differences, mean_threshold=5, std_dev_threshold=8):
 
 def call_metric(targets, outputs, config, figure_savepath, plot=False):
     r"""
-    Metrics for the Blood Pressure Estimation: plot Bland Altman and r² (optional), 
-    SBP/DBP AAAMI and BHS standards scores, and returns the loss (MSE, SmoothL1, etc.).
+    Evaluates blood pressure estimation performance by calculating regression losses, 
+    clinical standards (BHS/AAMI), and generating statistical validation plots.
+    
+    Parameters
+    ------------
+    targets (numpy.ndarray): 
+        Ground truth blood pressure values with shape (N, 2) for SBP and DBP.
+        
+    outputs (numpy.ndarray): 
+        Predicted blood pressure values from the model with shape (N, 2).
+        
+    config (dict): 
+        Configuration dictionary containing the 'criterion' type and loss-specific hyperparameters.
+        
+    figure_savepath (str): 
+        The directory path where generated Bland-Altman and R² plots will be saved.
+        
+    plot (bool): 
+        Flag to determine whether to generate and save visualization plots.
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing calculated loss, Mean Absolute Error (MAE), and Mean Error (ME) for both SBP and DBP.   
     """
     if not os.path.exists(figure_savepath) and plot:
         os.makedirs(figure_savepath)
@@ -326,7 +380,7 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
 
 
 def compute_transfer_metrics_from_matrix(errors_matrix):
-    """
+    r"""
     Compute continual learning metrics (AA, BWT) for error-based metrics (lower = better).
 
     Parameters

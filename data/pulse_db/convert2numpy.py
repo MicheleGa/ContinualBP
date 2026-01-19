@@ -9,15 +9,30 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 def check_record_continuity(timestamps, tolerance_factor=2.0):
-    """
-    Check if patient signal records are contiguous based on timestamps.
-    
-    Parameters:
-    npz_file_path: Path to the .npz file
-    tolerance_factor: Factor to multiply normal sampling interval for gap detection
-    
-    Returns:
-    Dictionary with continuity analysis results
+    r"""
+    Validates the temporal alignment between consecutive data records to identify 
+    gaps or sensor disconnections.
+
+    The function determines the expected sampling interval $\Delta t$ within a record 
+    and compares it to the inter-record gap. If the time difference between the 
+    end of record $n$ and the start of record $n+1$ exceeds $\Delta t \times \text{tolerance}$, 
+    it is flagged as a discontinuity.
+
+    Parameters
+    ------------
+    timestamps (np.ndarray): 
+        A 3D tensor of shape $(N, 1, T)$, where $N$ is the number of records and 
+        $T$ is the number of samples per record.
+    tolerance_factor (float, optional): 
+        The multiplier for the sampling interval used to define a "gap." 
+        Defaults to 2.0.
+
+    Returns
+    ------------
+    output param 1 (dict):
+        A dictionary containing summary statistics (mean/std of gaps) and 
+        a detailed list of detected discontinuities with their specific 
+        timestamps and gap ratios.
     """
     
     # timestamps shape: (677, 1, 1250)
@@ -98,8 +113,24 @@ def check_record_continuity(timestamps, tolerance_factor=2.0):
     return results
 
 def visualize_gaps(results, show_plot=True):
-    """
-    Visualize the gaps between consecutive records
+    r"""
+    Generates diagnostic plots to visualize the temporal spacing between 
+    consecutive data records.
+
+    This function provides two complementary views:
+    1.  **Chronological Gap Plot**: A line graph showing exactly where in the 
+        recording timeline discontinuities occurred.
+    2.  **Gap Distribution**: A histogram showing the frequency of different 
+        gap sizes, helping to distinguish between minor clock jitter and 
+        major data loss events.
+
+    Parameters
+    ------------
+    results (dict): 
+        The output dictionary from the `check_record_continuity` function.
+    show_plot (bool, optional): 
+        If True, the function generates a Matplotlib figure with two subplots. 
+        Defaults to True.
     """
     gaps = []
     record_indices = []
@@ -149,7 +180,35 @@ def visualize_gaps(results, show_plot=True):
 
 
 def preprocess_subject(mat_path, out_folder):
-    """Convert one subject file (pXXX.mat) into compressed NumPy format (.npz)."""
+    r"""
+    Orchestrates the conversion and normalization of raw physiological data 
+    from MATLAB (.mat) to compressed NumPy (.npz).
+
+    The function performs several key operations:
+    1.  **Signal Concatenation**: Combines ECG, PPG, and ABP into a single 
+        multichannel tensor of shape $(N, 3, T)$, where $N$ is segments 
+        and $T$ is time steps.
+    2.  **Blood Pressure Derived Labels**: In addition to Systolic (SBP) and 
+        Diastolic (DBP), it calculates the Mean Arterial Pressure (MAP) using:
+        $$MAP \approx \frac{2 \times DBP + SBP}{3}$$
+    3.  **Demographic Encoding**: Map strings (e.g., 'M') into numeric formats 
+        suitable for model embedding or metadata filtering.
+    4.  **Compression**: Uses `savez_compressed` to significantly reduce the 
+        storage footprint of the signal data.
+
+    Parameters
+    ------------
+    mat_path (str): 
+        Full path to the source patient MATLAB file.
+    out_folder (str): 
+        Directory where the processed .npz file will be saved.
+
+    Returns
+    ------------
+    output (tuple or None): 
+        A summary tuple (subject_id, n_segments, age, gender) if successful; 
+        otherwise returns None.
+    """
     try:
         data = loadmat(mat_path)
         segs = data['Subj_Wins']
@@ -232,6 +291,33 @@ def preprocess_subject(mat_path, out_folder):
 
 
 def preprocess_dataset(in_folder, out_folder, index_file, n_jobs=8):
+    r"""
+    Executes a parallelized batch conversion of the entire MATLAB dataset 
+    into a structured NumPy ecosystem.
+
+    This function utilizes the `joblib.Parallel` engine to distribute the 
+    CPU-intensive signal processing and compression tasks across multiple 
+    processor cores, significantly reducing total preprocessing time for 
+    large datasets (e.g., MIMIC-III).
+
+    The function follows three phases:
+    1.  **Discovery**: Scans the input directory for all patient `.mat` files.
+    2.  **Parallel Execution**: Dispatches `preprocess_subject` tasks to 
+        `n_jobs` workers, tracking progress with a `tqdm` status bar.
+    3.  **Indexing**: Aggregates metadata (age, gender, segment counts) from 
+        all successfully processed patients into a central CSV index.
+
+    Parameters
+    ------------
+    in_folder (str): 
+        Directory containing the raw source MATLAB files.
+    out_folder (str): 
+        Directory where the processed .npz files will be written.
+    index_file (str): 
+        Path to the CSV file that will store the metadata summary.
+    n_jobs (int, optional): 
+        Number of parallel CPU workers. Defaults to 8.
+    """
     os.makedirs(out_folder, exist_ok=True)
     subject_files = [os.path.join(in_folder, f) for f in os.listdir(in_folder) if f.endswith(".mat")]
 

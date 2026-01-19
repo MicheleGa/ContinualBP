@@ -19,10 +19,11 @@ if __name__ == "__main__":
     model_name = args.model.split(sep='.')[-1]
     target_model = imported_module.__dict__[model_name].__dict__[model_name]
 
-    # Select the gpu to be usesd
+    # Select the device that will run the experiments, should be a gpu
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = torch._C.device("cuda:0")
     torch.set_default_dtype(torch.float32)
+    
     # Setup paths
     run_name = generate_runname(model_name=target_model.__name__, exp_name=args.expname)
     checkpoint_path = os.path.join("./checkpoints/", args.expname, run_name)
@@ -42,8 +43,8 @@ if __name__ == "__main__":
 
     # Load configuration into a dict
     config = dict()    
-    config.update(args.__dict__)  # add argparse
-    config['model_name'] = model_name # add model name
+    config.update(args.__dict__)  
+    config['model_name'] = model_name 
     config['checkpoint_path'] = checkpoint_path
     config['tensorboard_path'] = tensorboard_path
     config['figure_path'] = figure_path

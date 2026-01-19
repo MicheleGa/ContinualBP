@@ -65,9 +65,7 @@ class PhysioDataset(Dataset):
                 plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, f'pretraining_subject_sample_distribution_min_sample_{self.min_subject_sample_number}.jpg'))
             else:
                 plot_subject_sample_distribution(self.index_by_subject_id, self.subjects_for_pretraining, savepath=os.path.join(savepath, 'pretraining_subject_sample_distribution.jpg'))
-        with open('./patient_ids.txt', "w") as f:
-            for subject_id in self.subjects_for_pretraining:
-                f.write(f"{subject_id}\n")
+        
         print(f"[PhysioDataset] Initialized with following configuration:")
         print(f"\t-Total Subjects: {len(self.subjects_for_pretraining)}")
         print(f"\t-Total Samples: {len(self.index_by_sample_id)}")
@@ -76,6 +74,23 @@ class PhysioDataset(Dataset):
         self.subject_drift_info = self.compute_subject_sbp_drift()
                     
     def check_subjects_list(self, min_subject_sample_number=0):
+        r"""
+        Performs data integrity checks and balancing on the subject list to avoid
+        run-time errors during pre-training data loading.
+        
+        Parameters
+        ------------
+        min_subject_sample_number (int, optional): 
+            The minimum required number of signal windows a subject must have to remain 
+            in the dataset. If greater than 0, subjects exceeding this number will 
+            be truncated to this length for data balancing. Defaults to 0.
+
+        Returns
+        ------------
+        None: 
+            The method modifies the instance attributes `self.subjects_for_pretraining` 
+            and `self.index_by_subject_id` in-place.
+        """
         # Considering preprocessing in the mimic_iii, when a subject has no valid samples,
         # its ID is in the self.index_by_subject_id but not in the self.index_by_sample_id as the for loop inside
         # with lmdbenv.begin(write=True) as txn: deos not make this check
@@ -97,6 +112,23 @@ class PhysioDataset(Dataset):
                     self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
 
     def compute_subject_sbp_drift(self):
+        r"""
+        Analyzes the 'drift' or physiological variance by retrieving 
+        the ground-truth SBP labels for all windows associated with a subject.
+
+        Statistical Metrics Computed:
+        1.  **SBP Standard Deviation**: Measures the average dispersion of BP values 
+            around the mean for that subject.
+        2.  **SBP Range**: The absolute difference between the highest and lowest 
+            recorded SBP (Max - Min).
+        3.  **Sample Count**: The total number of valid windows used for the calculation.
+
+        Returns
+        ------------
+        drift_info (dict): 
+            A dictionary keyed by `subject_id`, where each value is a sub-dictionary 
+            containing the calculated 'sbp_std_over_time', 'sbp_range', and 'num_samples'.
+        """
         drift_info = {}
 
         for subject_id, sample_ids in self.index_by_subject_id.items():
@@ -119,7 +151,7 @@ class PhysioDataset(Dataset):
         return drift_info
 
     def drift_aware_train_split(self, train_subjects, train_drift_info):
-        """
+        r"""
         Split training subjects into supervised and meta-learning sets
         in a drift-aware manner.
 
@@ -197,7 +229,33 @@ class PhysioDataset(Dataset):
 
     
     def get_pretraining_samplers(self):
-        """Get train/val/test samplers for pretraining dataset"""
+        r"""
+        Partitions the pre-training dataset into specialized cohorts for Supervised Learning 
+        and Meta-Learning, ensuring strict subject-level isolation.
+
+        The partitioning follows a hierarchical strategy:
+        1.  **Macro Split**: Divides all pre-training subjects into Train, Validation, 
+            and Test sets based on `pretraining_split_ratio`.
+        2.  **Drift Categorization**: Analyzes the Training set to classify subjects into 
+            'low', 'medium', or 'high' drift regimes using quartile thresholds ($Q25$ and $Q75$).
+        3.  **Specialized Train Split**: Further divides the Training cohort into:
+            - **Supervised Pre-train**: For standard representation learning.
+            - **Meta-Learning**: For training the model's ability to adapt quickly (MAML).
+        4.  **Drift-Awareness**: If `drift_aware` is enabled, the split ensures a 
+            balanced representation of different physiological drift regimes in both 
+            training pools.
+
+        Returns
+        ------------
+        supervised_sampler (SubsetRandomSampler):
+            Indices for standard supervised pre-training.
+        meta_sampler (SubsetRandomSampler):
+            Indices for meta-learning tasks.
+        val_sampler (SubsetRandomSampler):
+            Indices for hyperparameter validation.
+        test_sampler (SubsetRandomSampler):
+            Indices for final pre-training performance assessment.
+        """
             
         print("[PhysioDataset] Pretraining train/val/test sets samples are sampled from different subject sets")
         
@@ -396,10 +454,12 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()  
     
+    # Figs folder for logging dataset statistics
     root_figs_folder = os.path.join(args.figs_folder, args.name) 
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
-      
+    
+    # Instantiate dataset
     dataset = PhysioDataset(
         seed=args.seed,
         lmdb_folder=os.path.join(args.dataset_folder, args.name),
@@ -414,13 +474,13 @@ if __name__ == "__main__":
         savepath=root_figs_folder
     )
     
-    # Pretraining & personalization datasets statistics
     (supervised_train_sampler, _,  val_sampler, test_sampler) = dataset.get_pretraining_samplers()
     
     supervised_train_dataloader = DataLoader(dataset, sampler=supervised_train_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)    
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
 
+    # Get a sample batch and log shape along with I/O model outputs
     input_batch = next(iter(supervised_train_dataloader))
     sig = input_batch[0]
     sig = sig.unsqueeze(-1) if len(sig.shape) == 2 else sig
