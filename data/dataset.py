@@ -70,8 +70,8 @@ class PhysioDataset(Dataset):
         print(f"\t-Total Subjects: {len(self.subjects_for_pretraining)}")
         print(f"\t-Total Samples: {len(self.index_by_sample_id)}")
         
-        print("[PhysioDataset] Computing SBP drift information for each subject ...")
-        self.subject_drift_info = self.compute_subject_sbp_drift()
+        #print("[PhysioDataset] Computing SBP drift information for each subject ...")
+        #self.subject_drift_info = self.compute_subject_sbp_drift()
                     
     def check_subjects_list(self, min_subject_sample_number=0):
         r"""
@@ -273,21 +273,21 @@ class PhysioDataset(Dataset):
             test_size=(test_ratio / (val_ratio + test_ratio)), 
             random_state=self.seed
             ) 
-        
-        train_drift_info = {k: v for k, v in self.subject_drift_info.items() if k in self.pretraining_train_subjects}
-        
-        values = np.array([v["sbp_std_over_time"] for v in train_drift_info.values()])
-        q25, q75 = np.percentile(values, [25, 75])
-        
-        for subject_id, info in train_drift_info.items():
-            if info["sbp_std_over_time"] <= q25:
-                info["drift_regime"] = "low"
-            elif info["sbp_std_over_time"] >= q75:
-                info["drift_regime"] = "high"
-            else:
-                info["drift_regime"] = "medium"
                 
         if self.drift_aware:    
+            train_drift_info = {k: v for k, v in self.subject_drift_info.items() if k in self.pretraining_train_subjects}
+        
+            values = np.array([v["sbp_std_over_time"] for v in train_drift_info.values()])
+            q25, q75 = np.percentile(values, [25, 75])
+            
+            for subject_id, info in train_drift_info.items():
+                if info["sbp_std_over_time"] <= q25:
+                    info["drift_regime"] = "low"
+                elif info["sbp_std_over_time"] >= q75:
+                    info["drift_regime"] = "high"
+                else:
+                    info["drift_regime"] = "medium"
+                    
             self.supervised_pretrain_subjects, self.meta_learning_subjects = self.drift_aware_train_split(
                 self.pretraining_train_subjects,
                 train_drift_info
@@ -306,25 +306,25 @@ class PhysioDataset(Dataset):
                 if s in drift_info
             )
 
-        print("[PhysioDataset] Meta-learning regimes:", regime_counts(self.meta_learning_subjects, train_drift_info))
-        print("[PhysioDataset] Supervised regimes:", regime_counts(self.supervised_pretrain_subjects, train_drift_info))
+        #print("[PhysioDataset] Meta-learning regimes:", regime_counts(self.meta_learning_subjects, train_drift_info))
+        #print("[PhysioDataset] Supervised regimes:", regime_counts(self.supervised_pretrain_subjects, train_drift_info))
         
-        if self.plot:
-            plot_drift_regime_counts(
-                train_drift_info,
-                self.pretraining_train_subjects,
-                q25=q25,
-                q75=q75,
-                title='drift_regime_counts_pretraining_train_split',
-                savepath=self.savepath
-            )
-            
-            plot_sbp_drift_distribution(
-                train_drift_info,
-                self.pretraining_train_subjects,
-                title='sbp_drift_distribution_pretraining_train_split',
-                savepath=self.savepath
-            )
+        #if self.plot:
+        #    plot_drift_regime_counts(
+        #        train_drift_info,
+        #        self.pretraining_train_subjects,
+        #        q25=q25,
+        #        q75=q75,
+        #        title='drift_regime_counts_pretraining_train_split',
+        #        savepath=self.savepath
+        #    )
+        #    
+        #    plot_sbp_drift_distribution(
+        #        train_drift_info,
+        #        self.pretraining_train_subjects,
+        #        title='sbp_drift_distribution_pretraining_train_split',
+        #        savepath=self.savepath
+        #    )
                 
         
         print("[PhysioDataset] Pretraining subjects per split")
@@ -356,7 +356,20 @@ class PhysioDataset(Dataset):
         print(f"\t\t-# meta-learning pretraining samples: {len(meta_train_sample_ids)}")
         print(f"\t-# of val samples: {len(pretraining_val_sample_ids)}")
         print(f"\t-# of test samples: {len(pretraining_test_sample_ids)}")
-                
+        
+        with open('pulse_db_supervised_training_ids', 'w') as pulse_db_file:
+            for item in self.supervised_pretrain_subjects:
+                pulse_db_file.write(f"{item}\n")
+        with open('pulse_db_metalearning_training_ids', 'w') as pulse_db_file:
+            for item in self.meta_learning_subjects:
+                pulse_db_file.write(f"{item}\n")
+        with open('pulse_db_validation_ids', 'w') as pulse_db_file:
+            for item in self.pretraining_val_subjects:
+                pulse_db_file.write(f"{item}\n")
+        with open('pulse_db_test_ids', 'w') as pulse_db_file:
+            for item in self.pretraining_test_subjects:
+                pulse_db_file.write(f"{item}\n")
+        
         # Plot staticts per split
         if self.plot:
             plot_name = 'pretraining_dataset_overview.jpg'
@@ -374,7 +387,73 @@ class PhysioDataset(Dataset):
             SubsetRandomSampler(pretraining_val_sample_ids), 
             SubsetRandomSampler(pretraining_test_sample_ids)
             )
-
+    
+    # TO REMOVE
+    #def get_pretraining_samplers_v2(self, test_ids_path):
+    #    r"""
+    #    Version 2 of pre-training samplers. 
+    #    Loads specific test subject IDs from a text file, formats them to match 
+    #    LMDB keys (adding 'p0' prefix), and splits the remaining subjects.
+    #    """
+    #    print(f"[PhysioDataset] Loading test subjects from: {test_ids_path}")
+    #    
+    #    # 1. Read and format Test IDs from text file
+    #    with open(test_ids_path, 'r') as f:
+    #        # Strip whitespace and prepend 'p0' to match LMDB format (e.g., 1234 -> p01234)
+    #        raw_test_ids = [line.strip() for line in f if line.strip()]
+    #        self.pretraining_test_subjects = [f"p0{tid}" for tid in raw_test_ids]
+#
+    #    # 2. Identify remaining subjects for Train/Val
+    #    test_set = set(self.pretraining_test_subjects)
+    #    remaining_subjects = [s for s in self.subjects_for_pretraining if s not in test_set]
+    #    
+    #    # Calculate validation ratio relative to the remaining pool
+    #    # Original ratio was based on total; we adjust to keep absolute sizes similar
+    #    _, val_ratio, _ = self.pretraining_split_ratio
+    #    total_n = len(self.subjects_for_pretraining)
+    #    target_val_size = int(total_n * val_ratio)
+    #    val_relative_ratio = target_val_size / len(remaining_subjects)
+#
+    #    # 3. Split remaining into Train and Validation
+    #    self.pretraining_train_subjects, self.pretraining_val_subjects = train_test_split(
+    #        remaining_subjects,
+    #        test_size=val_relative_ratio,
+    #        random_state=self.seed
+    #    )
+#
+    #    # 4. Split remaining training subjects into supervised and meta leanring subjects
+    #    self.supervised_pretrain_subjects, self.meta_learning_subjects = train_test_split(
+    #        self.pretraining_train_subjects,
+    #        test_size=self.meta_split_ratio,
+    #        random_state=self.seed
+    #    )
+#
+    #    # 5. Map Subject IDs back to Sample IDs for Samplers
+    #    def get_samples_for_subjects(subject_list):
+    #        sample_ids = []
+    #        for sid in subject_list:
+    #            # Ensure the subject actually exists in the index
+    #            if sid in self.index_by_subject_id:
+    #                sample_ids.extend(self.index_by_subject_id[sid])
+    #        return sample_ids
+#
+    #    sup_train_ids = get_samples_for_subjects(self.supervised_pretrain_subjects)
+    #    meta_train_ids = get_samples_for_subjects(self.meta_learning_subjects)
+    #    val_ids = get_samples_for_subjects(self.pretraining_val_subjects)
+    #    test_ids = get_samples_for_subjects(self.pretraining_test_subjects)
+#
+    #    print(f"[PhysioDataset] Split Complete:")
+    #    print(f"\t- Test Subjects (from file): {len(self.pretraining_test_subjects)}")
+    #    print(f"\t- Train Subjects: {len(self.pretraining_train_subjects)} (Sup: {len(self.supervised_pretrain_subjects)}, Meta: {len(self.meta_learning_subjects)})")
+    #    print(f"\t- Val Subjects: {len(self.pretraining_val_subjects)}")
+#
+    #    return (
+    #        SubsetRandomSampler(sup_train_ids), 
+    #        SubsetRandomSampler(meta_train_ids), 
+    #        SubsetRandomSampler(val_ids), 
+    #        SubsetRandomSampler(test_ids)
+    #    )
+    
     def __len__(self):
         return len(self.index_by_sample_id)
 
@@ -476,10 +555,13 @@ if __name__ == "__main__":
     
     (supervised_train_sampler, _,  val_sampler, test_sampler) = dataset.get_pretraining_samplers()
     
+    # TO REMOVE
+    #(supervised_train_sampler, _,  val_sampler, test_sampler) = dataset.get_pretraining_samplers_v2('./subject_list.txt')
+    
     supervised_train_dataloader = DataLoader(dataset, sampler=supervised_train_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)    
     valid_dataloader = DataLoader(dataset, sampler=val_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
     test_dataloader = DataLoader(dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.loader_worker, pin_memory=True)
-
+    
     # Get a sample batch and log shape along with I/O model outputs
     input_batch = next(iter(supervised_train_dataloader))
     sig = input_batch[0]

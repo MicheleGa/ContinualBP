@@ -493,6 +493,7 @@ def collect_subject_metrics(exp_root, total_adapt_macs, total_adapt_prediction_m
 
         subject_id = subj_dir.split("_")[1]
 
+        # Collect updates info
         path = os.path.join(
             exp_root,
             subj_dir,
@@ -514,13 +515,35 @@ def collect_subject_metrics(exp_root, total_adapt_macs, total_adapt_prediction_m
             + total_test_macs_patient
         )
 
+        # Collect AE info for ranking
+        # -> columns naming could be improved
+        sbp_path = os.path.join(
+            exp_root,
+            subj_dir,
+            f"{subj_dir}_sbp_baseline_metrics.csv"
+        )
+
+        df_sbp = pd.read_csv(sbp_path)
+        feature_replay_sbp_aa = df_sbp.loc[df_sbp["Unnamed: 0"] == "feature_replay", "AA"].iloc[0]
+        
+        dbp_path = os.path.join(
+            exp_root,
+            subj_dir,
+            f"{subj_dir}_dbp_baseline_metrics.csv"
+        )
+
+        df_dbp = pd.read_csv(dbp_path)
+        feature_replay_dbp_aa = df_dbp.loc[df_dbp["Unnamed: 0"] == "feature_replay", "AA"].iloc[0]
+        
         rows.append({
             "subject": subject_id,
             "drift_aware": drift_aware,
             "total_blocks": total_blocks,
             "num_updates": num_updates,
             "total_macs": total_macs_patient,
-            "adapt_macs": total_adapt_macs_patient
+            "adapt_macs": total_adapt_macs_patient,
+            "sbp_aa": feature_replay_sbp_aa,
+            "dbp_aa": feature_replay_dbp_aa            
         })
 
     return pd.DataFrame(rows)
@@ -567,7 +590,7 @@ def relative_degradation(aware, unaware):
     return (aware - unaware) / unaware * 100
 
 
-def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, exp_fig_root_drift_aware):
+def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, drift_aware_roots):
     r"""
     Profiles the computational resources and memory footprint of the Continual Learning algorithm (Feature Replay) and generates comparative reports between drift-aware and drift-unaware settings.
     
@@ -582,13 +605,13 @@ def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, exp_fi
     exp_fig_root (str): 
         The directory containing experiment results for the standard (drift-unaware) baseline.
         
-    exp_fig_root_drift_aware (str): 
-        The directory containing experiment results for the drift-aware adaptation strategy.
+    drift_aware_roots (str): 
+        The list of directories containing experiment results for the drift-aware adaptation strategy.
     """
     
     OUT_FIG_ROOT = os.path.join(root_savepath, "resource_usage_profile")
-    os.makedirs(OUT_FIG_ROOT, exist_ok=True)
-        
+    os.makedirs(OUT_FIG_ROOT, exist_ok=True) 
+    
     # Get configuration parameters
     with open(config_file_path, "r") as f:
         setup = yaml.safe_load(f)
@@ -798,170 +821,243 @@ def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, exp_fi
     aa_sbp_unaware = read_feature_replay_aa(sbp_path_unaware)
     aa_dbp_unaware = read_feature_replay_aa(dbp_path_unaware)
 
-    # Compute AA, MACs and number of updates per drift unaware cases
-    df_aware = collect_subject_metrics(
-        exp_fig_root_drift_aware,
-        total_adapt_macs=total_adapt_macs,
-        total_adapt_prediction_macs=total_adapt_prediction_macs,
-        total_test_macs=total_test_macs,
-        drift_aware=True
-    )
-    
-    # Read AA with drift-aware
-    sbp_path_aware = os.path.join(
-        exp_fig_root_drift_aware,
-        "aggregate_metrics",
-        "sbp_aggregate_baseline_metrics.csv"
-    )
-    dbp_path_aware = os.path.join(
-        exp_fig_root_drift_aware,
-        "aggregate_metrics",
-        "dbp_aggregate_baseline_metrics.csv"
-    )
-    aa_sbp_aware = read_feature_replay_aa(sbp_path_aware)
-    aa_dbp_aware = read_feature_replay_aa(dbp_path_aware)
-    
-    print(f"SBP AA (drift-unaware):     {aa_sbp_unaware:.4f}")
-    print(f"SBP AA (drift-aware): {aa_sbp_aware:.4f}")
+    all_updates = {}
+    subject_order = None
+    results = []
 
-    print(f"DBP AA (drift-unaware):     {aa_dbp_unaware:.4f}")
-    print(f"DBP AA (drift-aware): {aa_dbp_aware:.4f}")
+    for drift_root in drift_aware_roots:
 
-    # Compute degradation
-    sbp_deg = relative_degradation(aa_sbp_aware, aa_sbp_unaware)
-    dbp_deg = relative_degradation(aa_dbp_aware, aa_dbp_unaware)
+        print(f"\n[Resource Usage Profile] Processing drift-aware experiment: {drift_root}")
 
-    # Report
-    print(f"SBP AA (unaware → aware): {aa_sbp_unaware:.4f} → {aa_sbp_aware:.4f}")
-    print(f"SBP AA degradation: {sbp_deg:+.2f}%")
-
-    print(f"DBP AA (unaware → aware): {aa_dbp_unaware:.4f} → {aa_dbp_aware:.4f}")
-    print(f"DBP AA degradation: {dbp_deg:+.2f}%")
-
-    
-    df_all = pd.concat([df_unaware, df_aware], ignore_index=True)
-    
-    # Report mean +/-std per subject (drift unware vs drift aware   )
-    summary = (
-        df_all
-        .groupby("drift_aware")
-        .agg(
-            mean_updates=("num_updates", "mean"),
-            std_updates=("num_updates", "std"),
-            mean_total_macs=("total_macs", "mean"),
-            std_total_macs=("total_macs", "std"),
+        df_aware = collect_subject_metrics(
+            drift_root,
+            total_adapt_macs=total_adapt_macs,
+            total_adapt_prediction_macs=total_adapt_prediction_macs,
+            total_test_macs=total_test_macs,
+            drift_aware=True
         )
-        .reset_index()
-    )
 
-    print(summary)
-    
-    # Relative MACs savings
-    df_merged = pd.merge(
-        df_unaware,
-        df_aware,
-        on="subject",
-        suffixes=("_unaware", "_aware")
-    )
+        # ---- Read AA metrics ----
+        sbp_path_aware = os.path.join(
+            drift_root,
+            "aggregate_metrics",
+            "sbp_aggregate_baseline_metrics.csv"
+        )
 
-    df_merged["relative_macs_savings"] = ((
-        df_merged["total_macs_unaware"] - df_merged["total_macs_aware"]
-    ) / df_merged["total_macs_unaware"]) * 100
+        dbp_path_aware = os.path.join(
+            drift_root,
+            "aggregate_metrics",
+            "dbp_aggregate_baseline_metrics.csv"
+        )
 
-    df_merged["relative_update_reduction"] = ((
-        df_merged["num_updates_unaware"] - df_merged["num_updates_aware"]
-    ) / df_merged["num_updates_unaware"]) * 100
+        aa_sbp_aware = read_feature_replay_aa(sbp_path_aware)
+        aa_dbp_aware = read_feature_replay_aa(dbp_path_aware)
+
+        sbp_deg = relative_degradation(aa_sbp_aware, aa_sbp_unaware)
+        dbp_deg = relative_degradation(aa_dbp_aware, aa_dbp_unaware)
+
+        # ---- MAC savings ----        
+        df_merged = pd.merge(
+            df_unaware,
+            df_aware,
+            on="subject",
+            suffixes=("_unaware", "_aware")
+        )
+
+        df_merged["relative_macs_savings"] = (
+            (df_merged["total_macs_unaware"] - df_merged["total_macs_aware"])
+            / df_merged["total_macs_unaware"]
+        ) * 100
+
+        mac_savings_mean = df_merged["relative_macs_savings"].mean()
+
+        print(f"SBP AA degradation: {sbp_deg:+.2f}%")
+        print(f"DBP AA degradation: {dbp_deg:+.2f}%")
+        print(f"Relative MAC savings: {mac_savings_mean:.2f}%")
+
+        # ---- Histogram of updates per patient ----
+        df_sorted = df_merged.sort_values("subject")
         
-    print(
-        "Relative MAC savings: "
-        f"{df_merged['relative_macs_savings'].mean():.3f} ± "
-        f"{df_merged['relative_macs_savings'].std():.3f}"
-    )
+        # Extract the threshold string as the experiment name
+        exp_name = drift_root.split('/')[2][-3:]
+        
+        plt.figure(figsize=(12,6))
 
-    print(
-        "Relative update reduction: "
-        f"{df_merged['relative_update_reduction'].mean():.3f} ± "
-        f"{df_merged['relative_update_reduction'].std():.3f}"
-    )
-
-    # Read CSV file with patient ID, sorted by SBP MAE and with the SBP variability over time
-    df_sbp = pd.read_csv(os.path.join(
-        root_savepath, 
-        "feature_replay",
-        "patient_sbp_mae_with_target_stats.csv"
+        plt.bar(
+            df_sorted["subject"],
+            df_sorted["num_updates_aware"]
         )
-    )
+
+        plt.xticks(rotation=90)
+        plt.xlabel("Subjects", fontsize=12)
+        plt.ylabel("Number of drift-aware updates", fontsize=12)
+        plt.title("Drift-aware update frequency per subject", fontsize=14)
+
+        plt.tight_layout()
+
+        plt.savefig(
+            os.path.join(
+                OUT_FIG_ROOT,
+                f"drift_updates_histogram_{exp_name}.png"
+            ),
+            dpi=300
+        )
+
+        plt.close()
+        
+        # Store the number of updates for this experiment
+        # Select a subset of all_updates to improve readability of the plot
+        if exp_name == '0.1' or exp_name == '0.3' or exp_name == '0.5':
+            all_updates[exp_name] = df_sorted["num_updates_aware"].values
+            subject_order = df_sorted["subject"].values # subject order is always the same
+        
+        # ---- Store results ----
+        results.append({
+            "experiment": exp_name,
+            "sbp_degradation_percent": round(sbp_deg, 2),
+            "dbp_degradation_percent": round(dbp_deg, 2),
+            "mac_savings_percent": round(mac_savings_mean, 2)
+        })
     
-    # The column "std_mean_SBP_over_time" report the variability of SBP (higher for difficult patient)
-    df_analysis = pd.merge(
-        df_merged,
-        df_sbp[["subject", "std_mean_SBP_over_time"]],
-        on="subject"
-    )
-    df_analysis = df_analysis.sort_values("std_mean_SBP_over_time").reset_index(drop=True)
+    # For plotting readability check all_updates length
+    assert len(all_updates) == 3, f"Expected 3 experiments, found {len(all_updates)}"
+    
+    # Plot  num updates reduction
+    plt.figure(figsize=(14, 10))
 
-    # MACs savings vs SBP varaibility (i.e. patient difficulty)
-    df_analysis["drift_bin"] = pd.qcut(
-        df_analysis.index,
-        q=[0, 0.25, 0.75, 1.0],
-        labels=["Low", "Medium", "High"]
+    # Define a custom Pastel RGB palette
+    pastel_rgb = [
+        (0.4, 0.6, 1.0),  # Muted Blue (Sky)
+        (1.0, 0.85, 0.30), # Golden Pastel Yellow
+        (1.0, 0.4, 0.4), # Muted Red (Salmon)
+    ]
+    # Sort experiments by total updates descending 
+    # This ensures smaller bars are often drawn "on top" of larger ones if they share a baseline
+    sorted_exps = sorted(all_updates.items(), key=lambda x: np.mean(x[1]), reverse=True)
+
+    for i, (exp_name, updates) in enumerate(sorted_exps):
+        plt.bar(
+            subject_order, 
+            updates, 
+            label=f"thr: {exp_name}", 
+            color=pastel_rgb[i],
+            alpha=0.8,            # Increased opacity for better visibility
+            edgecolor=pastel_rgb[i], 
+            linewidth=1.2,        # Slightly thicker edge to define the overlap
+            width=0.8,
+            zorder=i              # Larger values at back, smaller values on top
+        )
+
+    # Formatting
+    plt.xticks([])
+    #plt.xticks(rotation=90)
+    plt.xlabel("Subjects", fontsize=12)
+    plt.ylabel("Number of drift-aware updates", fontsize=12)
+    plt.title("Drift-aware Update Frequency per Subject", fontsize=14)
+
+    # Place legend to the side so it doesn't cover the bars
+    plt.legend(
+        title="Thresholds", 
+        bbox_to_anchor=(1.02, 1), 
+        loc='upper left', 
+        frameon=True,
+        fontsize=10
     )
 
-    plt.figure(figsize=(10, 7))
-    sns.violinplot(
-        data=df_analysis,
-        x="drift_bin",
-        y="relative_macs_savings",
-        inner="box"
-    )
-
-    plt.xlabel("SBP drift regime")
-    plt.ylabel("Relative MAC savings")
-    plt.title("Computational savings vs SBP drift variability")
+    plt.grid(axis='y', linestyle=':', alpha=0.4, zorder=-1)
     plt.tight_layout()
+
+    # Save
     plt.savefig(
-        os.path.join(root_savepath, "feature_replay", "mac_savings_vs_sbp_drift.png"),
-        dpi=300
+        os.path.join(OUT_FIG_ROOT, "drift_updates_overlapping.png"),
+        dpi=300,
+        bbox_inches='tight'
     )
     plt.close()
     
-    # Relative MACs saving vs SBP variability (i.e. patient difficulty)
-    plt.figure(figsize=(10, 8))
-    plt.scatter(
-        df_analysis["std_mean_SBP_over_time"],
-        df_analysis["relative_macs_savings"],
-        alpha=0.7
+    # Plot tradeoff
+    df_tradeoff = pd.DataFrame(results)
+    
+    print("\nTradeoff summary:")
+    print(df_tradeoff)
+    
+    plt.figure(figsize=(12,10))
+
+    # Sort experiments for consistency
+    df_plot = df_tradeoff.copy()
+
+    x_plot = np.arange(len(df_plot))
+    labels = df_plot["experiment"]
+
+    # Pastel colors
+    color_sbp = "#f4a6a6"   # pastel coral
+    color_dbp = "#8fd3d1"   # pastel teal
+    color_macs = "#bdbdbd"  # soft gray
+
+    ax1 = plt.gca()
+
+    # ---- MAC savings (left axis) ----
+    ax1.plot(
+        x_plot,
+        df_plot["mac_savings_percent"],
+        marker="s",
+        linewidth=1,
+        markersize=6,
+        color=color_macs,
+        label="MACs saving"
     )
 
-    plt.xlabel("SBP temporal variability")
-    plt.ylabel("Relative MAC savings")
-    plt.title("Computational savings vs SBP variability")
-    plt.tight_layout()
-    plt.savefig(
-        os.path.join(root_savepath, "feature_replay", "updates_vs_sbp_variability.png"),
-        dpi=300
-    )
-    plt.close()
-    
-    # Number of updates vs SBP variability (i.e. patient difficulty)
-    plt.figure(figsize=(10, 8))
-    plt.scatter(
-        df_analysis["std_mean_SBP_over_time"],
-        df_analysis["num_updates_aware"],
-        alpha=0.7
-    )
-    
-    plt.xticks(fontsize=12)
-    plt.yticks(fontsize=12)
+    ax1.set_ylabel("MACs saving (%)", fontsize=12)
+    ax1.set_ylim(bottom=0)
 
-    plt.xlabel("SBP drift (mmHg)", fontsize=14)
-    plt.ylabel("Number of drift-aware updates", fontsize=14)
-    plt.title("Update frequency vs SBP drift", fontsize=16)
+    # ---- AA degradation (right axis) ----
+    ax2 = ax1.twinx()
+
+    ax2.plot(
+        x_plot,
+        df_plot["sbp_degradation_percent"],
+        marker="s",
+        linewidth=1,
+        markersize=6,
+        color=color_sbp,
+        label="SBP AE degradation"
+    )
+
+    ax2.plot(
+        x_plot,
+        df_plot["dbp_degradation_percent"],
+        marker="s",
+        linewidth=1,
+        markersize=6,
+        color=color_dbp,
+        label="DBP AE degradation"
+    )
+
+    ax2.set_ylabel("AE degradation (%)", fontsize=12)
+
+    # ---- X axis ----
+    ax1.set_xlabel("Thresholds", fontsize=12)
+    ax1.set_xticks(x_plot)
+    ax1.set_xticklabels(labels,fontsize=12)
+
+    # ---- Grid ----
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    # ---- Combined legend ----
+    lines = ax1.get_lines() + ax2.get_lines()
+    labels = [l.get_label() for l in lines]
+
+    plt.legend(lines, labels, loc="upper left", fontsize=10)
+
+    plt.title("MACs Saving vs AE Degradation Trade-off", fontsize=14)
+
     plt.tight_layout()
+
     plt.savefig(
-        os.path.join(root_savepath, "feature_replay", "updates_vs_sbp_variability.png"),
+        os.path.join(OUT_FIG_ROOT, "aa_vs_macs_tradeoff.png"),
         dpi=300
     )
+    
     plt.close()
 
     
@@ -972,8 +1068,8 @@ def parseargs():
     parser.add_argument('--config_yaml_path', default='', type=str, help='path to the configuration YAML file for the experiments')
     parser.add_argument('--fig_root', default='', type=str, help='path to figure folder where to store the result analysis outputs')
     parser.add_argument('--exp_fig_root', default='', type=str, help='path to figure folder of each subject analyzed in an experiment (subfolder inside fig_root)')
-    parser.add_argument('--exp_fig_root_drift_aware', default='', type=str, help='path to figure folder of each subject analyzed in a drift aware experiment (subfolder inside fig_root)')
-    
+    parser.add_argument('--exp_fig_root_drift_aware', nargs='+', default=[], help='list of drift-aware experiment folders')
+
     return parser.parse_args()
 
 
@@ -982,12 +1078,13 @@ if __name__ == "__main__":
     
     # Collect metrics from the experiment log file and organize them in CSVs
     analyze_logs_and_plot(args.log_file_path, args.fig_root)
-    
+        
     # Aggregates results over patients and correlates them to SBP variability
     aggregate_patient_level_target_statistics_and_plot(args.fig_root, args.exp_fig_root)
     
-    # Computational and storage resources of the Feature Replay algorithm
-    # -> NOTE: the resource cost of other baselines may be estimated with future expansion of the codebase
-    resource_usage_profile(args.config_yaml_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
+    if len(args.exp_fig_root_drift_aware) > 0:
+        # Computational and storage resources of the Feature Replay algorithm
+        # -> NOTE: the resource cost of other baselines may be estimated with future expansion of the codebase
+        resource_usage_profile(args.config_yaml_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
     
         

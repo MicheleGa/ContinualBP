@@ -8,8 +8,8 @@ import lmdb
 import torch
 from torch.utils.data import Dataset
 from preprocessing_utils.data_visualization import (
-    plot_subject_sample_distribution, plot_consecutive_runs_all, 
-    plot_subject_annotation_runs, plot_run_length_statistics,
+    plot_subject_sample_distribution, plot_consecutive_block_all, 
+    plot_subject_annotation_blocks, plot_block_length_statistics,
     plot_pareto_frontier
 )
 
@@ -123,10 +123,8 @@ class OnlineDatasetBase(Dataset):
 
         # ---------------------------------------------------------
         # === Load annotations ===
-        #   - Full ABP waveform
         #   - SBP, DBP, MAP values
         # ---------------------------------------------------------
-        abp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-abp".encode()), dtype="float32"))
         sbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-sbp".encode()), dtype="float32"))
         dbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-dbp".encode()), dtype="float32"))
         map = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{index}-map".encode()), dtype="float32"))
@@ -169,16 +167,17 @@ class OnlineDatasetBase(Dataset):
         
 
 class OnlineSubjectDataset(OnlineDatasetBase):
-    def __init__(self, block_length, valid_runs_number, *args, **kwargs):
+    def __init__(self, batch_size, num_batches, num_blocks, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.filter_subjects_by_min_run_length(
+        self.filter_subjects_by_min_block_length(
             window_length=kwargs['input_seq_len_s'], 
-            block_length=block_length,
-            valid_runs_number=valid_runs_number
-            )
+            batch_size=batch_size,
+            num_batches=num_batches,
+            num_blocks=num_blocks
+        )
 
-    def find_consecutive_runs(self, sample_list, window_length):
+    def find_consecutive_blocks(self, sample_list, window_length):
         r"""
         Identifies and groups segments of samples that form a continuous, 
         uninterrupted chronological sequence.
@@ -194,7 +193,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         Returns
         ------------
         output param 1 (list):
-            A list of dictionaries, where each dictionary represents a continuous run. 
+            A list of dictionaries, where each dictionary represents a continuous block. 
             Keys include 'start_idx', 'end_idx', 'length', 'start_time', 'end_time', 
             and the ordered 'sample_ids'.
         """
@@ -258,90 +257,94 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         # if the end of a window and the ebginning of the next one is more then half-a second delta, then there is a gap 
         threshold = float(window_length) + 0.5
 
-        # Group into runs: whenever gap > threshold we cut the run
-        runs = []
-        run_start = 0
+        # Group into blocks: whenever gap > threshold we cut the block
+        blocks = []
+        block_start = 0
         for i, gap in enumerate(diffs):
             if gap > threshold:
-                run_end = i
-                runs.append({
-                    "start_idx": run_start,
-                    "end_idx": run_end,
-                    "length": run_end - run_start + 1,
-                    "start_time": float(sorted_starts[run_start]),
-                    "end_time": float(sorted_ends[run_end]),
-                    "sample_ids": sorted_ids[run_start:run_end+1]
+                block_end = i
+                blocks.append({
+                    "start_idx": block_start,
+                    "end_idx": block_end,
+                    "length": block_end - block_start + 1,
+                    "start_time": float(sorted_starts[block_start]),
+                    "end_time": float(sorted_ends[block_end]),
+                    "sample_ids": sorted_ids[block_start:block_end+1]
                 })
-                run_start = i + 1
+                block_start = i + 1
 
-        # Add last run
-        if run_start <= len(sorted_ids) - 1:
-            runs.append({
-                "start_idx": run_start,
+        # Add last block if it exists
+        if block_start <= len(sorted_ids) - 1:
+            blocks.append({
+                "start_idx": block_start,
                 "end_idx": len(sorted_ids) - 1,
-                "length": len(sorted_ids) - run_start,
-                "start_time": float(sorted_starts[run_start]),
+                "length": len(sorted_ids) - block_start,
+                "start_time": float(sorted_starts[block_start]),
                 "end_time": float(sorted_ends[-1]),
-                "sample_ids": sorted_ids[run_start:]
+                "sample_ids": sorted_ids[block_start:]
             })
 
-        return runs
+        return blocks
 
-    def filter_subjects_by_min_run_length(self, window_length, block_length, valid_runs_number):
+    def filter_subjects_by_min_block_length(self, window_length, batch_size, num_batches, num_blocks):
         r"""
         Filters subjects based on:
-        1. Run length sufficient to contain `num_phases` train/val phases.
-        2. At least `valid_runs_number` such runs per subject.
-        3. Each valid run is *trimmed* so that only the first
-            `num_phases * (adapt_size + val_size)` windows are kept.
-
-        A run is valid if:
-            len(run) >= block_length
+        1. Block length sufficient to contain `num_batches * batch_size` windows.
+        2. At least `num_blocks` of such blocks per subject.
+        3. Each block is *trimmed* so that only the first
+            `num_batches * batch_size` windows are kept.
 
         Parameters
         ----------
         window_length : int
             Length of each input window in seconds.
-        block_length : int
-            Number of windows for the training and validation parts of each run.
-        valid_runs_number : int
-            Minimum number of valid runs required for a subject to be kept.
+        batch_size : int
+            Number of windows in each batch.
+        num_batches : int
+            Number of batches required for a block of a subject to be kept.
+        num_blocks : int
+            Minimum number of blocks required for a subject to be kept.
         """
-
         subjects_to_remove = []
 
-        print(f"[Filtering] Required windows per run: {block_length}")
-        print(f"[Filtering] Required runs per subject: {valid_runs_number}")
+        print(f"[Filtering] Required windows per batch: {batch_size}")
+        print(f"[Filtering] Required batches per block: {num_batches}")
+        print(f"[Filtering] Required blocks per subject: {num_blocks}")
 
         for subj in list(self.subjects_for_personalization):
 
             sample_ids = list(self.index_by_subject_id[subj])
-            if len(sample_ids) < block_length:
+            
+            # Remove subjects with insufficient windows for a batch
+            if len(sample_ids) < batch_size:
                 subjects_to_remove.append(subj)
                 continue
 
-            # 1) Identify raw runs
-            runs = self.find_consecutive_runs(sample_ids, window_length)
+            # 1) Identify raw blocks of consecutive windows for this subject (without trimming yet)
+            blocks = self.find_consecutive_blocks(sample_ids, window_length)
 
-            valid_runs = []
+            valid_blocks = []
             kept_sample_ids = []
 
-            # 2) Keep only runs long enough AND trim them
-            for r in runs:
-                if r["length"] >= block_length:
+            # 2) Keep only blocks long enough AND trim them
+            for b in blocks:
+                if b["length"] >= batch_size:
 
-                    # --- trim run to first block_length windows ---
-                    trimmed_samples = r["sample_ids"][:block_length]
-
-                    valid_runs.append(trimmed_samples)
-                    kept_sample_ids.extend(trimmed_samples)
+                    # --- trim block to first num_batches * batch_size windows ---
+                    trimmed_samples = b["sample_ids"][:num_batches * batch_size]
                     
-                    # Maintain only required number of valid runs
-                    if len(valid_runs) >= valid_runs_number:
-                        break
+                    if len(trimmed_samples) < (num_batches * batch_size):
+                        continue
 
-            # 3) Check if enough valid runs exist for this subject
-            if len(valid_runs) < valid_runs_number:
+                    valid_blocks.append(trimmed_samples)
+                    kept_sample_ids.extend(trimmed_samples)
+
+                    # Maintain only required number of valid blocks
+                    if len(valid_blocks) >= num_blocks:
+                        break
+                    
+            # 3) Check if enough valid blocks exist for this subject
+            if len(valid_blocks) < num_blocks:
                 subjects_to_remove.append(subj)
                 continue
 
@@ -349,7 +352,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             kept_sample_ids = sorted(set(kept_sample_ids))
             self.index_by_subject_id[subj] = kept_sample_ids
 
-        # Remove subjects without enough valid runs
+        # Remove subjects without enough valid blocks
         for subj in subjects_to_remove:
             if subj in self.index_by_subject_id:
                 del self.index_by_subject_id[subj]
@@ -359,86 +362,75 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         print(f"[Filtering] Subjects remaining: {len(self.subjects_for_personalization)} (removed {len(subjects_to_remove)})")
 
 
-    def get_subject_runs(self, subject_id, window_length, adapt_size: int = 16, val_size: int = 16, block_length: int = 32, split_blocks: int = 1):
+    def get_subject_blocks(self, subject_id, window_length, batch_size: int = 16, num_batches: int = 3, num_blocks: int = 3):
         r"""
-        Build subject runs using fixed interleaved adaptation/validation windows.
+        Build subject blocks using fixed interleaved adaptation/validation windows.
 
         Parameters
         ----------
         subject_id : int
             Subject identifier from the dataset.
-        adapt_size : int, optional
-            Number of windows per adaptation (train) block.
-        val_size : int, optional
-            Number of windows per validation (test) block.
-        block_length : int, optional
-            Minimum number of windows in a run to be considered. Default=200.
-        split_blocks : int, optional
-            Number of interleaved train/test blocks to create for each block.
+        batch_size : int, optional
+            Number of windows per batch.
+        num_batches : int, optional
+            Number of batches per block.
+        num_blocks : int, optional
+            Number of blocks per subject.
 
         Returns
         -------
-        runs : list of dict
+        blocks : list of dict
         """
-        
-        assert adapt_size == val_size, "Currently only equal adapt/val sizes are supported"
-        
-        if split_blocks < 1:
-            raise ValueError("split_blocks must be >= 1")
-
-        if adapt_size % split_blocks != 0:
-            raise ValueError(f"adapt_size ({adapt_size}) must be divisible by split_blocks ({split_blocks})")
-
-        if val_size % split_blocks != 0:
-            raise ValueError(f"val_size ({val_size}) must be divisible by split_blocks ({split_blocks})")
-
         
         # Get samples of a subject
         index_list = list(self.index_by_subject_id[subject_id])
 
-        # Collect valid run indices
-        runs = self.find_consecutive_runs(index_list, window_length)
-        subject_runs = []
+        # Collect valid block indices
+        blocks = self.find_consecutive_blocks(index_list, window_length)
+        
+        # Skip blocks shorter than required minimum (should not happen as get_subject_blocks should be called after the initial filtering of subjects)
+        if len(blocks) < num_blocks:
+            raise ValueError(f"Subject {subject_id} has only {len(blocks)} valid blocks, but {num_blocks} are required.")
+        
+        for block_idx, block in enumerate(blocks):
+            # b['sample_ids'] is already chronologically ordered
+            block_samples = block['sample_ids']
+            block_len = len(block_samples)
 
-        for r_idx, r in enumerate(runs):
-            # r['sample_ids'] is already chronologically ordered
-            run_samples = r['sample_ids']
-            run_len = len(run_samples)
+            # Skip blocks shorter than required minimum (should not happen as get_subject_blocks should be called after the initial filtering of subjects)
+            if block_len < (num_batches * batch_size):
+                raise ValueError(f"Block length {block_len} is shorter than minimum required {num_batches * batch_size}")
 
-            # Skip runs shorter than required minimum (should not happen as get_subject_runs should be called after the initial filtering of subjects)
-            if run_len < block_length:
-                raise ValueError(f"Run length {run_len} is shorter than minimum required {block_length}")
+            # No worries on the //, see filter_subjects_by_min_block_length where blocks are already trimmed to the required length
+            n_batches = block_len // batch_size 
 
-            # Segment into interleaved adaptation/testing blocks
-            block_size = adapt_size + val_size
-            n_blocks = run_len // block_size
+            for batch_idx in range(n_batches):
+                start = batch_idx * batch_size
+                end = start + batch_size
 
-            adapt_sub = adapt_size // split_blocks
-            val_sub = val_size // split_blocks
+                batch = block_samples[start:end]
 
-            for b in range(n_blocks):
-                block_start = b * block_size
-                block_samples = run_samples[block_start : block_start + block_size]
+                if len(batch) < batch_size:
+                    raise ValueError(f"Batch {batch_idx} (len {len(batch)}) is shorter than minimum required {batch_size}")
 
-                cursor = 0
-                for s in range(split_blocks):
-                    train_segment = block_samples[cursor : cursor + adapt_sub]
-                    cursor += adapt_sub
-
-                    test_segment = block_samples[cursor : cursor + val_sub]
-                    cursor += val_sub
-
-                    if len(train_segment) == adapt_sub and len(test_segment) == val_sub:
-                        subject_runs.append({
-                            "r_idx": r_idx,
-                            "b_idx": b,
-                            "s_idx": s, 
-                            "train": train_segment,
-                            "test": test_segment,
-                            "all": train_segment + test_segment
-                        })
-                    
-        return subject_runs
+                yield {
+                    "subject_id": subject_id,
+                    "block_idx": block_idx,
+                    "batch_idx": batch_idx,
+                    "sample_ids": batch
+                }
+    
+    def __del__(self):
+        """
+        Magic method called when the object is destroyed.
+        Explicitly close the LMDB environment and transaction.
+        """
+        # Check if attributes exist to avoid errors during partial initialization
+        if hasattr(self, 'lmdbtxn'):
+            self.lmdbtxn = None 
+        if hasattr(self, 'lmdbenv') and self.lmdbenv is not None:
+            self.lmdbenv.close()
+            self.lmdbenv = None
 
 
 def pareto_frontier(df):
@@ -503,11 +495,9 @@ def parseargs():
     parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=False, help='plot dataset overview or not (# subjects per pretraining/personalization steps, # samples in pretraining splits)')
     parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
     parser.add_argument('--save_run', action=argparse.BooleanOptionalAction, default=False, help='whether to save a specific subject run to a pickle dict or not')
-    parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size')
-    parser.add_argument('--validation_batch_size', default=16, type=int, help='batch size for personalization')
-    parser.add_argument('--num_train_val', default=2, type=int, help='number of training and validation phases per block')
-    parser.add_argument('--valid_runs_number', default=2, type=int, help='valid runs number')
-    parser.add_argument('--split_blocks', default=1, type=int, help='number of train/test sub part of a block')
+    parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size during personalization (number of windows in a batch)')
+    parser.add_argument('--num_batches', default=2, type=int, help='required number of batches with timestamp-contiguous windows')
+    parser.add_argument('--num_blocks', default=2, type=int, help='required number of blocks with timestamp-contiguous windows per subject')
     parser.add_argument('--loader_worker', default=4, type=int, help='number of loader workers')
 
     args = parser.parse_args()
@@ -521,8 +511,6 @@ if __name__ == "__main__":
     root_figs_folder = os.path.join(args.save_path, args.name)
     if not os.path.exists(root_figs_folder):
         os.makedirs(root_figs_folder)
-        
-    block_length = args.num_train_val * (args.personalization_batch_size + args.validation_batch_size)
     
     # Instantiate OnlinePhysioDataset (the base for continual learning)
     online_physio_dataset = OnlineSubjectDataset(
@@ -532,8 +520,9 @@ if __name__ == "__main__":
         input_seq_len_s=args.input_seq_len_s,
         ecg=args.ecg,
         savepath=root_figs_folder,
-        block_length=block_length,
-        valid_runs_number=args.valid_runs_number
+        batch_size=args.personalization_batch_size,
+        num_batches=args.num_batches,
+        num_blocks=args.num_blocks
     )
     
     # Notice that at this point subjects with insufficient runs have been removed
@@ -542,64 +531,63 @@ if __name__ == "__main__":
     
     if args.save_run:
         import pickle
-        runs = online_physio_dataset.get_subject_runs(
+        blocks = online_physio_dataset.get_subject_blocks(
             subject_id, 
             window_length=args.input_seq_len_s, 
-            adapt_size=args.personalization_batch_size, 
-            val_size=args.validation_batch_size, 
-            block_length=block_length,
-            split_blocks=args.split_blocks
-            )
+            batch_size=args.personalization_batch_size,
+            num_batches=args.num_batches,
+            num_blocks=args.num_blocks
+        )
     
         # Save the list of dictionaries, namely runs
-        with open(f"../notebooks/data/{subject_id}_runs.pkl", "wb") as f:
-            pickle.dump(runs, f)
+        with open(f"../notebooks/data/{subject_id}_blocks.pkl", "wb") as f:
+            pickle.dump(blocks, f)
             
-        print(f"Saved {subject_id} runs to ../notebooks/data/{subject_id}_runs.pkl, exiting")
+        print(f"Saved {subject_id} runs to ../notebooks/data/{subject_id}_blocks.pkl, exiting")
         exit()
 
     # Compute runs first
-    all_runs = []
+    all_blocks = []
     for subj in online_physio_dataset.subjects_for_personalization:
         index_list = list(online_physio_dataset.index_by_subject_id[subj])
-        runs = online_physio_dataset.find_consecutive_runs(index_list, args.input_seq_len_s)
-        all_runs.append(runs)
+        blocks = online_physio_dataset.find_consecutive_blocks(index_list, args.input_seq_len_s)
+        all_blocks.append(blocks)
 
     # Plot distribution across all subjects
-    plot_consecutive_runs_all(all_runs, savepath=os.path.join(root_figs_folder, 'all_subjects_run_lengths.jpg' if block_length == 0 else f'all_subjects_run_lengths_{block_length}.jpg'))
+    plot_consecutive_block_all(all_blocks, savepath=os.path.join(root_figs_folder, f'all_subjects_block_lengths_{args.personalization_batch_size}_{args.num_batches}_{args.num_blocks}.jpg'))
 
     # Plot the Annotation statistics for the runs
-    runs = online_physio_dataset.get_subject_runs(
+    blocks = online_physio_dataset.get_subject_blocks(
         subject_id, 
         window_length=args.input_seq_len_s, 
-        adapt_size=args.personalization_batch_size, 
-        val_size=args.validation_batch_size, 
-        block_length=block_length,
-        split_blocks=args.split_blocks
+        batch_size=args.personalization_batch_size,
+        num_batches=args.num_batches,
+        num_blocks=args.num_blocks
     )
     
-    plot_subject_annotation_runs(online_physio_dataset, subject_id, runs, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_runs.png"), show_bp_plot=args.plot)
+    plot_subject_annotation_blocks(online_physio_dataset, subject_id, blocks, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=args.plot)
     
     # Plot run length statistics across subjects
-    plot_run_length_statistics(online_physio_dataset, savepath=root_figs_folder, keep_longest=False)
+    plot_block_length_statistics(online_physio_dataset, savepath=root_figs_folder, keep_longest=False)
+    
+    # Trigger __del__
+    del online_physio_dataset
     
     # Choose a suitable value for the number of runs and number of train/val per run so that the number of aptietns is maximized
     # -> find the pareto-frontier
-    A_values = range(1, 14)      # valid_runs_number (abrupt shifts)
-    B_values = range(1, 11)      # num_train_val (consecutive windows)
+    A_values = range(1, 25)      # num blocks (abrupt shifts)
+    B_values = range(1, 21)      # num batches (consecutive batches)
 
     results = []
     
     for A in A_values:
         for B in B_values:
 
-            args.valid_runs_number = A
-            args.num_train_val = B
+            args.num_blocks = A
+            args.num_batches = B
 
-            block_length = args.num_train_val * (
-                args.personalization_batch_size + args.validation_batch_size
-            )
-
+            block_length = args.num_batches * args.personalization_batch_size
+            
             online_physio_dataset = OnlineSubjectDataset(
                 seed=args.seed,
                 lmdb_folder=os.path.join(args.dataset_folder, args.name),
@@ -607,8 +595,9 @@ if __name__ == "__main__":
                 input_seq_len_s=args.input_seq_len_s,
                 ecg=args.ecg,
                 savepath=root_figs_folder,
-                block_length=block_length,
-                valid_runs_number=args.valid_runs_number
+                batch_size=args.personalization_batch_size,
+                num_batches=args.num_batches,
+                num_blocks=args.num_blocks
             )
 
             N = len(online_physio_dataset.subjects_for_personalization)
@@ -618,6 +607,9 @@ if __name__ == "__main__":
                 "B": B,
                 "N_patients": N
             })
+            
+            # Trigger __del__
+            del online_physio_dataset
 
     
     # Cvt ot dataframe
@@ -663,14 +655,14 @@ if __name__ == "__main__":
         gradual_shift_stressed,
         savepath=os.path.join(
             root_figs_folder,
-            "pareto_frontier_valid_runs_vs_train_val_blocks.png"
+            "pareto_frontier_num_blocks_vs_num_batches.png"
         )
     )
     
     print("[Pareto] Selected configurations with at least 85 patients:")
-    print("Balanced A/B:")
+    print("Mixed-Shifts Set:")
     print(selected)
-    print("Abrupt-shift-stressed:")
+    print("Abrupt-Shifts Set:")
     print(abrupt_shift_stressed)
-    print("Gradual-shift-stressed:")
+    print("Gradual-Shifts Set:")
     print(gradual_shift_stressed)

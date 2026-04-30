@@ -381,7 +381,7 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
 
 def compute_transfer_metrics_from_matrix(errors_matrix):
     r"""
-    Compute continual learning metrics (AA, BWT) for error-based metrics (lower = better).
+    Compute continual learning metrics (AE, BWT) for error-based metrics (lower = better).
 
     Parameters
     ----------
@@ -390,12 +390,13 @@ def compute_transfer_metrics_from_matrix(errors_matrix):
 
     Returns
     -------
-    dict : {'AA': float, 'BWT': float}
+    dict : {'AE': float, 'BWT': float}
     """
     T = errors_matrix.shape[0]
+    
     # Average final MAE (lower = better)
     final_row = errors_matrix[T - 1, :]
-    AA = float(np.nanmean(final_row))
+    AE = float(np.nanmean(final_row))
 
     # Backward Transfer (ΔMAE): positive = forgetting, negative = improvement
     diag = np.array([errors_matrix[i, i] for i in range(T)])
@@ -406,5 +407,5 @@ def compute_transfer_metrics_from_matrix(errors_matrix):
         if not np.isnan(final_err) and not np.isnan(init_err):
             bwt_vals.append(final_err - init_err)
     BWT = float(np.mean(bwt_vals)) if len(bwt_vals) > 0 else None
-
-    return {"AA": AA, "BWT": BWT}
+    
+    return {"AE": AE, "BWT": BWT}

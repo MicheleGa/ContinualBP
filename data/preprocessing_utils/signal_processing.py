@@ -1,11 +1,16 @@
 import os
 import numpy as np
-from scipy.signal import butter, cheby2, sosfiltfilt, filtfilt, correlate, welch, resample
+import neurokit2 as nk
+from scipy.signal import (
+    resample, resample_poly, ellipord, ellip, filtfilt, 
+    cheby1, butter, remez, welch, find_peaks,
+    cheby2, sosfiltfilt, correlate
+)
+from scipy.stats import skew
 from scipy.interpolate import PchipInterpolator
 import matplotlib.pyplot as plt
 import pywt
 from PyEMD import EEMD
-from pyampd.ampd import find_peaks
 
 
 def emd_decompose(signal, num_imfs=4, trials=50):
@@ -1230,3 +1235,519 @@ def harmonic_filtering(signal, fs=125, order=2, plot=False, title='Harmonic', sa
         plt.close()
 
     return filtered_signal
+
+
+def ppg_lowpass_equiripple(ppg, fs):
+
+    nyq = fs / 2
+
+    # Slightly relaxed transition band
+    bands = [0, 10, 13, nyq]
+    desired = [1, 0]
+
+    ripple_db = 1
+    atten_db = 60
+
+    delta_p = (10**(ripple_db/20) - 1) / (10**(ripple_db/20) + 1)
+    delta_s = 10**(-atten_db/20)
+
+    weights = [1/delta_p, 1/delta_s]
+
+    # Safe fixed order (prevents instability)
+    N = 201
+
+    taps = remez(N, bands, desired, weight=weights, fs=fs)
+
+    return filtfilt(taps, [1], ppg)
+
+def filter_ppg(ppg, fs):
+
+    # 1. High-pass Butterworth
+    b, a = butter(4, 0.25/(fs/2), btype='high')
+    ppg = filtfilt(b, a, ppg)
+
+    # 2. Equiripple LP (correct)
+    ppg = ppg_lowpass_equiripple(ppg, fs)
+
+    return ppg
+
+
+def ecg_lowpass_elliptic(ecg, fs):
+    wp = 40 / (fs / 2)
+    ws = 45 / (fs / 2)
+
+    rp = 0.1   # passband ripple (dB)
+    rs = 40    # must choose (paper doesn't specify)
+
+    N, Wn = ellipord(wp, ws, rp, rs)
+    b, a = ellip(N, rp, rs, Wn, btype='low')
+
+    return filtfilt(b, a, ecg)
+
+
+def ecg_notch_cheby1(ecg, fs):
+    f0 = 60
+    Q = 3
+
+    bw = f0 / Q
+    low = (f0 - bw/2) / (fs / 2)
+    high = (f0 + bw/2) / (fs / 2)
+
+    rp = 0.1  # passband ripple
+
+    b, a = cheby1(
+        N=6,
+        rp=rp,
+        Wn=[low, high],
+        btype='bandstop'
+    )
+
+    return filtfilt(b, a, ecg)
+
+
+def filter_ecg(ecg, fs):
+
+    # 1. DC block
+    b, a = butter(2, 0.1/(fs/2), btype='high')
+    ecg = filtfilt(b, a, ecg)
+
+    # 2. Elliptic LP (correct)
+    ecg = ecg_lowpass_elliptic(ecg, fs)
+
+    # 3. Chebyshev notch (correct)
+    ecg = ecg_notch_cheby1(ecg, fs)
+
+    return ecg
+
+def quantile_normalization(X, q=0.95, eps=1e-8):
+    """
+    Robust per-window normalization using quantile scaling.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Signal (1D or batched with last dim = time)
+    q : float
+        Quantile for scaling (default 0.95)
+    eps : float
+        Small constant to avoid division by zero
+
+    Returns
+    -------
+    X_norm : np.ndarray
+        Normalized signal
+    """
+    scale = np.quantile(
+        np.abs(X),
+        q=q,
+        axis=-1,
+        keepdims=True
+    )
+    return X / (scale + eps)
+
+
+def resample_signals(timestamp, ecg, ppg, orig_fs=500, target_fs=125):
+    """
+    Resample timestamp, ECG, and PPG from orig_fs to target_fs.
+    """
+    # Calculate up/down factors
+    up = target_fs
+    down = orig_fs
+
+    # Resample signals
+    ecg_resampled = resample_poly(ecg, up, down)
+    ppg_resampled = resample_poly(ppg, up, down)
+
+    # Recreate timestamp based on new sampling rate
+    duration = timestamp[-1] - timestamp[0]
+    n_samples = len(ecg_resampled)
+    new_timestamp = np.linspace(timestamp[0], timestamp[0] + duration, n_samples)
+
+    return new_timestamp, ecg_resampled, ppg_resampled
+
+
+def extract_central_window(timestamp, ecg, ppg, fs=125, window_sec=10):
+    """
+    Extract central contiguous window of fixed duration.
+    """
+    target_len = fs * window_sec
+    signal_len = len(ecg)
+
+    if signal_len < target_len:
+        raise ValueError("Signal shorter than required window")
+
+    center = signal_len // 2
+    half_window = target_len // 2
+
+    start = center - half_window
+    end = start + target_len
+
+    return (
+        timestamp[start:end],
+        ecg[start:end],
+        ppg[start:end]
+    )
+
+
+def detect_ecg_rpeaks(ecg, fs):
+    """
+    Robust R-peak detection using slope-enhanced signal.
+    """
+
+    # 1. Differentiate (emphasize slopes)
+    diff = np.diff(ecg, prepend=ecg[0])
+
+    # 2. Square (emphasize large changes)
+    squared = diff ** 2
+
+    # 3. Moving average (smooth)
+    window = int(0.08 * fs)  # ~80 ms
+    kernel = np.ones(window) / window
+    integrated = np.convolve(squared, kernel, mode='same')
+
+    # 4. Peak detection on processed signal
+    min_distance = int(0.3 * fs)
+
+    peaks, _ = find_peaks(
+        integrated,
+        distance=min_distance,
+        prominence=np.std(integrated)
+    )
+
+    # 5. Map back to original ECG (local max)
+    rpeaks = []
+    search_window = int(0.1 * fs)
+
+    for p in peaks:
+        start = max(0, p - search_window)
+        end = min(len(ecg), p + search_window)
+        rpeaks.append(start + np.argmax(ecg[start:end]))
+
+    return np.array(rpeaks)
+
+
+def detect_ppg_peaks(ppg, fs):
+    """
+    Detect PPG systolic peaks.
+    """
+
+    min_distance = int(0.4 * fs)  # HR ~150 bpm max
+
+    threshold = 0.3 * np.std(ppg)
+
+    peaks, properties = find_peaks(
+        ppg,
+        distance=min_distance,
+        prominence=threshold
+    )
+
+    return peaks
+
+
+def detect_ppg_onsets(ppg, peaks):
+    """
+    Detect PPG pulse onsets as minimum between consecutive peaks.
+    """
+
+    onsets = []
+
+    for i in range(len(peaks) - 1):
+
+        start = peaks[i]
+        stop = peaks[i + 1]
+
+        if stop <= start:
+            continue
+
+        segment = ppg[start:stop]
+
+        if len(segment) == 0:
+            continue
+
+        onset = start + np.argmin(segment)
+
+        onsets.append(onset)
+
+    return np.array(onsets)
+
+
+def compute_freq_features(signal, fs):
+
+    if len(signal) < fs * 2:
+        return {
+            "dom_freq": np.nan,
+            "spec_centroid": np.nan,
+            "spec_bandwidth": np.nan,
+            "power_05_5": np.nan
+        }
+
+    f, Pxx = welch(signal, fs=fs, nperseg=min(len(signal), fs*4))
+
+    if np.sum(Pxx) == 0:
+        return {
+            "dom_freq": np.nan,
+            "spec_centroid": np.nan,
+            "spec_bandwidth": np.nan,
+            "power_05_5": np.nan
+        }
+
+    # Dominant frequency
+    dom_freq = f[np.argmax(Pxx)]
+
+    # Spectral centroid
+    spec_centroid = np.sum(f * Pxx) / np.sum(Pxx)
+
+    # Spectral bandwidth
+    spec_bw = np.sqrt(np.sum(((f - spec_centroid) ** 2) * Pxx) / np.sum(Pxx))
+
+    # Power in physiological band
+    band_mask = (f >= 0.5) & (f <= 5)
+    band_power = np.trapz(Pxx[band_mask], f[band_mask])
+
+    return {
+        "dom_freq": dom_freq,
+        "spec_centroid": spec_centroid,
+        "spec_bandwidth": spec_bw,
+        "power_05_5": band_power
+    }
+        
+
+def extract_ecg_ppg_features(ecg, ppg, fs, plot=False, filename='ecg_ppg_fiducials', save_path='./'):
+    f"""
+    Extract ECG + PPG handcrafted features from NeuroKit outputs.
+
+    Parameters
+    ----------
+    ecg : np.array
+        Cleaned ECG signal
+    ppg : np.array
+        Cleaned PPG signal
+    fs : int
+        Sampling frequency
+    plot : bool,
+        Whether to plot ECG/PPG fiducials
+    filename : str,
+        Filename to save the plot of ECG/PPG fiducials
+    save_path : str,
+        Folder to save the plot of ECG/PPG fiducials
+        
+    Returns
+    -------
+    features_dict : dict
+        Dictionary of features
+    features_array : np.ndarray
+        Feature vector (same order as feature_names)
+    feature_names : list
+        Ordered feature names (save this once)
+    """
+
+    rpeaks = detect_ecg_rpeaks(ecg, fs)
+    ppg_peaks = detect_ppg_peaks(ppg, fs)
+    
+    # Detect PPG onsets
+    ppg_onsets = None
+    if len(ppg_peaks) > 1:
+        ppg_onsets = detect_ppg_onsets(ppg, ppg_peaks)
+    else:
+        raise ValueError("Insufficient number of peaks detected in the PPG signal.")
+        
+    if plot:
+        from preprocessing_utils.data_visualization import plot_ecg_ppg_fiducials
+        plot_ecg_ppg_fiducials(ecg, ppg, rpeaks, ppg_peaks, ppg_onsets, fs, filename=filename, save_path=save_path)
+
+    features = {}
+
+    # -------------------------------------------------
+    # Beat counts
+    # -------------------------------------------------
+
+    features["n_ecg_beats"] = len(rpeaks)
+    features["n_ppg_beats"] = len(ppg_peaks)
+    features["beat_ratio"] = len(ppg_peaks) / (len(rpeaks) + 1e-6)
+
+    # -------------------------------------------------
+    # ECG HR / RR
+    # -------------------------------------------------
+
+    if len(rpeaks) > 2:
+
+        rr = np.diff(rpeaks) / fs
+        hr = 60 / rr
+
+        features["hr_median"] = np.median(hr)
+        features["hr_std"] = np.std(hr)
+
+        features["rr_median"] = np.median(rr)
+        features["rr_std"] = np.std(rr)
+        features["rr_iqr"] = np.percentile(rr, 75) - np.percentile(rr, 25)
+
+        # Short-term HRV
+        diff_rr = np.diff(rr)
+
+        features["rmssd"] = np.sqrt(np.mean(diff_rr ** 2))
+        features["pnn20"] = np.mean(np.abs(diff_rr) > 0.02)
+
+    else:
+
+        features["hr_median"] = np.nan
+        features["hr_std"] = np.nan
+        features["rr_median"] = np.nan
+        features["rr_std"] = np.nan
+        features["rr_iqr"] = np.nan
+        features["rmssd"] = np.nan
+        features["pnn20"] = np.nan
+
+    # -------------------------------------------------
+    # PPG amplitude features
+    # -------------------------------------------------
+
+    amps = []
+    rise_times = []
+
+    if len(ppg_peaks) > 1 and len(ppg_onsets) > 1:
+
+        for onset in ppg_onsets:
+
+            peak_candidates = ppg_peaks[ppg_peaks > onset]
+
+            if len(peak_candidates) == 0:
+                continue
+
+            peak = peak_candidates[0]
+
+            amp = ppg[peak] - ppg[onset]
+            rise = (peak - onset) / fs
+
+            amps.append(amp)
+            rise_times.append(rise)
+
+    if len(amps) > 0:
+
+        amps = np.array(amps)
+        rise_times = np.array(rise_times)
+
+        features["ppg_amp_median"] = np.median(amps)
+        features["ppg_amp_iqr"] = np.percentile(amps, 75) - np.percentile(amps, 25)
+
+        features["ppg_rise_median"] = np.median(rise_times)
+        features["ppg_rise_std"] = np.std(rise_times)
+
+    else:
+
+        features["ppg_amp_median"] = np.nan
+        features["ppg_amp_iqr"] = np.nan
+        features["ppg_rise_median"] = np.nan
+        features["ppg_rise_std"] = np.nan
+    
+    if len(ppg_onsets) > 0:
+        pw = np.diff(ppg_onsets) / fs
+        features["pw_median"] = np.median(pw)
+        features["pw_std"] = np.std(pw)
+    else:
+        features["pw_median"] = np.nan
+        features["pw_std"] = np.nan
+
+    # -------------------------------------------------
+    # Pulse Transit Time (R -> PPG peak)
+    # -------------------------------------------------
+
+    ptt = []
+
+    if len(rpeaks) > 0 and len(ppg_peaks) > 0:
+
+        for r in rpeaks:
+
+            next_ppg = ppg_peaks[ppg_peaks > r]
+
+            if len(next_ppg) == 0:
+                continue
+
+            delay = (next_ppg[0] - r) / fs
+
+            if 0 < delay < 1:
+                ptt.append(delay)
+
+    if len(ptt) > 0:
+
+        ptt = np.array(ptt)
+
+        features["ptt_median"] = np.median(ptt)
+        features["ptt_std"] = np.std(ptt)
+
+    else:
+
+        features["ptt_median"] = np.nan
+        features["ptt_std"] = np.nan
+    
+    # ---------------------------------------------------------
+    # ECG / PPG cross-correlation (surrogate of vascular delay)
+    # ---------------------------------------------------------
+    corr = np.correlate(
+        (ecg - np.mean(ecg)),
+        (ppg - np.mean(ppg)),
+        mode="full"
+    )
+
+    lags = np.arange(-len(ecg)+1, len(ecg))
+    lag = lags[np.argmax(corr)] / fs
+
+    features["ecg_ppg_corr_lag"] = lag
+
+    # -------------------------------------------------
+    # Signal statistics
+    # -------------------------------------------------
+
+    features["ecg_var"] = np.var(ecg)
+    features["ppg_var"] = np.var(ppg)
+
+    features["ecg_mean"] = np.mean(ecg)
+    features["ppg_mean"] = np.mean(ppg)
+
+    features["ecg_skew"] = skew(ecg, bias=False)
+    features["ppg_skew"] = skew(ppg, bias=False)
+
+    # -------------------------------------------------
+    # NeuroKit HRV (time domain)
+    # -------------------------------------------------
+
+    try:
+
+        hrv = nk.hrv_time(rpeaks, sampling_rate=fs, show=False)
+
+        features["HRV_SDNN"] = float(hrv["HRV_SDNN"].iloc[0])
+        features["HRV_MeanNN"] = float(hrv["HRV_MeanNN"].iloc[0])
+
+    except:
+
+        features["HRV_SDNN"] = np.nan
+        features["HRV_MeanNN"] = np.nan
+        
+    # ECG frequency features
+    ecg_freq = compute_freq_features(ecg, fs)
+
+    features["ecg_dom_freq"] = ecg_freq["dom_freq"]
+    features["ecg_spec_centroid"] = ecg_freq["spec_centroid"]
+    features["ecg_spec_bw"] = ecg_freq["spec_bandwidth"]
+    features["ecg_power_05_5"] = ecg_freq["power_05_5"]
+
+    # PPG frequency features
+    ppg_freq = compute_freq_features(ppg, fs)
+
+    features["ppg_dom_freq"] = ppg_freq["dom_freq"]
+    features["ppg_spec_centroid"] = ppg_freq["spec_centroid"]
+    features["ppg_spec_bw"] = ppg_freq["spec_bandwidth"]
+    features["ppg_power_05_5"] = ppg_freq["power_05_5"]
+
+    # -------------------------------------------------
+    # Create stable ordering
+    # -------------------------------------------------
+
+    feature_names = list(features.keys())
+
+    feature_vector = np.array([features.get(k) for k in feature_names])
+    
+    #with open("./handcrafted_feats_defs.txt", 'w') as file:
+    #    for name in feature_names:
+    #        file.write(f'{name}\n')
+
+    return features, feature_vector, feature_names

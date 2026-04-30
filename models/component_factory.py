@@ -81,6 +81,88 @@ class SBPDriftDetector:
 
     def to_dataframe(self) -> pd.DataFrame:
         return pd.DataFrame(self.records)
+    
+
+class FeatureDriftDetector:
+
+    def __init__(
+        self,
+        stats_path,
+        threshold,
+        ema_alpha=1e-3,
+        shrinkage=1e-4,
+        device="cpu"
+    ):
+
+        stats = torch.load(stats_path, map_location=device)
+
+        self.mean = torch.tensor(stats["mean"], device=device)
+        self.cov = torch.tensor(stats["covariance"], device=device)
+
+        self.cov_inv = torch.tensor(stats["cov_inv"], device=device)
+
+        threshold_idx = str(threshold) if threshold < 1.0 else str(int(threshold))
+        self.thr = float(stats[f"threshold_{threshold_idx}"])
+
+        self.alpha = ema_alpha
+        self.shrinkage = shrinkage
+
+        self.device = device
+
+
+    def mahalanobis_batch(self, features):
+        
+        # L2 normalization (must match pretraining)
+        features = F.normalize(features, p=2, dim=1)
+
+        delta = features - self.mean
+
+        dist = torch.einsum(
+            "bi,ij,bj->b",
+            delta,
+            self.cov_inv,
+            delta
+        )
+
+        return dist
+
+
+    def score(self, features):
+
+        d = self.mahalanobis_batch(features)
+
+        return torch.quantile(d, 0.95).item() # More reobust to outliers
+
+
+    def update_stats(self, features):
+
+        # L2 normalization (must match pretraining)
+        features = torch.nn.functional.normalize(features, p=2, dim=1)
+        
+        mu_b = torch.mean(features, dim=0)
+
+        cov_b = torch.cov(features.T)
+
+        # EMA update
+        self.mean = (1 - self.alpha) * self.mean + self.alpha * mu_b
+
+        self.cov = (1 - self.alpha) * self.cov + self.alpha * cov_b
+
+        # shrinkage regularization
+        D = self.cov.shape[0]
+        self.cov += self.shrinkage * torch.eye(D, device=self.device)
+
+        # recompute inverse
+        self.cov_inv = torch.linalg.pinv(self.cov)
+
+
+    def update(self, features):
+
+        score = self.score(features)
+
+        drift = score > self.thr
+
+        return score, drift
 
 
 # ==============
@@ -186,3 +268,100 @@ class BPRegressor(nn.Module):
         if x.dim() != 2:
             raise ValueError(f"BPRegressor expected input dims 2 [btach dimension, feature dimension], got {list(x.shape)}")
         return self.regressor(x)
+    
+
+# ==============================
+# Shallow ML Heads for Regressor
+# ==============================
+class RidgeHead(nn.Module):
+    def __init__(self, in_dim, out_dim, alpha=1.0, fit_intercept=True, normalize=True):
+        """
+        Drop-in ridge regression head.
+
+        Args:
+            in_dim (int): feature dimension
+            out_dim (int): output dimension (e.g. 2 for SBP/DBP)
+            alpha (float): ridge regularization strength
+            fit_intercept (bool): whether to use bias term
+            normalize (bool): whether to normalize features
+        """
+        super().__init__()
+
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.alpha = alpha
+        self.fit_intercept = fit_intercept
+        self.normalize = normalize
+
+        self.register_buffer("W", None)        # [D(+1), O]
+        self.register_buffer("mean", None)
+        self.register_buffer("std", None)
+
+    def _add_bias(self, X):
+        if not self.fit_intercept:
+            return X
+        ones = torch.ones(X.shape[0], 1, device=X.device)
+        return torch.cat([X, ones], dim=1)
+
+    def _normalize(self, X):
+        if not self.normalize:
+            return X
+
+        if self.mean is None:
+            self.mean = X.mean(dim=0, keepdim=True)
+            self.std = X.std(dim=0, keepdim=True) + 1e-6
+
+        return (X - self.mean) / self.std
+
+    def fit(self, X, Y, alpha=None):
+        """
+        Fit ridge regression in closed form.
+
+        X: [N, D]
+        Y: [N, O]
+        """
+        if alpha is None:
+            alpha = self.alpha
+        alpha = max(alpha, 1e-6)
+
+        # Normalize
+        X = self._normalize(X)
+
+        # Add bias
+        X = self._add_bias(X)
+
+        D = X.shape[1]
+
+        sqrt_alpha = torch.sqrt(torch.tensor(alpha, device=X.device))
+
+        X_aug = torch.cat([
+            X,
+            sqrt_alpha * torch.eye(D, device=X.device)
+        ], dim=0)
+
+        Y_aug = torch.cat([
+            Y,
+            torch.zeros(D, Y.shape[1], device=Y.device)
+        ], dim=0)
+
+        self.W = torch.linalg.lstsq(X_aug, Y_aug).solution
+
+    def forward(self, X):
+        """
+        Predict outputs.
+
+        X: [N, D]
+        """
+        if self.W is None:
+            raise RuntimeError("RidgeHead must be fitted before calling forward().")
+
+        X = self._normalize(X)
+        X = self._add_bias(X)
+
+        return X @ self.W
+
+    def reset(self):
+        """Reset model (useful per subject or per block)."""
+        self.W = None
+        self.mean = None
+        self.std = None

@@ -61,24 +61,24 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
         ecg=config['ecg'],
         min_subject_sample_number=config['min_subject_sample_number']
     )
-        
+    
     (pre_train_sampler, _, pre_val_sampler, pre_test_sampler) = pretrain_ds.get_pretraining_samplers()
     
     pre_train_dataloader = DataLoader(pretrain_ds, sampler=pre_train_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)    
     pre_valid_dataloader = DataLoader(pretrain_ds, sampler=pre_val_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     pre_test_dataloader = DataLoader(pretrain_ds, sampler=pre_test_sampler, batch_size=config['batch_size'], num_workers=config['loader_worker'], pin_memory=True)
     
-    print(f"[Pretraining][Stage 1] Dataset initialized ✅")
+    print(f"[Pretraining][Stage 1] Dataset initialized ✓")
     
     # Initialize encoder
     encoder = get_encoder_architecture(config)
     encoder = encoder.to(device)
-    print(f"[Pretraining][Stage 1] Encoder weights initialized ✅")
+    print(f"[Pretraining][Stage 1] Encoder weights initialized ✓")
     
     # Initialize prediction head
     prediction_head = get_prediction_head_architecture(config)
     prediction_head = prediction_head.to(device)
-    print(f"[Pretraining][Stage 1] Prediction head weights initialized ✅")
+    print(f"[Pretraining][Stage 1] Prediction head weights initialized ✓")
     
     # Pretraining config
     stage1_epochs = config.get('stage1_epochs')
@@ -172,7 +172,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
         print(f"[Pretraining][Stage 1] Epoch {epoch+1}/{stage1_epochs} - Train {train_losses.avg:.5f} Val {val_losses.avg:.5f}")
             
         if val_losses.avg < best_val:
-            print(f"[Pretraining][Stage 1] New best validation loss ✅: {val_losses.avg:.5f}")
+            print(f"[Pretraining][Stage 1] New best validation loss ✓: {val_losses.avg:.5f}")
             save_status(
                 subject_id=None, epoch=epoch, model_name=model_name + "_encoder", 
                 save_name=save_name, model=encoder, optimizer=optimizer_stage1, scheduler=scheduler_stage1, 
@@ -186,7 +186,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
             
             best_val = val_losses.avg
     
-    print(f"[Pretraining][Stage 1] Supervised stage training completed ✅")
+    print(f"[Pretraining][Stage 1] Supervised stage training completed ✓")
     print(f"\t- Best val loss {best_val}")
     print(f"[Pretraining][Stage 1] Supervised stage testing ...")
         
@@ -291,7 +291,7 @@ def pre_training(save_name, checkpoint_path, writer, model_name, config, device)
     # Log test metrics (optionally, plot them) and return loss for validation
     _ = call_metric(all_test_targets, all_test_outputs, config, figure_savepath=os.path.join(config['figure_path'], 'pretraining_supervised_stage'), plot=True)    
     
-    print(f"[Pretraining][Stage 1] Supervised stage testing completed ✅")
+    print(f"[Pretraining][Stage 1] Supervised stage testing completed ✓")
     print(f"[Pretraining][Stage 1] ==== Stage 1 end ====")
 
 
@@ -330,7 +330,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         checkpoint_path=checkpoint_path, config=config
     )
     encoder.eval()
-    print(f"[Pretraining][MAML] Stage-1 encoder weights initialized ✅")
+    print(f"[Pretraining][MAML] Stage-1 encoder weights initialized ✓")
     
     # Load best prediction head
     prediction_head = get_prediction_head_architecture(config)
@@ -340,7 +340,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
         checkpoint_path=checkpoint_path, config=config
     )
     prediction_head.eval()
-    print(f"[Pretraining][MAML] Stage-1 prediction head weights initialized ✅")
+    print(f"[Pretraining][MAML] Stage-1 prediction head weights initialized ✓")
     
     # Count trainable params
     model = Model(encoder, prediction_head)
@@ -564,27 +564,16 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
             best_model_path = os.path.join(checkpoint_path, f"{save_name}_best_maml")
             torch.save(save_ckpt, best_model_path)
             best_val = val_loss
-            print(f"[Pretraining][MAML] New best validation loss ✅: {val_loss:.5f}, saved to {best_model_path}")
+            print(f"[Pretraining][MAML] New best validation loss ✓: {val_loss:.5f}, saved to {best_model_path}")
     
     # After meta-training, run final test evaluation
-    print(f"[Pretraining][MAML] MAML training completed ✅")
+    print(f"[Pretraining][MAML] MAML training completed ✓")
     print(f"\t- Best val loss {best_val}")
     print(f"[Pretraining][MAML] MAML testing ...")
     
     # Load best model
     best_ckpt = torch.load(os.path.join(checkpoint_path, f"{save_name}_best_maml"), weights_only=False)
     model.load_state_dict(best_ckpt['learner_state_dict'])
-    
-    # Saving feature statistics for intiializing the drift detector during the personalization step
-    baseline_mean, baseline_std = compute_embedding_stats(model.encoder, train_dataloader, device)
-
-    # Save to file for personalization later on
-    stats_ckpt = {
-        'baseline_mean': baseline_mean,
-        'baseline_std': baseline_std,
-    }
-    np.savez(os.path.join(checkpoint_path, f"{save_name}_embedding_stats.npz"), **stats_ckpt)
-    print(f"[Pretraining][MAML] Embedding stats saved to {save_name}_embedding_stats.npz ✅")
     
     # ==== Test ====
     model = model.to(device)
@@ -604,7 +593,7 @@ def maml_meta_training(save_name, checkpoint_path, writer, model_name, config, d
     
     writer.close()
     
-    print(f"[Pretraining][Stage 1] MAML testing completed ✅")
+    print(f"[Pretraining][Stage 1] MAML testing completed ✓")
     print(f"[Pretraining][MAML] === MAML end ====")
     
     
