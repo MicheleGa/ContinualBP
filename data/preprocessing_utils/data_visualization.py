@@ -900,6 +900,109 @@ def plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath="subjec
     plt.close()
 
 
+def plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath="subject_annotation_plots.jpg", show_bp_plot=False):
+    """
+    Plot annotation statistics for a subject from the AuroraDB with fixed interleaved blocks.
+
+    Parameters
+    ----------
+    dataset : OnlineSubjectDataset
+        Dataset instance (must allow __getitem__ access to annotation tensors).
+    subject_id : int
+        Subject identifier.
+    blocks : list of dict
+        Each dict contains sample IDs
+    savepath : str
+        File path to save the figure.
+    show_bp_plot : bool, optional
+        If True, also plot SBP/DBP/MAP evolution. Default=False.
+    """
+    
+    # Activate subject
+    full_index_list = dataset.index_by_subject_id[subject_id]
+
+    # Helper: extract SBP/DBP/MAP
+    def get_annotations(sample_ids):
+        sbp_values, dbp_values, map_values = [], [], []
+        for sid in sample_ids:
+            _, ann, _ = dataset.__getitem__(sid)
+            sbp_values.append(float(ann[0]))
+            dbp_values.append(float(ann[1]))
+            map_values.append(float(ann[2]))
+        return sbp_values, dbp_values, map_values
+
+    # Collect block-level data
+    block_idxs_list, set_list = [], []
+    sbp_list, dbp_list, map_list, window_indices = [], [], [], []
+
+    for block in blocks:
+        
+        # Adaptation windows
+        train_sbp, train_dbp, train_map = get_annotations(block["sample_ids"])
+        adapt_window_indices = [full_index_list.index(sid) for sid in block["sample_ids"]]
+
+        block_idxs_list.extend([block["block_idx"]] * len(train_sbp))
+        set_list.extend(['batches'] * len(train_sbp))
+        sbp_list.extend(train_sbp)
+        dbp_list.extend(train_dbp)
+        map_list.extend(train_map)
+        window_indices.extend(adapt_window_indices)
+        
+    # Build DataFrame and sort chronologically
+    df = pd.DataFrame({
+        'window_index': window_indices,
+        'block_idx': block_idxs_list,
+        'set': set_list,
+        'sbp': sbp_list,
+        'dbp': dbp_list,
+        'map': map_list
+    }).sort_values(by='window_index').reset_index(drop=True)
+    
+    # Create the plot with three horizontal subplots
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(f'Subject {subject_id} - Annotation Statistics', fontsize=14, fontweight='bold')
+
+    # Subplot 1: Window indices vs Block structure
+    ax1 = axes[0]
+    
+    # Plot points for each run with different colors
+    unique_blocks = df['block_idx'].unique()
+    colors_blocks = plt.cm.tab10(np.linspace(0, 1, len(unique_blocks)))
+    
+    for i, block_idx in enumerate(unique_blocks):
+        block_data = df[df['block_idx'] == block_idx]
+        ax1.scatter(block_data['window_index'], block_data['block_idx'], 
+                   c=[colors_blocks[i]], label=f'Block {block_idx}', alpha=0.7, s=30)
+    
+    ax1.set_ylabel('Block Number')
+    ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.set_title('Window Index vs Block Number')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    # Subplot 2: Window indices vs SBP/DBP/MAP
+    ax2 = axes[1]
+    ax2.plot(df['window_index'], df['sbp'], 'o-', color='red', 
+             label='SBP', alpha=0.7, markersize=4, linewidth=1)
+    ax2.plot(df['window_index'], df['dbp'], 'o-', color='blue', 
+             label='DBP', alpha=0.7, markersize=4, linewidth=1)
+    ax2.plot(df['window_index'], df['map'], 'o-', color='green', 
+             label='MAP', alpha=0.7, markersize=4, linewidth=1)
+    
+    ax2.set_ylabel('Blood Pressure (mmHg)')
+    ax2.set_xlabel('Window Index')
+    ax2.set_title('Window Index vs Blood Pressure Values')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
+    
+    # Save the figure
+    plt.savefig(savepath)
+    plt.close()
+
+
 def plot_block_length_statistics(dataset, savepath='./data_figs', keep_longest=False):
     r"""
     Plot statistics of block lengths across subjects.
@@ -1523,7 +1626,7 @@ def plot_param_updates(df, subject_id, save_path):
     }
 
     # Sort by true chronological order
-    sort_cols = [c for c in ["batch_idx", "block_idx", "step_idx"] if c in df.columns]
+    sort_cols = [c for c in ["step_idx"] if c in df.columns]
     df = df.sort_values(sort_cols)
 
     x = df["step_idx"].values
@@ -1651,6 +1754,82 @@ def plot_pareto_frontier(
     plt.tight_layout()
     plt.savefig(savepath, dpi=300)
     plt.close()
+
+
+def plot_pareto_frontier_aurora(
+    df,
+    pareto_df,
+    shift_stressed,
+    savepath,
+    min_patients=85
+):
+    r"""
+    Visualizes the multi-objective optimization trade-off between subject 
+    inclusion and data quality constraints.
+
+    This scatter plot highlights configurations that are "non-dominated"—meaning 
+    you cannot improve one metric without degrading another. It specifically 
+    marks configurations used for different experimental settings (Mixed, 
+    Abrupt, and Gradual shifts) against the backdrop of all possible parameter 
+    combinations.
+
+    Parameters
+    ------------
+    df (pd.DataFrame): 
+        The full search space of all possible subject-inclusion configurations.
+    pareto_df (pd.DataFrame): 
+        The subset of configurations that lie on the Pareto frontier.
+    selected (pd.Series/dict): 
+        The specific configuration chosen for the 'Mixed-Shifts' experimental set.
+    shift_stressed (pd.Series/dict): 
+        The configuration chosen for the 'Abrupt-Shifts' (High volatility) set.
+    calibration_stressed (pd.Series/dict): 
+        The configuration chosen for the 'Gradual-Shifts' (Long-term stability) set.
+    savepath (str): 
+        The destination path where the plot image will be saved.
+    min_patients (int, optional): 
+        The threshold for feasibility (default=85). Only Pareto points meeting 
+        this count are highlighted in red.
+    """
+    plt.figure(figsize=(10, 8))
+
+    pareto_feasible = pareto_df[pareto_df["N_patients"] >= min_patients]
+
+    # Background: all configurations
+    plt.scatter(
+        df["A"], df["B"],
+        color="lightgray", alpha=0.4,
+        label="All configurations"
+    )
+
+    # Feasible Pareto points
+    plt.scatter(
+        pareto_feasible["A"], pareto_feasible["B"],
+        s=120, color="red",
+        label="≥ 85 patients"
+    )
+
+    # Abrupt-Shifts configuration
+    plt.scatter(
+        shift_stressed["A"], shift_stressed["B"],
+        s=220, marker="^",
+        color="green",
+        label="Abrupt-Shifts Set"
+    )
+
+    x_min, x_max = int(df["A"].min()), int(df["A"].max())
+    y_min, y_max = int(df["B"].min()), int(df["B"].max())
+    
+    plt.xticks(np.arange(x_min, x_max + 1, 1), fontsize=12)
+    plt.yticks(np.arange(y_min, y_max + 1, 1), fontsize=12)
+
+    plt.xlabel("Minimum abrupt shifts per subject", fontsize=14)
+    plt.ylabel("Minimum consecutive blocks per subject", fontsize=14)
+    plt.title("Pareto frontier under AAMI/BHS constraint", fontsize=16)
+    plt.legend(frameon=False, fontsize=12)
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=300)
+    plt.close()
     
 
 def plot_ecg_ppg_fiducials(ecg, ppg, rpeaks, ppg_peaks, ppg_onsets, fs, filename, save_path):
@@ -1709,3 +1888,111 @@ def plot_ecg_ppg_fiducials(ecg, ppg, rpeaks, ppg_peaks, ppg_onsets, fs, filename
     plt.tight_layout()
     plt.savefig(os.path.join(save_path, f"{filename}.png"), dpi=300)
     plt.close()
+
+
+
+def plot_drift_calibration_summary(
+    targets_log,
+    predictions_log,
+    detection_timesteps,
+    calibration_phase_size,
+    batch_size,
+    ert,
+    window_size,
+    sbp_ae,
+    dbp_ae,
+    sbp_bwt,
+    dbp_bwt,
+    save_path,
+):    
+    # Build flat (window_idx, SBP, DBP) arrays from targets_log/predictions_log
+    # targets_log/predictions_log entries each cover one step_idx and carry batch_size values.
+    window_indices, sbp_vals, dbp_vals = [], [], []
+    for entry in sorted(targets_log, key=lambda e: e["step_idx"]):
+        base = entry["step_idx"] * batch_size
+        for j, (s, d) in enumerate(zip(entry["sbp_values"], entry["dbp_values"])):
+            window_indices.append(base + j)
+            sbp_vals.append(s)
+            dbp_vals.append(d)
+    
+    p_window_indices, p_sbp_vals, p_dbp_vals = [], [], []
+    for entry in sorted(predictions_log, key=lambda e: e["step_idx"]):
+        base = entry["step_idx"] * batch_size
+        for j, (s, d) in enumerate(zip(entry["sbp_values"], entry["dbp_values"])):
+            p_window_indices.append(base + j)
+            p_sbp_vals.append(s)
+            p_dbp_vals.append(d)
+ 
+    window_indices = np.array(window_indices, dtype=float)
+    sbp_vals = np.array(sbp_vals, dtype=float)
+    dbp_vals = np.array(dbp_vals, dtype=float)
+    
+    p_window_indices = np.array(p_window_indices, dtype=float)
+    p_sbp_vals = np.array(p_sbp_vals, dtype=float)
+    p_dbp_vals = np.array(p_dbp_vals, dtype=float)
+ 
+    # Boundaries (in window-index units)
+    calib_end     = calibration_phase_size * batch_size   # first TTA window
+    total_windows = int(window_indices.max()) + 1 if len(window_indices) else calib_end
+ 
+    # Figure
+    fig, ax = plt.subplots(figsize=(15, 7))
+ 
+    # Phase backgrounds
+    ax.axvspan(-0.5, calib_end - 0.5, color="#AED6F1", alpha=0.40, zorder=0)
+    ax.axvspan(calib_end - 0.5, total_windows, color="#A9DFBF", alpha=0.30, zorder=0)
+ 
+    # BP target traces (Circles)
+    ax.plot(window_indices, sbp_vals,
+            color="#C0392B", linewidth=0.9, marker="o", markersize=3,
+            label="SBP target", zorder=3)
+    ax.plot(window_indices, dbp_vals,
+            color="#2471A3", linewidth=0.9, marker="o", markersize=3,
+            label="DBP target", zorder=3)
+
+    # BP Predictions (Squares)
+    ax.plot(p_window_indices, p_sbp_vals,
+            color="#C0392B", linewidth=0.7, linestyle="--", marker="s", markersize=3,
+            alpha=0.7, label="SBP predicted", zorder=3)
+    ax.plot(p_window_indices, p_dbp_vals,
+            color="#2471A3", linewidth=0.7, linestyle="--", marker="s", markersize=3,
+            alpha=0.7, label="DBP predicted", zorder=3)
+ 
+    # Drift-detection vertical lines
+    for k, t in enumerate(detection_timesteps):
+        if k == 0:
+            ax.axvline(x=t, color="#E67E22", linewidth=1.8, linestyle="--",
+                       zorder=4, label="First detection")
+        else:
+            ax.axvline(x=t, color="#8E44AD", linewidth=1.0, linestyle=":",
+                       alpha=0.75, zorder=4,
+                       label="Detection" if k == 1 else "_nolegend_")
+ 
+    # Axis labels
+    ax.set_xlabel("Window index", fontsize=10)
+    ax.set_ylabel("Blood pressure (mmHg)", fontsize=10)
+ 
+    # Custom legend patches for background phases
+    calib_patch = Patch(color="#AED6F1", alpha=0.6, label="Calibration phase")
+    tta_patch = Patch(color="#A9DFBF", alpha=0.5, label="TTA phase")
+ 
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(
+        handles + [calib_patch, tta_patch],
+        labels + ["Calibration phase", "TTA phase"],
+        loc="upper right", fontsize=7, ncol=4, framealpha=0.85,
+    )
+ 
+    # Title with metrics
+    fmt = lambda v: f"{v:.2f}" if v is not None and not np.isnan(v) else "N/A"
+    ax.set_title(
+        f"ERT={ert}  |  W={window_size}  ||  "
+        f"AE  SBP={fmt(sbp_ae)} mmHg  DBP={fmt(dbp_ae)} mmHg  ||  "
+        f"BWT  SBP={fmt(sbp_bwt)} mmHg  DBP={fmt(dbp_bwt)} mmHg  ",
+        fontsize=10, pad=7,
+    )
+ 
+    ax.grid(True, alpha=0.25, linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)

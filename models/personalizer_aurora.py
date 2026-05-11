@@ -17,10 +17,8 @@ from training_utils.helpers import get_encoder_architecture, get_prediction_head
 from training_utils.metrics import call_metric, compute_transfer_metrics_from_matrix
 from data.online_dataset import OnlineSubjectDataset
 from data.online_dataset_aurora import AuroraOnlineSubjectDataset
-from data.preprocessing_utils.data_visualization import (
-    plot_blockwise_mae, plot_subject_annotation_blocks, plot_aurora_subject_annotation_blocks, 
-    plot_update_summary_table, plot_param_updates, plot_drift_calibration_summary
-)
+from data.preprocessing_utils.data_visualization import plot_blockwise_mae, plot_subject_annotation_blocks, plot_update_summary_table, plot_param_updates, plot_drift_calibration_summary
+
 
 def eval_model_on_sample_set(encoder, prediction_head, dataset, sample_list, device, config):
     r"""
@@ -165,46 +163,16 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
             num_batches=config['num_batches'],
             num_blocks=config['num_blocks']
         )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+    
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -259,7 +227,12 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -283,6 +256,8 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -359,6 +334,8 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
         # Log updated parameters
         param_update_log.append({
             "step_idx": step_idx,
+            "block_idx": batch_info['block_idx'],
+            "batch_idx": batch_info['batch_idx'],
             "update_mode": config['inner_adapt'], # irrelevant for this baseline, maintained for consistency with other baselines
             "n_updated_params": 0,
             "total_params": total_params,
@@ -481,46 +458,16 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
             num_batches=config['num_batches'],
             num_blocks=config['num_blocks']
         )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+    
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -577,7 +524,12 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -601,6 +553,8 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -732,6 +686,8 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
         # Log updated parameters
         param_update_log.append({
             "step_idx": step_idx,
+            "block_idx": batch_info['block_idx'],
+            "batch_idx": batch_info['batch_idx'],
             "update_mode": config['inner_adapt'], # irrelevant for this baseline, maintained for consistency with other baselines
             "n_updated_params": 0 if step_idx > config['calibration_phase_size'] else n_updated_calibration,
             "total_params": total_params,
@@ -853,28 +809,8 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
@@ -882,17 +818,7 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
             num_blocks=config['num_blocks']
         )
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -942,14 +868,24 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
+    # Drift detector placeholders
+    drift_detector = None
     calibration_ids = []
+    n_steps = 0 # number of detector predictions after calibration
+    n_detections = 0
+    first_detection = None
+    detection_timesteps = []
     
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -973,6 +909,8 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -1062,6 +1000,34 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
                         "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
                     })
                 previous_steps += 1
+            
+            if config['setup_type'] == 'drift':
+                # Initialize drfit detector
+                # NOTE: only after calibration completion
+                reference_data = calibration_features.detach().clone()
+
+                if config['drift_detector_type'] == 'mmd':
+                    drift_detector = MMDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                elif config['drift_detector_type'] == 'lsdd':
+                    drift_detector = LSDDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                else:
+                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
+
+                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
              
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
@@ -1109,62 +1075,123 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
         with torch.no_grad():
             features = enc(signals) 
         
-        # ---------- Adaptation ----------
+        # ---------- Decide adaptation ----------
+        do_adapt = False
         
-        # Use features and targets for adaptation
-        train_features = features
-        train_targets = targets
-        
-        # Optimizer
-        opt = build_inner_optimizer(
-            adapted_encoder=enc, 
-            adapted_head=ph, 
-            base_lr=config['personalization_lr'], 
-            mode='head', # only head is updates during online TTA
-            opt_type=config['inner_opt'].lower(), 
-            config=config
-        )
-        
-        # Encoder params for logging
-        n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
-        total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+        if config['setup_type'] == 'drift':
+            # Detect data drifts with detector
+            for i in range(features.shape[0]):
+                # Add batch dimension before prediction
+                detection_report = drift_detector.predict(features[i].cpu().numpy())
+                drift_flag = detection_report["data"]["is_drift"]
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
-            
-        param_update_log.append({
-            "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
-            "n_updated_params": n_updated,
-            "total_params": total_params,
-            "fraction_updated": n_updated / total_params
-        })
-
-        # Loss Function
-        criterion = (
-            F.smooth_l1_loss
-            if config["criterion"] == "SmoothL1Loss"
-            else F.mse_loss
-        )
+                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
+                if drift_detector.t >= config['detector_window_size']:
+                    if drift_flag == 1:
+                        n_detections += 1
+                        if first_detection is None:
+                            first_detection = n_steps
+                            
+                        global_window_idx = step_idx * config['personalization_batch_size'] + i
+                        detection_timesteps.append(global_window_idx)
+                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
+                    n_steps += 1
         
-        # Training data/labels are already prepared for the current batch
-        for step in range(config["personalization_steps"]):
-            
-            # Train prediction head
-            ph.train()
-            
-            out = ph(train_features)
-            loss = criterion(out, train_targets)
-            
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        # If not drift setup: adapt by default (every block) for adaptive baselines
+        if config.get("setup_type") == "fixed":
+            do_adapt = True
+        elif config.get("setup_type") == "drift":
+            # Use detector for each adaptive baseline
+            if not do_adapt:
+                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+                if step_idx == config['calibration_phase_size']:
+                    # No parameters are updated exceet for the calibraiton ones
+                    n_updated = n_updated_calibration
 
-            train_loss = loss.item()
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": config['inner_adapt'],
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                elif step_idx > config['calibration_phase_size']:
+                    # No parameters are updated
+                    n_updated = 0
+
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": 'head',
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                else:
+                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+
+        if do_adapt:
+            # ---------- Adaptation ----------
             
-        # Set to eval mode after adaptation
-        ph.eval()
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
+            
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updates during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
+            
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+
+            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+            if step_idx == config['calibration_phase_size']:
+                n_updated += n_updated_calibration
+                
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
+
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # Training data/labels are already prepared for the current batch
+            for step in range(config["personalization_steps"]):
+                
+                # Train prediction head
+                ph.train()
+                
+                out = ph(train_features)
+                loss = criterion(out, train_targets)
+                
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                train_loss = loss.item()
+                
+            # Set to eval mode after adaptation
+            ph.eval()
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -1232,6 +1259,31 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
+    if config['setup_type'] == 'drift':    
+        
+        print(f"[Personalization] Total detections with drift-aware updates: {n_detections} out of {n_steps} steps with drift detection after calibration ✓")
+        # Calibration summary plot
+        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
+        
+        plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
+        plot_path  = os.path.join(baseline_path, plot_fname)
+    
+        plot_drift_calibration_summary(
+            targets_log=targets_log,
+            predictions_log=predictions_log,
+            detection_timesteps=detection_timesteps,
+            calibration_phase_size=config['calibration_phase_size'],
+            batch_size=config['personalization_batch_size'],
+            ert=config['detector_ert'],
+            window_size=config['detector_window_size'],
+            sbp_ae=sbp_ae,
+            dbp_ae=dbp_ae,
+            sbp_bwt=sbp_bwt,
+            dbp_bwt=dbp_bwt,
+            save_path=plot_path,
+        )
+
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
@@ -1282,47 +1334,17 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
             num_batches=config['num_batches'],
             num_blocks=config['num_blocks']
         )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+
     # Initialize encoder and prediction head (fresh weights)
     encoder_fresh = get_encoder_architecture(config)
     prediction_head_fresh = get_prediction_head_architecture(config)
@@ -1357,14 +1379,24 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
+    # Drift detector placeholders
+    drift_detector = None
     calibration_ids = []
+    n_steps = 0 # number of detector predictions after calibration
+    n_detections = 0
+    first_detection = None
+    detection_timesteps = []
     
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -1388,6 +1420,8 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -1454,6 +1488,34 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
                         "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
                     })
                 previous_steps += 1
+            
+            if config['setup_type'] == 'drift':
+                # Initialize drfit detector
+                # NOTE: only after calibration completion
+                reference_data = calibration_features.detach().clone()
+
+                if config['drift_detector_type'] == 'mmd':
+                    drift_detector = MMDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                elif config['drift_detector_type'] == 'lsdd':
+                    drift_detector = LSDDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                else:
+                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
+
+                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
                 
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
            
@@ -1501,62 +1563,123 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
         with torch.no_grad():
             features = enc(signals) 
         
-        # ---------- Adaptation ----------
+        # ---------- Decide adaptation ----------
+        do_adapt = False
         
-        # Use features and targets for adaptation
-        train_features = features
-        train_targets = targets
-        
-        # Optimizer
-        opt = build_inner_optimizer(
-            adapted_encoder=enc, 
-            adapted_head=ph, 
-            base_lr=config['personalization_lr'], 
-            mode='head', # only head is updated during online TTA
-            opt_type=config['inner_opt'].lower(), 
-            config=config
-        )
-        
-        # Encoder params for logging
-        n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
-        total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+        if config['setup_type'] == 'drift':
+            # Detect data drifts with detector
+            for i in range(features.shape[0]):
+                # Add batch dimension before prediction
+                detection_report = drift_detector.predict(features[i].cpu().numpy())
+                drift_flag = detection_report["data"]["is_drift"]
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
-            
-        param_update_log.append({
-            "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
-            "n_updated_params": n_updated,
-            "total_params": total_params,
-            "fraction_updated": n_updated / total_params
-        })
-
-        # Loss Function
-        criterion = (
-            F.smooth_l1_loss
-            if config["criterion"] == "SmoothL1Loss"
-            else F.mse_loss
-        )
+                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
+                if drift_detector.t >= config['detector_window_size']:
+                    if drift_flag == 1:
+                        n_detections += 1
+                        if first_detection is None:
+                            first_detection = n_steps
+                            
+                        global_window_idx = step_idx * config['personalization_batch_size'] + i
+                        detection_timesteps.append(global_window_idx)
+                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
+                    n_steps += 1    
         
-        # Training data/labels are already prepared for the current batch
-        for step in range(config["personalization_steps"]):
-            
-            # Train prediction head
-            ph.train()
-            
-            out = ph(train_features)
-            loss = criterion(out, train_targets)
-            
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        # If not drift setup: adapt by default (every block) for adaptive baselines
+        if config.get("setup_type") == "fixed":
+            do_adapt = True
+        elif config.get("setup_type") == "drift":
+            # Use detector for each adaptive baseline
+            if not do_adapt:
+                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+                if step_idx == config['calibration_phase_size']:
+                    # No parameters are updated exceet for the calibraiton ones
+                    n_updated = n_updated_calibration
 
-            train_loss = loss.item()
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": config['inner_adapt'],
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                elif step_idx > config['calibration_phase_size']:
+                    # No parameters are updated
+                    n_updated = 0
+
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": 'head',
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                else:
+                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+
+        if do_adapt:
+            # ---------- Adaptation ----------
             
-        # Set to eval mode after adaptation
-        ph.eval()
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
+            
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updated during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
+            
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+
+            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+            if step_idx == config['calibration_phase_size']:
+                n_updated += n_updated_calibration
+                
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
+
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # Training data/labels are already prepared for the current batch
+            for step in range(config["personalization_steps"]):
+                
+                # Train prediction head
+                ph.train()
+                
+                out = ph(train_features)
+                loss = criterion(out, train_targets)
+                
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                train_loss = loss.item()
+                
+            # Set to eval mode after adaptation
+            ph.eval()
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -1624,6 +1747,31 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
+    if config['setup_type'] == 'drift':    
+        
+        print(f"[Personalization] Total detections with drift-aware updates: {n_detections} out of {n_steps} steps with drift detection after calibration ✓")
+        # Calibration summary plot
+        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
+        
+        plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
+        plot_path  = os.path.join(baseline_path, plot_fname)
+    
+        plot_drift_calibration_summary(
+            targets_log=targets_log,
+            predictions_log=predictions_log,
+            detection_timesteps=detection_timesteps,
+            calibration_phase_size=config['calibration_phase_size'],
+            batch_size=config['personalization_batch_size'],
+            ert=config['detector_ert'],
+            window_size=config['detector_window_size'],
+            sbp_ae=sbp_ae,
+            dbp_ae=dbp_ae,
+            sbp_bwt=sbp_bwt,
+            dbp_bwt=dbp_bwt,
+            save_path=plot_path,
+        )
+
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
     
@@ -1674,28 +1822,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
@@ -1703,18 +1831,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
             num_blocks=config['num_blocks']
         )
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
-        
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
     prediction_head_pre = get_prediction_head_architecture(config)
@@ -1769,13 +1887,21 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     # Drift detector placeholders
     drift_detector = None
     calibration_ids = []
+    n_steps = 0 # number of detector predictions after calibration
+    n_detections = 0
+    first_detection = None
     detection_timesteps = []
     
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -1799,6 +1925,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -1976,9 +2104,14 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
                 # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
                 if drift_detector.t >= config['detector_window_size']:
                     if drift_flag == 1:
+                        n_detections += 1
+                        if first_detection is None:
+                            first_detection = n_steps
+                            
                         global_window_idx = step_idx * config['personalization_batch_size'] + i
                         detection_timesteps.append(global_window_idx)
                         do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
+                    n_steps += 1     
         
         # If not drift setup: adapt by default (every block) for adaptive baselines
         if config.get("setup_type") == "fixed":
@@ -1993,6 +2126,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
 
                     param_update_log.append({
                         "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
                         "update_mode": config['inner_adapt'],
                         "n_updated_params": n_updated,
                         "total_params": total_params,
@@ -2004,6 +2139,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
 
                     param_update_log.append({
                         "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
                         "update_mode": 'head',
                         "n_updated_params": n_updated,
                         "total_params": total_params,
@@ -2188,7 +2325,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
 
     if config['setup_type'] == 'drift':    
         
-        print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {(step_idx - config['calibration_phase_size']) * config['personalization_batch_size']} steps with drift detection after calibration ✓")
+        print(f"[Personalization] Total detections with drift-aware updates: {n_detections} out of {n_steps} steps with drift detection after calibration ✓")
         # Calibration summary plot
         sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
         dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
@@ -2262,28 +2399,8 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
@@ -2291,17 +2408,7 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
             num_blocks=config['num_blocks']
         )
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -2354,14 +2461,24 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
+    # Drift detector placeholders
+    drift_detector = None
     calibration_ids = []
+    n_steps = 0 # number of detector predictions after calibration
+    n_detections = 0
+    first_detection = None
+    detection_timesteps = []
     
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
 
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -2385,6 +2502,8 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -2474,6 +2593,34 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
                         "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
                     })
                 previous_steps += 1
+            
+            if config['setup_type'] == 'drift':
+                # Initialize drfit detector
+                # NOTE: only after calibration completion
+                reference_data = calibration_features.detach().clone()
+
+                if config['drift_detector_type'] == 'mmd':
+                    drift_detector = MMDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                elif config['drift_detector_type'] == 'lsdd':
+                    drift_detector = LSDDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                else:
+                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
+
+                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
         
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
@@ -2520,78 +2667,139 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
         # Extract features with the frozen encoder
         with torch.no_grad():
             features = enc(signals) 
+        
+        # ---------- Decide adaptation ----------
+        do_adapt = False
+        
+        if config['setup_type'] == 'drift':
+            # Detect data drifts with detector
+            for i in range(features.shape[0]):
+                # Add batch dimension before prediction
+                detection_report = drift_detector.predict(features[i].cpu().numpy())
+                drift_flag = detection_report["data"]["is_drift"]
 
-        # ---------- Adaptation ----------
-        
-        # Use features and targets for adaptation
-        train_features = features
-        train_targets = targets
-        
-        # Optimizer
-        opt = build_inner_optimizer(
-            adapted_encoder=enc, 
-            adapted_head=ph, 
-            base_lr=config['personalization_lr'], 
-            mode='head', # only head is updated during online TTA
-            opt_type=config['inner_opt'].lower(), 
-            config=config
-        )
-        
-        # Encoder params for logging
-        n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
-        total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
+                if drift_detector.t >= config['detector_window_size']:
+                    if drift_flag == 1:
+                        n_detections += 1
+                        if first_detection is None:
+                            first_detection = n_steps
+                            
+                        global_window_idx = step_idx * config['personalization_batch_size'] + i
+                        detection_timesteps.append(global_window_idx)
+                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
+                    n_steps += 1  
+                
+        # If not drift setup: adapt by default (every block) for adaptive baselines
+        if config.get("setup_type") == "fixed":
+            do_adapt = True
+        elif config.get("setup_type") == "drift":
+            # Use detector for each adaptive baseline
+            if not do_adapt:
+                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+                if step_idx == config['calibration_phase_size']:
+                    # No parameters are updated exceet for the calibraiton ones
+                    n_updated = n_updated_calibration
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": config['inner_adapt'],
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                elif step_idx > config['calibration_phase_size']:
+                    # No parameters are updated
+                    n_updated = 0
+
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": 'head',
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                else:
+                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+        
+        if do_adapt:
+            # ---------- Adaptation ----------
             
-        param_update_log.append({
-            "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
-            "n_updated_params": n_updated,
-            "total_params": total_params,
-            "fraction_updated": n_updated / total_params
-        })
-
-        # Loss Function
-        criterion = (
-            F.smooth_l1_loss
-            if config["criterion"] == "SmoothL1Loss"
-            else F.mse_loss
-        )
-        
-        # LwF teacher: it can be either the pretrained head or the previously updated head
-        # Here we use the previously updated head as teacher
-        teacher_ph = copy.deepcopy(ph)
-
-        for p in teacher_ph.parameters():
-            p.requires_grad = False
-
-        teacher_ph.eval()
-        with torch.no_grad():
-            teacher_out = teacher_ph(train_features)
-        
-        for step in range(config["personalization_steps"]):
-
-            # Train prediction head
-            ph.train()
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
             
-            out = ph(train_features)
-            loss = criterion(out, train_targets)
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updated during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
+            
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
 
-            # L2 distance from teacher and student logits
-            distill_loss = F.mse_loss(out, teacher_out)
-        
-            loss = loss + lwf_lambda * distill_loss
-        
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+            if step_idx == config['calibration_phase_size']:
+                n_updated += n_updated_calibration
+                
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
 
-            train_loss = loss.item()
-        
-        # Load best model
-        ph.eval()
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # LwF teacher: it can be either the pretrained head or the previously updated head
+            # Here we use the previously updated head as teacher
+            teacher_ph = copy.deepcopy(ph)
+
+            for p in teacher_ph.parameters():
+                p.requires_grad = False
+
+            teacher_ph.eval()
+            with torch.no_grad():
+                teacher_out = teacher_ph(train_features)
+            
+            for step in range(config["personalization_steps"]):
+
+                # Train prediction head
+                ph.train()
+                
+                out = ph(train_features)
+                loss = criterion(out, train_targets)
+
+                # L2 distance from teacher and student logits
+                distill_loss = F.mse_loss(out, teacher_out)
+            
+                loss = loss + lwf_lambda * distill_loss
+            
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                train_loss = loss.item()
+            
+            # Load best model
+            ph.eval()
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -2659,6 +2867,31 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
+    if config['setup_type'] == 'drift':    
+        
+        print(f"[Personalization] Total detections with drift-aware updates: {n_detections} out of {n_steps} steps with drift detection after calibration ✓")
+        # Calibration summary plot
+        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
+        
+        plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
+        plot_path  = os.path.join(baseline_path, plot_fname)
+    
+        plot_drift_calibration_summary(
+            targets_log=targets_log,
+            predictions_log=predictions_log,
+            detection_timesteps=detection_timesteps,
+            calibration_phase_size=config['calibration_phase_size'],
+            batch_size=config['personalization_batch_size'],
+            ert=config['detector_ert'],
+            window_size=config['detector_window_size'],
+            sbp_ae=sbp_ae,
+            dbp_ae=dbp_ae,
+            sbp_bwt=sbp_bwt,
+            dbp_bwt=dbp_bwt,
+            save_path=plot_path,
+        )
+        
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
@@ -2708,28 +2941,8 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
@@ -2737,17 +2950,7 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
             num_blocks=config['num_blocks']
         )
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -2802,14 +3005,24 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
+    # Drift detector placeholders
+    drift_detector = None
     calibration_ids = []
+    n_steps = 0 # number of detector predictions after calibration
+    n_detections = 0
+    first_detection = None
+    detection_timesteps = []
     
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -2833,6 +3046,8 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -2923,6 +3138,34 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
                     })
                 previous_steps += 1
             
+            if config['setup_type'] == 'drift':
+                # Initialize drfit detector
+                # NOTE: only after calibration completion
+                reference_data = calibration_features.detach().clone()
+
+                if config['drift_detector_type'] == 'mmd':
+                    drift_detector = MMDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                elif config['drift_detector_type'] == 'lsdd':
+                    drift_detector = LSDDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                else:
+                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
+
+                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
+                
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
              
         # ---------- Evaluate before adaptation ----------
@@ -2968,100 +3211,161 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
         # Extract features with the frozen encoder
         with torch.no_grad():
             features = enc(signals) 
+        
+        # ---------- Decide adaptation ----------
+        do_adapt = False
+        
+        if config['setup_type'] == 'drift':
+            # Detect data drifts with detector
+            for i in range(features.shape[0]):
+                # Add batch dimension before prediction
+                detection_report = drift_detector.predict(features[i].cpu().numpy())
+                drift_flag = detection_report["data"]["is_drift"]
 
-        # ---------- Adaptation ----------
+                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
+                if drift_detector.t >= config['detector_window_size']:
+                    if drift_flag == 1:
+                        n_detections += 1
+                        if first_detection is None:
+                            first_detection = n_steps
+                            
+                        global_window_idx = step_idx * config['personalization_batch_size'] + i
+                        detection_timesteps.append(global_window_idx)
+                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
+                    n_steps += 1 
         
-        # Use features and targets for adaptation
-        train_features = features
-        train_targets = targets
-        
-        # Optimizer
-        opt = build_inner_optimizer(
-            adapted_encoder=enc, 
-            adapted_head=ph, 
-            base_lr=config['personalization_lr'], 
-            mode='head', # only head is updated during online TTA
-            opt_type=config['inner_opt'].lower(), 
-            config=config
-        )
-        
-        # Encoder params for logging
-        n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
-        total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+        # If not drift setup: adapt by default (every block) for adaptive baselines
+        if config.get("setup_type") == "fixed":
+            do_adapt = True
+        elif config.get("setup_type") == "drift":
+            # Use detector for each adaptive baseline
+            if not do_adapt:
+                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+                if step_idx == config['calibration_phase_size']:
+                    # No parameters are updated exceet for the calibraiton ones
+                    n_updated = n_updated_calibration
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": config['inner_adapt'],
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                elif step_idx > config['calibration_phase_size']:
+                    # No parameters are updated
+                    n_updated = 0
+
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": 'head',
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                else:
+                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+
+        if do_adapt:
+            # ---------- Adaptation ----------
             
-        param_update_log.append({
-            "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
-            "n_updated_params": n_updated,
-            "total_params": total_params,
-            "fraction_updated": n_updated / total_params
-        })
-
-        # Loss Function
-        criterion = (
-            F.smooth_l1_loss
-            if config["criterion"] == "SmoothL1Loss"
-            else F.mse_loss
-        )
-        
-        # Training data/labels are already prepared for the current batch
-        for step in range(config["personalization_steps"]):
-
-            # Train prediction head
-            ph.train()
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
             
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updated during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
+            
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+
+            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+            if step_idx == config['calibration_phase_size']:
+                n_updated += n_updated_calibration
+                
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
+
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # Training data/labels are already prepared for the current batch
+            for step in range(config["personalization_steps"]):
+
+                # Train prediction head
+                ph.train()
+                
+                out = ph(train_features)
+                loss = criterion(out, train_targets)
+                
+                # EWC loss with Fisher Information Matrix
+                ewc_loss = 0.0
+                for n, p in list(ph.named_parameters()):
+                    if n in ewc_fisher:
+                        ewc_loss += (ewc_fisher[n] * (p - ewc_prev_params[n]).pow(2)).sum()
+                loss = loss + ewc_lambda * ewc_loss
+                
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                train_loss = loss.item()
+
+            # Set to eval mode after adaptation
+            ph.eval()
+               
+            # Fisher Matrix update for EWC
+            ewc_fisher = {}
+
+            params = [
+                (n, p) for n, p in list(ph.named_parameters())
+                if p.requires_grad
+            ]
+
+            for n, p in params:
+                ewc_fisher[n] = torch.zeros_like(p)
+
+            ph.eval()
+            ph.zero_grad()
             out = ph(train_features)
             loss = criterion(out, train_targets)
-            
-            # EWC loss with Fisher Information Matrix
-            ewc_loss = 0.0
-            for n, p in list(ph.named_parameters()):
-                if n in ewc_fisher:
-                    ewc_loss += (ewc_fisher[n] * (p - ewc_prev_params[n]).pow(2)).sum()
-            loss = loss + ewc_lambda * ewc_loss
-            
-            opt.zero_grad()
             loss.backward()
-            opt.step()
 
-            train_loss = loss.item()
+            for n, p in params:
+                if p.grad is not None:
+                    ewc_fisher[n] += p.grad.data.pow(2)
 
-        # Set to eval mode after adaptation
-        ph.eval()
-            
-        # Fisher Matrix update for EWC
-        ewc_fisher = {}
+            for n in ewc_fisher:
+                ewc_fisher[n] /= len(train_features)
 
-        params = [
-            (n, p) for n, p in list(ph.named_parameters())
-            if p.requires_grad
-        ]
-
-        for n, p in params:
-            ewc_fisher[n] = torch.zeros_like(p)
-
-        ph.eval()
-        ph.zero_grad()
-        out = ph(train_features)
-        loss = criterion(out, train_targets)
-        loss.backward()
-
-        for n, p in params:
-            if p.grad is not None:
-                ewc_fisher[n] += p.grad.data.pow(2)
-
-        for n in ewc_fisher:
-            ewc_fisher[n] /= len(train_features)
-
-        ewc_prev_params = {
-            n: p.detach().clone()
-            for n, p in list(ph.named_parameters())
-            if p.requires_grad
-        }
+            ewc_prev_params = {
+                n: p.detach().clone()
+                for n, p in list(ph.named_parameters())
+                if p.requires_grad
+            }
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -3129,6 +3433,31 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
+    if config['setup_type'] == 'drift':    
+        
+        print(f"[Personalization] Total detections with drift-aware updates: {n_detections} out of {n_steps} steps with drift detection after calibration ✓")
+        # Calibration summary plot
+        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
+        
+        plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
+        plot_path  = os.path.join(baseline_path, plot_fname)
+    
+        plot_drift_calibration_summary(
+            targets_log=targets_log,
+            predictions_log=predictions_log,
+            detection_timesteps=detection_timesteps,
+            calibration_phase_size=config['calibration_phase_size'],
+            batch_size=config['personalization_batch_size'],
+            ert=config['detector_ert'],
+            window_size=config['detector_window_size'],
+            sbp_ae=sbp_ae,
+            dbp_ae=dbp_ae,
+            sbp_bwt=sbp_bwt,
+            dbp_bwt=dbp_bwt,
+            save_path=plot_path,
+        )
+        
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
@@ -3181,28 +3510,8 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     baseline_path = os.path.join(subj_dir, baseline)
     os.makedirs(baseline_path, exist_ok=True)
     
-    # Set stream kwargs based on the dataset and optionally
-    # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    
-    elif 'vital_db' in config['dataset_name'].lower():
+    if config['plot_personalization']:
+        # Plot subject blocks and SBP/DBP/MAP drifts
         blocks = dataset.get_subject_blocks(
             subject_id, window_length=config['input_seq_len_s'],
             batch_size=config['personalization_batch_size'],
@@ -3210,17 +3519,7 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
             num_blocks=config['num_blocks']
         )
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -3273,14 +3572,24 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
+    # Drift detector placeholders
+    drift_detector = None
     calibration_ids = []
+    n_steps = 0 # number of detector predictions after calibration
+    n_detections = 0
+    first_detection = None
+    detection_timesteps = []
     
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+    for batch_info in dataset.get_subject_blocks(
+            subject_id, window_length=config['input_seq_len_s'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        ):
         
         # CALIBRATION PHASE 
         if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
@@ -3304,6 +3613,8 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
 
             param_update_log.append({
                 "step_idx": step_idx,
+                "block_idx": batch_info['block_idx'],
+                "batch_idx": batch_info['batch_idx'],
                 "update_mode": config['inner_adapt'],
                 "n_updated_params": n_updated,
                 "total_params": total_params,
@@ -3394,6 +3705,34 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
                     })
                 previous_steps += 1
             
+            if config['setup_type'] == 'drift':
+                # Initialize drfit detector
+                # NOTE: only after calibration completion
+                reference_data = calibration_features.detach().clone()
+
+                if config['drift_detector_type'] == 'mmd':
+                    drift_detector = MMDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                elif config['drift_detector_type'] == 'lsdd':
+                    drift_detector = LSDDDriftOnline(
+                        x_ref=reference_data.cpu().numpy(),
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                else:
+                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
+
+                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
+                
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
         # ---------- Evaluate before adaptation ----------
@@ -3440,110 +3779,171 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
         with torch.no_grad():
             features = enc(signals) 
         
-        # ---------- Adaptation ----------
+        # ---------- Decide adaptation ----------
+        do_adapt = False
         
-        # Use features and targets for adaptation
-        train_features = features
-        train_targets = targets
-        
-        # Optimizer
-        opt = build_inner_optimizer(
-            adapted_encoder=enc, 
-            adapted_head=ph, 
-            base_lr=config['personalization_lr'], 
-            mode='head', # only head is updated during online TTA
-            opt_type=config['inner_opt'].lower(), 
-            config=config
-        )
-        
-        # Encoder params for logging
-        n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
-        total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+        if config['setup_type'] == 'drift':
+            # Detect data drifts with detector
+            for i in range(features.shape[0]):
+                # Add batch dimension before prediction
+                detection_report = drift_detector.predict(features[i].cpu().numpy())
+                drift_flag = detection_report["data"]["is_drift"]
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
+                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
+                if drift_detector.t >= config['detector_window_size']:
+                    if drift_flag == 1:
+                        n_detections += 1
+                        if first_detection is None:
+                            first_detection = n_steps
+                            
+                        global_window_idx = step_idx * config['personalization_batch_size'] + i
+                        detection_timesteps.append(global_window_idx)
+                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
+                    n_steps += 1  
+        
+        # If not drift setup: adapt by default (every block) for adaptive baselines
+        if config.get("setup_type") == "fixed":
+            do_adapt = True
+        elif config.get("setup_type") == "drift":
+            # Use detector for each adaptive baseline
+            if not do_adapt:
+                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+                if step_idx == config['calibration_phase_size']:
+                    # No parameters are updated exceet for the calibraiton ones
+                    n_updated = n_updated_calibration
+
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": config['inner_adapt'],
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                elif step_idx > config['calibration_phase_size']:
+                    # No parameters are updated
+                    n_updated = 0
+
+                    param_update_log.append({
+                        "step_idx": step_idx,
+                        "block_idx": batch_info['block_idx'],
+                        "batch_idx": batch_info['batch_idx'],
+                        "update_mode": 'head',
+                        "n_updated_params": n_updated,
+                        "total_params": total_params,
+                        "fraction_updated": n_updated / total_params
+                    })
+                else:
+                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+
+        if do_adapt:
+            # ---------- Adaptation ----------
             
-        param_update_log.append({
-            "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
-            "n_updated_params": n_updated,
-            "total_params": total_params,
-            "fraction_updated": n_updated / total_params
-        })
-        
-        # Trainable parameters required by AGEM
-        trainable_params = [
-            p for p in list(enc.parameters()) + list(ph.parameters())
-            if p.requires_grad
-        ]
-
-        # Loss Function
-        criterion = (
-            F.smooth_l1_loss
-            if config["criterion"] == "SmoothL1Loss"
-            else F.mse_loss
-        )
-        
-        # Training data/labels are already prepared for the current batch
-        for step in range(config["personalization_steps"]):
-
-            # Train prediction head
-            ph.train()
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
             
-            out = ph(train_features)
-            loss = criterion(out, train_targets)
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updated during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
             
-            if len(replay_buffer) > 0:
-                # Current batch gradient
-                opt.zero_grad()
-                loss.backward()
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
 
-                grad_cur = torch.cat([
-                        p.grad.view(-1)
-                        for p in trainable_params
-                        if p.grad is not None
-                    ])
+            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+            if step_idx == config['calibration_phase_size']:
+                n_updated += n_updated_calibration
+                
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
+            
+            # Trainable parameters required by AGEM
+            trainable_params = [
+                p for p in list(enc.parameters()) + list(ph.parameters())
+                if p.requires_grad
+            ]
 
-                # Replay batch gradient
-                replay_feats, replay_tgts = replay_buffer.sample(train_features.shape[0])
-                if replay_feats is not None:
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # Training data/labels are already prepared for the current batch
+            for step in range(config["personalization_steps"]):
+
+                # Train prediction head
+                ph.train()
+                
+                out = ph(train_features)
+                loss = criterion(out, train_targets)
+                
+                if len(replay_buffer) > 0:
+                    # Current batch gradient
                     opt.zero_grad()
-                    replay_out = ph(replay_feats.to(device))
-                    replay_loss = criterion(replay_out, replay_tgts.to(device))
-                    replay_loss.backward()
-                    grad_ref = torch.cat([
-                        p.grad.view(-1)
-                        for p in trainable_params
-                        if p.grad is not None
-                    ])
+                    loss.backward()
 
-                    dot = torch.dot(grad_cur, grad_ref)
-                    if dot < 0:
-                        proj = grad_cur - (dot / grad_ref.dot(grad_ref)) * grad_ref
+                    grad_cur = torch.cat([
+                            p.grad.view(-1)
+                            for p in trainable_params
+                            if p.grad is not None
+                        ])
 
-                        # Write projected gradient back
-                        idx = 0
-                        for p in trainable_params:
-                            if p.grad is not None:
-                                numel = p.grad.numel()
-                                p.grad.copy_(proj[idx:idx+numel].view_as(p))
-                                idx += numel
+                    # Replay batch gradient
+                    replay_feats, replay_tgts = replay_buffer.sample(train_features.shape[0])
+                    if replay_feats is not None:
+                        opt.zero_grad()
+                        replay_out = ph(replay_feats.to(device))
+                        replay_loss = criterion(replay_out, replay_tgts.to(device))
+                        replay_loss.backward()
+                        grad_ref = torch.cat([
+                            p.grad.view(-1)
+                            for p in trainable_params
+                            if p.grad is not None
+                        ])
 
-                opt.step()
-            else:
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
+                        dot = torch.dot(grad_cur, grad_ref)
+                        if dot < 0:
+                            proj = grad_cur - (dot / grad_ref.dot(grad_ref)) * grad_ref
 
-            train_loss = loss.item()
+                            # Write projected gradient back
+                            idx = 0
+                            for p in trainable_params:
+                                if p.grad is not None:
+                                    numel = p.grad.numel()
+                                    p.grad.copy_(proj[idx:idx+numel].view_as(p))
+                                    idx += numel
 
-        # Set to eval mode after adaptation
-        ph.eval()
-        
-        # Update replay buffer 
-        with torch.no_grad():
-            replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
+                    opt.step()
+                else:
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+
+                train_loss = loss.item()
+  
+            # Set to eval mode after adaptation
+            ph.eval()
+            
+            # Update replay buffer 
+            with torch.no_grad():
+                replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -3610,6 +4010,31 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     log_json_path = os.path.join(baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
+
+    if config['setup_type'] == 'drift':    
+        
+        print(f"[Personalization] Total detections with drift-aware updates: {n_detections} out of {n_steps} steps with drift detection after calibration ✓")
+        # Calibration summary plot
+        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
+        
+        plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
+        plot_path  = os.path.join(baseline_path, plot_fname)
+    
+        plot_drift_calibration_summary(
+            targets_log=targets_log,
+            predictions_log=predictions_log,
+            detection_timesteps=detection_timesteps,
+            calibration_phase_size=config['calibration_phase_size'],
+            batch_size=config['personalization_batch_size'],
+            ert=config['detector_ert'],
+            window_size=config['detector_window_size'],
+            sbp_ae=sbp_ae,
+            dbp_ae=dbp_ae,
+            sbp_bwt=sbp_bwt,
+            dbp_bwt=dbp_bwt,
+            save_path=plot_path,
+        )
 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
@@ -3694,7 +4119,7 @@ def personalization(tensorboard_path, config, device):
         os.makedirs(agg_dir)
         
     if config['setup_type'] == 'drift':
-        print(f"[Personalization] Personalization performed with feature-based drift detection")
+        print(f"[Personalization] Personalization performed with feature-based drift detection with percentile threshold {config['drift_threshold']}")
     
     for subject_counter, subject_id in enumerate(personalization_subjects):
         print(f"[Personalization] {subject_counter + 1}/{len(personalization_subjects)} personalizing model on subject {subject_id}")

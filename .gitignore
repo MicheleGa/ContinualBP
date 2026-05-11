@@ -22,6 +22,7 @@ data/lmdb/*
 data/data_logs/*
 data/pulse_db/mimic_iii_npz/*
 data/pulse_db/vital_db_npz/*
+data/aurora_db/
 
 # Figures
 figs/

@@ -2,8 +2,8 @@
 
 # Main baseline
 python results_analysis.py \
-    --log_file_path "./logs/gradual_shifts/gradual_shifts_personalization_training.log" \
-    --config_yaml_path "./checkpoints/proto_ppg_percentile_group_layer_norm/proto_ppg_percentile_group_layer_norm-Proto-2026_01_06-11_03_38/proto_ppg_percentile_group_layer_norm/ckpt/config.yaml" \
-    --fig_root "./figs/gradual_shifts" \
-    --exp_fig_root "./figs/gradual_shifts/gradual_shifts-Proto-2026_01_07-14_55_02" \
-    --exp_fig_root_drift_aware "./figs/feature_drift_aware_gradual_shifts_0.1/feature_drift_aware_gradual_shifts_0.1-Proto-2026_03_09-11_44_48" "./figs/feature_drift_aware_gradual_shifts_0.2/feature_drift_aware_gradual_shifts_0.2-Proto-2026_03_09-11_57_47" "./figs/feature_drift_aware_gradual_shifts_0.3/feature_drift_aware_gradual_shifts_0.3-Proto-2026_03_09-12_10_01" "./figs/feature_drift_aware_gradual_shifts_0.4/feature_drift_aware_gradual_shifts_0.4-Proto-2026_03_09-12_22_18" "./figs/feature_drift_aware_gradual_shifts_0.5/feature_drift_aware_gradual_shifts_0.5-Proto-2026_03_09-12_34_23"
+    --log_file_path "./logs/new_eval_gradual_shifts_ppg_batch_size_4/new_eval_gradual_shifts_ppg_batch_size_4_personalization_training.log" \
+    --config_yaml_path "./checkpoints/full_proto_ppg_percentile_group_layer_norm_kq_16/full_proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_05-21_49_45/full_proto_ppg_percentile_group_layer_norm_kq_16/ckpt/config.yaml" \
+    --fig_root "./figs/new_eval_gradual_shifts_ppg_batch_size_4" \
+    --exp_fig_root "./figs/new_eval_gradual_shifts_ppg_batch_size_4/new_eval_gradual_shifts_ppg_batch_size_4-Proto-2026_05_08-12_20_02" \
+    --exp_fig_root_drift_aware "./figs/new_eval_gradual_shifts_ppg_batch_size_4_drift_aware/new_eval_gradual_shifts_ppg_batch_size_4_drift_aware-Proto-2026_05_08-12_20_07"

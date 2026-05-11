@@ -6,6 +6,7 @@ folders_to_add = ['models']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import shutil
+import json
 import argparse
 import re
 import yaml
@@ -13,36 +14,25 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, pearsonr
 import torch
 from thop import profile
 from models.Proto import Proto
 from models.component_factory import BPRegressor
 
 
-def analyze_logs_and_plot(log_file_path, fig_root):
-    r"""
-    Parses blood pressure estimation log files to extract performance metrics and generates summary plots.
-    
-    Parameters
-    ------------
-    log_file_path (str): 
-        The file path to the raw text logs containing subject results and baseline metrics.
-        
-    fig_root (str): 
-        The root directory where baseline-specific subfolders, CSV summaries, and PNG plots will be saved.
-    """
+def analyze_logs_and_plot(log_file_path, fig_root, exp_fig_root, exp_drift_aware_fig_root):
     
     print("[Log Analysis] Analyzing log files ...")
     for baseline_name in [
-        'no_adapt',
-        'first_batch_finetune',
-        'online',
-        'online_from_scratch',
+        #'no_adapt',
+        #'first_batch_finetune',
+        #'online',
+        #'online_from_scratch',
         'feature_replay',
-        'lwf',
-        'ewc',
-        'agem'
+        #'lwf',
+        #'ewc',
+        #'agem'
     ]:
         baseline_fig_root = os.path.join(fig_root, baseline_name)
         if os.path.exists(baseline_fig_root):
@@ -94,9 +84,7 @@ def analyze_logs_and_plot(log_file_path, fig_root):
             for line in f.readlines():
                 line = line.strip()
 
-                # ---------------------------
                 # Detect header: subject + baseline
-                # ---------------------------
                 m = re_subject_header.search(line)
                 if m:
                     # If we were collecting a previous block, store it
@@ -109,9 +97,7 @@ def analyze_logs_and_plot(log_file_path, fig_root):
                     }
                     continue
 
-                # ---------------------------
                 # Extract SBP/DBP MAE ± std
-                # ---------------------------
                 m = re_sbp_mae.search(line)
                 if m:
                     current["SBP_MAE"] = float(m.group(1))
@@ -124,9 +110,7 @@ def analyze_logs_and_plot(log_file_path, fig_root):
                     current["DBP_STD"] = float(m.group(2))
                     continue
 
-                # ---------------------------
                 # Extract BHS percentage lines
-                # ---------------------------
                 m = re_sbp_bhs_perc.search(line)
                 if m:
                     current["SBP_p<=5"] = float(m.group(1))
@@ -141,9 +125,7 @@ def analyze_logs_and_plot(log_file_path, fig_root):
                     current["DBP_p<=15"] = float(m.group(3))
                     continue
 
-                # ---------------------------
                 # Extract BHS letter grade
-                # ---------------------------
                 m = re_sbp_grade.search(line)
                 if m:
                     current["SBP_BHS"] = m.group(1)
@@ -158,9 +140,7 @@ def analyze_logs_and_plot(log_file_path, fig_root):
         if "subject" in current:
             records.append(current)
 
-        # ----------------
         # Create DataFrame
-        # ----------------
         df = pd.DataFrame(records)
 
         # N.B. — filter only continual_replay baseline
@@ -176,10 +156,88 @@ def analyze_logs_and_plot(log_file_path, fig_root):
                             index=False)
 
         print("[Log Analysis] Saved → df_sorted_by_SBP_MAE.csv")
+        
+        # ----------------------------------------------------------
+        # Get number of updates and target values for drift analysis
+        # ----------------------------------------------------------
+        personalization_subjects = df_sbp_sorted['subject'].tolist()
+        
+        subject_drift_scores   = {}   # median |Δ SBP| per subject
+        subject_updates_drift  = {}   # drift-aware update count per subject
+        
+        for subject in personalization_subjects:
+            # Get number of updates without drift detection
+            exp_param_log_path = os.path.join(
+                exp_fig_root,
+                f"subject_{subject}",
+                baseline_name,
+                "param_update_log.csv"
+            )
+            df_updates = pd.read_csv(exp_param_log_path)
+            exp_num_updates = (df_updates["n_updated_params"] > 0).sum()
+            
+            # Get number of updates with drift detection
+            exp_drift_param_log_path = os.path.join(
+                exp_drift_aware_fig_root,
+                f"subject_{subject}",
+                baseline_name,
+                "param_update_log.csv"
+            )
+            df_updates_drift = pd.read_csv(exp_drift_param_log_path)
+            exp_drift_num_updates = (df_updates_drift["n_updated_params"] > 0).sum()
+            
+            print(f"[Log Analysis] Updates for subject {subject} (non-drift vs drift) {exp_num_updates} - {exp_drift_num_updates}")
+            
+            # Get targets for drift calculation
+            # -> same for either drift non-aware and drift-aware
+            exp_targets_log_path = os.path.join(
+                exp_fig_root,
+                f"subject_{subject}",
+                baseline_name,
+                "targets_log.json"
+            )
+            with open(exp_targets_log_path, "r") as f:
+                targets_log = json.load(f)
+                
+            # -------------------------------------------------------
+            # Aggregate SBP values and compute first-order derivative
+            # -------------------------------------------------------
+            # Compute diff within each batch to avoid artificial jumps
+            # at batch boundaries, then pool all intra-batch deltas.
+            sbp_deltas = []
+            for log in targets_log:
+                sbp_batch = np.array(log['sbp_values'], dtype=float)
+                if len(sbp_batch) > 1:
+                    sbp_deltas.extend(np.diff(sbp_batch).tolist())
+
+            # Median of absolute first-order differences:
+            # high value → subject has frequent / steep SBP swings (drift-prone)
+            sbp_drift_score = float(np.median(np.abs(sbp_deltas))) if sbp_deltas else 0.0
+
+            subject_drift_scores[subject] = sbp_drift_score
+            subject_updates_drift[subject] = int(exp_drift_num_updates)
 
         # --------
         # PLOTTING
         # --------
+        
+        # Ensure correct ordering using sorted dataframe
+        subjects_ordered = df_sbp_sorted["subject"].tolist()
+
+        sbp_mae_arr = df_sbp_sorted["SBP_MAE"].values
+
+        updates_arr = np.array(
+            [subject_updates_drift[s] for s in subjects_ordered],
+            dtype=float
+        )
+
+        drift_score_arr = np.array(
+            [subject_drift_scores[s] for s in subjects_ordered],
+            dtype=float
+        )
+        # Correlation between SBP MAE and SBP derivative
+        r_value, p_value = pearsonr(sbp_mae_arr, drift_score_arr)
+        r_squared = r_value ** 2
 
         # Plot 1 — Ranked MAE
         plt.figure(figsize=(12, 6))
@@ -224,8 +282,105 @@ def analyze_logs_and_plot(log_file_path, fig_root):
         plt.tight_layout()
         plt.savefig(OUTPUT_GRADE_PLOT, dpi=300)
         plt.close()
-
         print(f"[Log Analysis] Saved → {OUTPUT_GRADE_PLOT}")
+        
+        # Plot 3 - Correlation plot: SBP MAE vs SBP derivative
+        print(f"[Log Analysis] Pearson r = {r_value:.4f}, R² = {r_squared:.4f}, p = {p_value:.4e}")
+        x_ticks = np.arange(len(subjects_ordered))
+
+        fig = plt.figure(figsize=(14, 10))
+        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.05)
+
+        fig.suptitle(
+            f"Correlation SBP MAE vs SBP derivative: R² = {r_squared:.3f} (r = {r_value:.3f}, p = {p_value:.2e})",
+            fontsize=16
+        )
+
+        # ── Subplot 1: SBP MAE ──
+        ax1 = fig.add_subplot(gs[0])
+        ax1.bar(x_ticks, sbp_mae_arr, color="forestgreen", width=0.7)
+
+        ax1.set_ylabel("SBP MAE (mmHg)", fontsize=14)
+        #ax1.set_title("SBP MAE per subject", fontsize=14)
+        ax1.grid(axis="y", alpha=0.4)
+        ax1.tick_params(labelsize=12)
+        ax1.set_xticklabels([])  # hide x labels
+
+        # ── Subplot 2 (BROKEN AXIS): SBP derivative ──
+        ax2_top = fig.add_subplot(gs[1], sharex=ax1)
+        ax2_bottom = fig.add_subplot(gs[2], sharex=ax1)
+
+        # Plot both
+        ax2_top.bar(x_ticks, drift_score_arr, color="darkorange", width=0.7)
+        ax2_bottom.bar(x_ticks, drift_score_arr, color="darkorange", width=0.7)
+
+        # Set y-limits (broken region between 3 and 12)
+        ax2_bottom.set_ylim(0, 2)
+        ax2_top.set_ylim(12, max(drift_score_arr) * 1.1)
+
+        # Hide spines between axes
+        ax2_top.spines['bottom'].set_visible(False)
+        ax2_bottom.spines['top'].set_visible(False)
+
+        ax2_top.tick_params(labeltop=False)
+        ax2_bottom.xaxis.tick_bottom()
+
+        # Diagonal break marks
+        d = .5
+        kwargs = dict(marker=[(-1, -d), (1, d)], markersize=12,
+                    linestyle="none", color='k', mec='k', mew=1, clip_on=False)
+
+        ax2_top.plot([0, 1], [0, 0], transform=ax2_top.transAxes, **kwargs)
+        ax2_bottom.plot([0, 1], [1, 1], transform=ax2_bottom.transAxes, **kwargs)
+
+        # Labels
+        ax2_bottom.set_xlabel("Subjects (ranked by increasing SBP MAE)", fontsize=14)
+        ax2_bottom.set_ylabel("Median |ΔSBP| (mmHg)", fontsize=14)
+
+        #ax2_top.set_title("SBP first-order derivative per subject", fontsize=14)
+
+        ax2_top.grid(axis="y", alpha=0.4)
+        ax2_bottom.grid(axis="y", alpha=0.4)
+
+        # X ticks
+        ax2_bottom.set_xticks(x_ticks)
+        ax2_bottom.set_xticklabels([""] * len(x_ticks))
+
+        plt.tight_layout()
+
+        OUTPUT_DRIFT_CORR_PLOT = os.path.join(
+            baseline_fig_root,
+            "sbp_mae_vs_sbp_derivative.png"
+        )
+
+        plt.savefig(OUTPUT_DRIFT_CORR_PLOT, dpi=300)
+        plt.close()
+
+        print(f"[Log Analysis] Saved → {OUTPUT_DRIFT_CORR_PLOT}")
+        
+        # Plot 4 — Drift-aware updates only
+        plt.figure(figsize=(12, 6))
+        x_ticks = np.arange(len(subjects_ordered))
+
+        plt.bar(x_ticks, updates_arr, color="steelblue", width=0.7)
+        plt.xticks(x_ticks, [""] * len(x_ticks))
+        plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+        plt.xlabel("Subjects (ranked by SBP MAE)", fontsize=14)
+        plt.ylabel("Number of drift-aware updates", fontsize=14)
+        plt.title("Drift-aware update counts per subject", fontsize=14)
+        plt.grid(axis="y", alpha=0.4)
+
+        OUTPUT_UPDATES_ONLY = os.path.join(
+            baseline_fig_root,
+            "drift_updates_per_subject.png"
+        )
+
+        plt.tight_layout()
+        plt.savefig(OUTPUT_UPDATES_ONLY, dpi=300)
+        plt.close()
+
+        print(f"[Log Analysis] Saved → {OUTPUT_UPDATES_ONLY}")
 
         
 def aggregate_patient_level_target_statistics_and_plot(fig_root, exp_fig_root):
@@ -255,8 +410,11 @@ def aggregate_patient_level_target_statistics_and_plot(fig_root, exp_fig_root):
         baseline_fig_root = os.path.join(fig_root, baseline_name)
 
         # Read CSV file  with sorted SBP MAE
-        df_sbp_sorted = pd.read_csv(os.path.join(baseline_fig_root, "df_sorted_by_SBP_MAE.csv"))
-        
+        try:
+            df_sbp_sorted = pd.read_csv(os.path.join(baseline_fig_root, "df_sorted_by_SBP_MAE.csv"))
+        except:
+            print(f"No file found at {os.path.join(baseline_fig_root, 'df_sorted_by_SBP_MAE.csv')}") 
+            
         personalization_subjects = df_sbp_sorted['subject'].tolist()
         rows = []
 
@@ -1068,7 +1226,7 @@ def parseargs():
     parser.add_argument('--config_yaml_path', default='', type=str, help='path to the configuration YAML file for the experiments')
     parser.add_argument('--fig_root', default='', type=str, help='path to figure folder where to store the result analysis outputs')
     parser.add_argument('--exp_fig_root', default='', type=str, help='path to figure folder of each subject analyzed in an experiment (subfolder inside fig_root)')
-    parser.add_argument('--exp_fig_root_drift_aware', nargs='+', default=[], help='list of drift-aware experiment folders')
+    parser.add_argument('--exp_fig_root_drift_aware', default='', type=str, help='drift-aware experiment folder')
 
     return parser.parse_args()
 
@@ -1077,14 +1235,14 @@ if __name__ == "__main__":
     args = parseargs()
     
     # Collect metrics from the experiment log file and organize them in CSVs
-    analyze_logs_and_plot(args.log_file_path, args.fig_root)
+    analyze_logs_and_plot(args.log_file_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
         
     # Aggregates results over patients and correlates them to SBP variability
-    aggregate_patient_level_target_statistics_and_plot(args.fig_root, args.exp_fig_root)
+    #aggregate_patient_level_target_statistics_and_plot(args.fig_root, args.exp_fig_root)
     
-    if len(args.exp_fig_root_drift_aware) > 0:
+    #if len(args.exp_fig_root_drift_aware) > 0:
         # Computational and storage resources of the Feature Replay algorithm
         # -> NOTE: the resource cost of other baselines may be estimated with future expansion of the codebase
-        resource_usage_profile(args.config_yaml_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
+        #resource_usage_profile(args.config_yaml_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
     
         

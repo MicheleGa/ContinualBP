@@ -5,8 +5,8 @@ for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import pprint
 import torch
-from training_utils.helpers import parseargs, fixseed
-from models.compute_feature_stats import compute_feature_stats
+from training_utils.helpers import parseargs, fixseed, generate_runname
+from models.calibrate_drift_detector import calibrate_drift_detector
 
 
 if __name__ == "__main__":
@@ -23,9 +23,28 @@ if __name__ == "__main__":
     device = torch._C.device("cuda:0")
     torch.set_default_dtype(torch.float32)
     
-    config = dict()    
+    # Setup paths
+    run_name = generate_runname(model_name=target_model.__name__, exp_name=args.expname)
+    checkpoint_path = os.path.join("./checkpoints/", args.expname, run_name)
+    figure_path = os.path.join("./figs/", args.expname, run_name)
+    
+    if not os.path.exists(checkpoint_path):
+        os.makedirs(checkpoint_path)
+
+    if not os.path.exists(figure_path):
+        os.makedirs(figure_path)
+
+    print(f'Dataset folder: {os.path.join(args.dataset_folder, args.dataset_name)}')
+    print(f'Checkpoint folder: {checkpoint_path}')
+    print(f'Figure folder: {figure_path}')
+
+    # Load configuration into a dict
+    config = dict()
     config.update(args.__dict__)  
     config['model_name'] = model_name 
+    config['checkpoint_path'] = checkpoint_path
+    config['figure_path'] = figure_path
+
     print('Configuration for the run:')
     pprint.pprint(config, width=1)
     
@@ -33,4 +52,4 @@ if __name__ == "__main__":
     fixseed(config['seed'])
     
     # Compute Feature Stats
-    compute_feature_stats(device, config)
+    calibrate_drift_detector(config, device)

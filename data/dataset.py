@@ -70,8 +70,6 @@ class PhysioDataset(Dataset):
         print(f"\t-Total Subjects: {len(self.subjects_for_pretraining)}")
         print(f"\t-Total Samples: {len(self.index_by_sample_id)}")
         
-        #print("[PhysioDataset] Computing SBP drift information for each subject ...")
-        #self.subject_drift_info = self.compute_subject_sbp_drift()
                     
     def check_subjects_list(self, min_subject_sample_number=0):
         r"""
@@ -111,123 +109,6 @@ class PhysioDataset(Dataset):
                 if len(self.index_by_subject_id[subject]) > min_subject_sample_number:
                     self.index_by_subject_id[subject] = self.index_by_subject_id[subject][:min_subject_sample_number]
 
-    def compute_subject_sbp_drift(self):
-        r"""
-        Analyzes the 'drift' or physiological variance by retrieving 
-        the ground-truth SBP labels for all windows associated with a subject.
-
-        Statistical Metrics Computed:
-        1.  **SBP Standard Deviation**: Measures the average dispersion of BP values 
-            around the mean for that subject.
-        2.  **SBP Range**: The absolute difference between the highest and lowest 
-            recorded SBP (Max - Min).
-        3.  **Sample Count**: The total number of valid windows used for the calculation.
-
-        Returns
-        ------------
-        drift_info (dict): 
-            A dictionary keyed by `subject_id`, where each value is a sub-dictionary 
-            containing the calculated 'sbp_std_over_time', 'sbp_range', and 'num_samples'.
-        """
-        drift_info = {}
-
-        for subject_id, sample_ids in self.index_by_subject_id.items():
-            sbps = []
-
-            for sid in sample_ids:
-                sbp = np.squeeze(np.frombuffer(self.lmdbtxn.get(f"{sid}-sbp".encode()), dtype="float32"))
-                sbps.append(sbp)
-            sbps = np.asarray(sbps, dtype=np.float32)
-            
-            if len(sbps) < 2:
-                continue
-
-            drift_info[subject_id] = {
-                "sbp_std_over_time": float(np.std(sbps)),
-                "sbp_range": float(np.max(sbps) - np.min(sbps)),
-                "num_samples": len(sbps)
-            }
-
-        return drift_info
-
-    def drift_aware_train_split(self, train_subjects, train_drift_info):
-        r"""
-        Split training subjects into supervised and meta-learning sets
-        in a drift-aware manner.
-
-        Args:
-            train_subjects (list): subject IDs in training split
-            train_drift_info (dict): subject_id -> {
-                "sbp_std_over_time": float,
-                "drift_regime": "low" | "medium" | "high"
-            }
-
-        Returns:
-            supervised_subjects (list)
-            meta_learning_subjects (list)
-        """
-
-        rng = np.random.default_rng(self.seed)
-
-        # Group subjects by drift regime
-        regime_groups = defaultdict(list)
-        for sid in train_subjects:
-            info = train_drift_info.get(sid)
-            if info is None:
-                raise ValueError(f"Subject {sid} has no drift info")
-            regime = info["drift_regime"]
-            regime_groups[regime].append(sid)
-
-        # Shuffle each regime group for randomness
-        for regime in regime_groups:
-            rng.shuffle(regime_groups[regime])
-
-        total_train = len(train_subjects)
-        target_meta = int(round(self.meta_split_ratio * total_train))
-
-        regimes = ["low", "medium", "high"]
-        per_regime_target = target_meta // 3
-        remainder = target_meta % 3
-
-        meta_subjects = []
-
-        # First pass: equal quota per regime
-        for regime in regimes:
-            available = regime_groups.get(regime, [])
-            take = min(len(available), per_regime_target)
-            meta_subjects.extend(available[:take])
-            regime_groups[regime] = available[take:]
-
-        # Second pass: distribute remainder fairly
-        if remainder > 0:
-            # pool remaining subjects across regimes
-            leftovers = []
-            for regime in regimes:
-                leftovers.extend(regime_groups.get(regime, []))
-
-            rng.shuffle(leftovers)
-            meta_subjects.extend(leftovers[:remainder])
-
-            # Remove taken remainder subjects from regime_groups
-            taken_set = set(meta_subjects)
-            for regime in regimes:
-                regime_groups[regime] = [
-                    s for s in regime_groups.get(regime, []) if s not in taken_set
-                ]
-
-        # Remaining subjects go to supervised learning
-        supervised_subjects = []
-        for remaining in regime_groups.values():
-            supervised_subjects.extend(remaining)
-
-        # Safety checks
-        assert len(meta_subjects) == target_meta
-        assert len(meta_subjects) + len(supervised_subjects) == total_train
-        assert len(set(meta_subjects).intersection(supervised_subjects)) == 0
-
-        return supervised_subjects, meta_subjects
-
-    
     def get_pretraining_samplers(self):
         r"""
         Partitions the pre-training dataset into specialized cohorts for Supervised Learning 
@@ -273,59 +154,12 @@ class PhysioDataset(Dataset):
             test_size=(test_ratio / (val_ratio + test_ratio)), 
             random_state=self.seed
             ) 
-                
-        if self.drift_aware:    
-            train_drift_info = {k: v for k, v in self.subject_drift_info.items() if k in self.pretraining_train_subjects}
         
-            values = np.array([v["sbp_std_over_time"] for v in train_drift_info.values()])
-            q25, q75 = np.percentile(values, [25, 75])
-            
-            for subject_id, info in train_drift_info.items():
-                if info["sbp_std_over_time"] <= q25:
-                    info["drift_regime"] = "low"
-                elif info["sbp_std_over_time"] >= q75:
-                    info["drift_regime"] = "high"
-                else:
-                    info["drift_regime"] = "medium"
-                    
-            self.supervised_pretrain_subjects, self.meta_learning_subjects = self.drift_aware_train_split(
-                self.pretraining_train_subjects,
-                train_drift_info
-            )
-        else:
-            self.supervised_pretrain_subjects, self.meta_learning_subjects = train_test_split(
-                self.pretraining_train_subjects,
-                test_size=self.meta_split_ratio,
-                random_state=self.seed
-            )
-
-        def regime_counts(subjects, drift_info):
-            return Counter(
-                drift_info[s]["drift_regime"]
-                for s in subjects
-                if s in drift_info
-            )
-
-        #print("[PhysioDataset] Meta-learning regimes:", regime_counts(self.meta_learning_subjects, train_drift_info))
-        #print("[PhysioDataset] Supervised regimes:", regime_counts(self.supervised_pretrain_subjects, train_drift_info))
-        
-        #if self.plot:
-        #    plot_drift_regime_counts(
-        #        train_drift_info,
-        #        self.pretraining_train_subjects,
-        #        q25=q25,
-        #        q75=q75,
-        #        title='drift_regime_counts_pretraining_train_split',
-        #        savepath=self.savepath
-        #    )
-        #    
-        #    plot_sbp_drift_distribution(
-        #        train_drift_info,
-        #        self.pretraining_train_subjects,
-        #        title='sbp_drift_distribution_pretraining_train_split',
-        #        savepath=self.savepath
-        #    )
-                
+        self.supervised_pretrain_subjects, self.meta_learning_subjects = train_test_split(
+            self.pretraining_train_subjects,
+            test_size=self.meta_split_ratio,
+            random_state=self.seed
+        )
         
         print("[PhysioDataset] Pretraining subjects per split")
         print(f"\t-# of train subjects: {len(self.pretraining_train_subjects)}")
@@ -357,18 +191,18 @@ class PhysioDataset(Dataset):
         print(f"\t-# of val samples: {len(pretraining_val_sample_ids)}")
         print(f"\t-# of test samples: {len(pretraining_test_sample_ids)}")
         
-        with open('pulse_db_supervised_training_ids', 'w') as pulse_db_file:
-            for item in self.supervised_pretrain_subjects:
-                pulse_db_file.write(f"{item}\n")
-        with open('pulse_db_metalearning_training_ids', 'w') as pulse_db_file:
-            for item in self.meta_learning_subjects:
-                pulse_db_file.write(f"{item}\n")
-        with open('pulse_db_validation_ids', 'w') as pulse_db_file:
-            for item in self.pretraining_val_subjects:
-                pulse_db_file.write(f"{item}\n")
-        with open('pulse_db_test_ids', 'w') as pulse_db_file:
-            for item in self.pretraining_test_subjects:
-                pulse_db_file.write(f"{item}\n")
+        #with open('pulse_db_supervised_training_ids', 'w') as pulse_db_file:
+        #    for item in self.supervised_pretrain_subjects:
+        #        pulse_db_file.write(f"{item}\n")
+        #with open('pulse_db_metalearning_training_ids', 'w') as pulse_db_file:
+        #    for item in self.meta_learning_subjects:
+        #        pulse_db_file.write(f"{item}\n")
+        #with open('pulse_db_validation_ids', 'w') as pulse_db_file:
+        #    for item in self.pretraining_val_subjects:
+        #        pulse_db_file.write(f"{item}\n")
+        #with open('pulse_db_test_ids', 'w') as pulse_db_file:
+        #    for item in self.pretraining_test_subjects:
+        #        pulse_db_file.write(f"{item}\n")
         
         # Plot staticts per split
         if self.plot:
@@ -504,6 +338,18 @@ class PhysioDataset(Dataset):
         ], dim=-1)
 
         return signals, annotation
+    
+    def __del__(self):
+        """
+        Magic method called when the object is destroyed.
+        Explicitly close the LMDB environment and transaction.
+        """
+        # Check if attributes exist to avoid errors during partial initialization
+        if hasattr(self, 'lmdbtxn'):
+            self.lmdbtxn = None 
+        if hasattr(self, 'lmdbenv') and self.lmdbenv is not None:
+            self.lmdbenv.close()
+            self.lmdbenv = None
         
 
 def parseargs():

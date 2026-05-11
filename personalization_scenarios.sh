@@ -1,14 +1,14 @@
 # Personalization
 
-# Ablation Studies on Personalization Scenarios
-experiment_name="gradual_shifts"
+# Personalization Scenarios: Abrupt Shifts & Mixed Shifts (Gradual Shifts is inside the script personalizaiton_proto_ppg.sh)
+experiment_name="personalization_proto_ppg_batch_size_16_abrupt_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 1 \
+    --batch_size 16 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -20,31 +20,28 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm/proto_ppg_percentile_group_layer_norm-Proto-2026_01_06-11_03_38/proto_ppg_percentile_group_layer_norm_best_maml \
-    --pretraining_feats_stats ./checkpoints/proto_ppg_percentile_group_layer_norm/proto_ppg_percentile_group_layer_norm-Proto-2026_01_06-11_03_38/proto_ppg_percentile_group_layer_norm_embedding_stats.npz \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
     --criterion 'SmoothL1Loss' \
-    --personalization_lr 0.01 \
-    --personalization_steps 8 \
-    --personalization_batch_size 16 \
-    --validation_batch_size 16 \
-    --valid_runs_number 1 \
-    --num_train_val 9 \
-    --split_blocks 1 \
+    --personalization_lr 0.005 \
+    --personalization_steps 10 \
+    --personalization_batch_size 4 \
+    --calibration_phase_size 4 \
+    --num_batches 1 \
+    --num_blocks 82 \
     --replay_buffer_size 64 \
-    --replay_batch_size 16 \
     --inner_adapt 'head' \
     --plot_personalization \
     --setup_type 'fixed' \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
-experiment_name="abrupt_shifts"
+experiment_name="personalization_proto_ppg_batch_size_16_mixed_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 1 \
+    --batch_size 16 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -56,18 +53,15 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm/proto_ppg_percentile_group_layer_norm-Proto-2026_01_06-11_03_38/proto_ppg_percentile_group_layer_norm_best_maml \
-    --pretraining_feats_stats ./checkpoints/proto_ppg_percentile_group_layer_norm/proto_ppg_percentile_group_layer_norm-Proto-2026_01_06-11_03_38/proto_ppg_percentile_group_layer_norm_embedding_stats.npz \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
     --criterion 'SmoothL1Loss' \
-    --personalization_lr 0.01 \
-    --personalization_steps 8 \
-    --personalization_batch_size 16 \
-    --validation_batch_size 16 \
-    --valid_runs_number 12 \
-    --num_train_val 1 \
-    --split_blocks 1 \
+    --personalization_lr 0.005 \
+    --personalization_steps 10 \
+    --personalization_batch_size 4 \
+    --calibration_phase_size 4 \
+    --num_batches 9 \
+    --num_blocks 9 \
     --replay_buffer_size 64 \
-    --replay_batch_size 16 \
     --inner_adapt 'head' \
     --plot_personalization \
     --setup_type 'fixed' \

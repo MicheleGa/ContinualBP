@@ -99,10 +99,12 @@ def parseargs():
     parser.add_argument('--eval_steps', default=8, type=int, help='inner steps for meta-learning evaluation')
    
     # Personalization Setup
-    parser.add_argument('--baselines', default=['no_adapt', 'first_batch_finetune', 'online', 'online_from_scratch', 'feature_replay', 'lwf', 'ewc', 'agem'], type=str, nargs='+', help='Baselines to employ for personalization')
+    parser.add_argument('--baselines', default=['no_adapt', 'calibration_only', 'online', 'online_from_scratch', 'feature_replay', 'lwf', 'ewc', 'agem'], type=str, nargs='+', help='Baselines to employ for personalization')
     parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
     parser.add_argument('--pretraining_feats_stats', default=None, type=str, help='path to the features statistics during pretraining')
+    parser.add_argument('--detector_calibration_csv_path', default=None, type=str, help='path to the folder where the calibration results CSV file should be saved')
     parser.add_argument('--num_personalization_subjects', default=0, type=int, help='number of subjects to for personalization')
+    parser.add_argument('--calibration_phase_size', default=4, type=int, help='number of batches for the calibration phase on-device')
     parser.add_argument('--personalization_steps', default=8, type=int, help='number of gradient steps for personalization')
     parser.add_argument('--personalization_lr', default=1e-2, type=float, help='learning rate for personalization')
     parser.add_argument('--plot_personalization', action=argparse.BooleanOptionalAction, default=False, help='whether to plot the subject annotation over the total windows or not')
@@ -110,14 +112,16 @@ def parseargs():
     parser.add_argument('--num_batches', default=2, type=int, help='required number of batches with timestamp-contiguous windows')
     parser.add_argument('--num_blocks', default=2, type=int, help='required number of blocks with timestamp-contiguous windows per subject')
     parser.add_argument('--setup_type', default='fixed', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
-    parser.add_argument('--drift_threshold', default=0.1, type=float, choices=[0.1, 0.2, 0.3, 0.4, 0.5], help='Threshold percentile for drift detector (allowed: 20, 50, 80)')
+    parser.add_argument('--drift_detector_type', default='mmd', type=str, choices=['mmd', 'lsdd'], help='type of drift detector to use for the drift-aware setup')
+    parser.add_argument('--drift_threshold', default=20, type=int, choices=[20, 50, 70, 90, 95], help='Threshold percentile for drift detector (allowed: 20, 50, 80)')
     parser.add_argument('--replay_buffer_size', default=64, type=int, help='maximum size of the feature replay buffer')
     parser.add_argument('--replay_batch_size', default=16, type=int, help='batch size for feature replay')
     parser.add_argument('--lwf_lambda', default=0.01, type=float, help='lambda for LwF distillation loss')
     parser.add_argument('--ewc_lambda', default=10.0, type=float, help='lambda for EWC weight-regulariaztion loss')
-    parser.add_argument('--use_ridge', action=argparse.BooleanOptionalAction, default=False, help='whether to use ridge regression instead of MLP or not')
-    parser.add_argument('--ridge_alphas', default=[0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0], type=float, nargs='+', help='Ridge regression alphas for personalization')
-    
+    parser.add_argument('--detector_window_size', default=2, type=int, help='window size for the drift detector (# of samples)')
+    parser.add_argument('--detector_ert', default=16, type=int, help='ERT target for the drift detector')
+    parser.add_argument('--detector_n_bootstraps', default=1000, type=int, help='number of bootstrap samples for the drift detector')
+   
     args = parser.parse_args()
     return args
 

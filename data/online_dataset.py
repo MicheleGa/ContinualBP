@@ -24,7 +24,8 @@ class OnlineDatasetBase(Dataset):
                  ecg=False, 
                  min_subject_sample_number=0, 
                  plot=False, 
-                 savepath='./figs'):
+                 savepath='./figs',
+                 subject_list=None):
         super(OnlineDatasetBase, self).__init__()
         
         # Generic arguments
@@ -42,6 +43,9 @@ class OnlineDatasetBase(Dataset):
         self.index_by_subject_id:dict = pickle.loads(self.lmdbtxn.get("index_by_subject_id".encode()))
         self.index_by_sample_id = pickle.loads(self.lmdbtxn.get("index_by_sample_id".encode()))
         self.check_subjects_list(min_subject_sample_number=min_subject_sample_number)
+        
+        if subject_list is not None:
+            self.subjects_for_personalization = subject_list
                 
         # Which input data to load (PPG or PPG + ECG), PPG is always loaded
         self.ecg = ecg
@@ -575,9 +579,20 @@ if __name__ == "__main__":
     
     # Choose a suitable value for the number of runs and number of train/val per run so that the number of aptietns is maximized
     # -> find the pareto-frontier
-    A_values = range(1, 25)      # num blocks (abrupt shifts)
-    B_values = range(1, 21)      # num batches (consecutive batches)
-
+    
+    # Setup for batch size = 16
+    if args.personalization_batch_size == 16:
+        A_values = range(1, 25)      # num blocks (abrupt shifts)
+        B_values = range(1, 21)      # num batches (consecutive batches)
+    elif args.personalization_batch_size == 8:
+        A_values = range(1, 46)      # num blocks (abrupt shifts)
+        B_values = range(1, 40)      # num batches (consecutive batches)
+    elif args.personalization_batch_size == 4:
+        A_values = range(1, 84)      # num blocks (abrupt shifts)
+        B_values = range(1, 78)      # num batches (consecutive batches)
+    else:
+        raise ValueError("Unsupported batch size, please add the corresponding A and B ranges to the code")
+    
     results = []
     
     for A in A_values:
@@ -655,7 +670,7 @@ if __name__ == "__main__":
         gradual_shift_stressed,
         savepath=os.path.join(
             root_figs_folder,
-            "pareto_frontier_num_blocks_vs_num_batches.png"
+            f"pareto_frontier_{args.personalization_batch_size}_num_blocks_{args.num_blocks}_vs_num_batches_{args.num_batches}.png"
         )
     )
     

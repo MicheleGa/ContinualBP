@@ -7,11 +7,7 @@ import pandas as pd
 import lmdb
 import torch
 from torch.utils.data import Dataset
-from preprocessing_utils.data_visualization import (
-    plot_subject_sample_distribution, plot_consecutive_block_all, 
-    plot_subject_annotation_blocks, plot_block_length_statistics,
-    plot_pareto_frontier
-)
+from preprocessing_utils.data_visualization import plot_aurora_subject_annotation_blocks, plot_pareto_frontier_aurora
 from online_dataset import OnlineDatasetBase
         
 
@@ -243,6 +239,56 @@ def parseargs():
     return args
 
 
+def pareto_frontier(df):
+    r"""
+    Identifies the Pareto frontier (non-dominated set) from a DataFrame based on 
+    three maximization objectives.
+
+    A row is considered "dominated" if there exists another row that is at least 
+    as good in all objectives and strictly better in at least one. This function 
+    is essential for multi-objective decision making, such as finding the best 
+    performing models across multiple clinical metrics.
+
+    Objectives (all maximized):
+    1.  **N_patients**: Data volume or subject count.
+    2.  **A**: First performance metric (e.g., SBP Accuracy).
+    3.  **B**: Second performance metric (e.g., DBP Accuracy).
+
+    Parameters
+    ------------
+    df (pd.DataFrame): 
+        Input data containing at least the columns "N_patients", "A", and "B".
+
+    Returns
+    ------------
+    output param 1 (pd.DataFrame):
+        A DataFrame containing only the points that lie on the Pareto frontier.
+    """
+    pareto_points = []
+
+    for _, row in df.iterrows():
+        dominated = False
+
+        for _, other in df.iterrows():
+            if (
+                other["N_patients"] >= row["N_patients"] and
+                other["A"] >= row["A"] and
+                other["B"] >= row["B"] and
+                (
+                    other["N_patients"] > row["N_patients"] or
+                    other["A"] > row["A"] or
+                    other["B"] > row["B"]
+                )
+            ):
+                dominated = True
+                break
+
+        if not dominated:
+            pareto_points.append(row)
+
+    return pd.DataFrame(pareto_points)
+
+
 if __name__ == "__main__":
 
     args = parseargs()
@@ -285,17 +331,6 @@ if __name__ == "__main__":
         print(f"Saved {subject_id} runs to ../notebooks/data/{subject_id}_blocks.pkl, exiting")
         exit()
 
-    # Compute runs first
-    all_blocks = []
-    for subj in online_physio_dataset.subjects_for_personalization:
-        blocks = online_physio_dataset.get_subject_blocks(
-            subject_id=subj,
-            batch_size=args.personalization_batch_size,
-            num_batches=args.num_batches,
-            num_blocks=args.num_blocks
-        )
-        all_blocks.append(blocks)
-
     # Plot the Annotation statistics for the runs
     blocks = online_physio_dataset.get_subject_blocks(
         subject_id, 
@@ -304,15 +339,88 @@ if __name__ == "__main__":
         num_blocks=args.num_blocks
     )
     
-    for block in blocks:
+    # Plot the annotation blocks for the selected subject
+    print(f"Plotting annotation blocks for subject {subject_id} with batch size {args.personalization_batch_size}, num_batches {args.num_batches}, num_blocks {args.num_blocks}")
+    plot_aurora_subject_annotation_blocks(online_physio_dataset, subject_id, blocks, savepath=os.path.join(root_figs_folder, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=args.plot)
+    
+    # Trigger __del__
+    del online_physio_dataset
+    
+    # Choose a suitable value for the number of runs and number of train/val per run so that the number of aptietns is maximized
+    # -> find the pareto-frontier
+    
+    # Setup for batch size = 4
+    if args.personalization_batch_size == 4:
+        A_values = range(1, 15)      # num blocks (abrupt shifts)
+        B_values = range(1, 2)      # num batches (consecutive batches)
+    else:
+        raise ValueError("Unsupported batch size, please add the corresponding A and B ranges to the code")
+    
+    results = []
+    
+    for A in A_values:
+        for B in B_values:
+
+            args.num_blocks = A
+            args.num_batches = B
+
+            block_length = args.num_batches * args.personalization_batch_size
             
-        block_idx = block['block_idx']
-        sample_ids = block['sample_ids']
-        print(f"Block {block_idx}")
-        print(f"Sample IDs {sample_ids} ({len(sample_ids)} samples)")
-        
-        for sample_id in sample_ids:
-            signals, targets_,  _ = online_physio_dataset[sample_id]
+            online_physio_dataset = AuroraOnlineSubjectDataset(
+                seed=args.seed,
+                lmdb_folder=os.path.join(args.dataset_folder, args.name),
+                fs=args.fs,
+                input_seq_len_s=args.input_seq_len_s,
+                ecg=args.ecg,
+                savepath=root_figs_folder,
+                batch_size=args.personalization_batch_size,
+                num_batches=args.num_batches,
+                num_blocks=args.num_blocks
+            )
+
+            N = len(online_physio_dataset.subjects_for_personalization)
+
+            results.append({
+                "A": A,
+                "B": B,
+                "N_patients": N
+            })
             
-            print(f"\tSample ID: {sample_id}")
-            print(f"\tSignals shape: {signals.shape}, Targets shape: {targets_.shape} - SBP: {targets_[0]}, DBP: {targets_[1]}, MAP: {targets_[2]}")
+            # Trigger __del__
+            del online_physio_dataset
+
+    
+    # Cvt ot dataframe
+    df = pd.DataFrame(results)
+    
+    # Extract the apreto frontier
+    pareto_df = pareto_frontier(df)
+    
+    feasible_df = df[df["N_patients"] >= 85]
+    pareto_feasible = pareto_df[pareto_df["N_patients"] >= 85].copy()
+    
+    pareto_feasible["balance"] = abs(
+        pareto_feasible["A"] - pareto_feasible["B"]
+    )
+    
+    # Abrupt-shift-stressed: maximize A, then minimize B
+    abrupt_shift_stressed = (
+        pareto_feasible
+        .sort_values(["A", "B"], ascending=[False, True])
+        .iloc[0]
+    )
+
+    # Plot the pareto frontier
+    plot_pareto_frontier_aurora(
+        df,
+        pareto_feasible,
+        abrupt_shift_stressed,
+        savepath=os.path.join(
+            root_figs_folder,
+            f"pareto_frontier_{args.personalization_batch_size}_num_blocks_{args.num_blocks}_vs_num_batches_{args.num_batches}.png"
+        )
+    )
+    
+    print("[Pareto] Selected configurations with at least 85 patients:")
+    print("Abrupt-Shifts Set:")
+    print(abrupt_shift_stressed)
