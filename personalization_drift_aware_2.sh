@@ -1,7 +1,7 @@
 # Drift Aware Personalization
 
-# FeatureDriftDetector with Online MMD w/ reinitialization
-experiment_name="feature_replay_personalization_proto_ppg_calibration_size_4_drift_aware_online_mmd"
+# FeatureDriftDetector with Online LSDD w/ reinitialization
+experiment_name="feature_replay_personalization_proto_ppg_calibration_size_4_drift_aware_online_lsdd"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
@@ -32,10 +32,9 @@ python personalization.py \
     --inner_adapt 'head' \
     --plot_personalization \
     --setup_type 'drift' \
-    --drift_detector_type 'mmd' \
-    --detector_window_size 4 \
-    --detector_ert 32 \
+    --drift_detector_type 'lsdd' \
+    --detector_window_size 3 \
+    --detector_ert 64 \
     --detector_n_bootstraps 500 \
     --baselines "feature_replay" \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
-

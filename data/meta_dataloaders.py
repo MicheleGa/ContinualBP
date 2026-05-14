@@ -62,9 +62,9 @@ class MetaTaskDataset(Dataset):
         - Return ((X_s, Y_s), (X_q, Y_q), patient_id)
     Implementation steps:
       1) Remove patients with fewer than k_support + k_query samples
-      2) Precompute chronological runs per patient using timestamps in LMDB
-      3) Remove runs shorter than k_support + k_query
-      4) Remove patients without any valid runs
+      2) Precompute chronological blocks per patient using timestamps in LMDB
+      3) Remove blocks shorter than k_support + k_query
+      4) Remove patients without any valid blocks
       5) At sampling time: choose a run and a chronological slice
     """
     def __init__(
@@ -73,7 +73,7 @@ class MetaTaskDataset(Dataset):
         patient_ids: List[str],
         k_support: int = 8,
         k_query: int = 8,
-        window_length: int = 10,   # seconds (used to determine contiguous runs)
+        window_length: int = 10,   # seconds (used to determine contiguous blocks)
     ):
         super().__init__()
         self.ds = base_dataset
@@ -101,23 +101,23 @@ class MetaTaskDataset(Dataset):
             # else: excluded
         print(f"[MetaTaskDataset] {len(filtered_patients)} patients remain after filtering by total samples >= {self.total_needed}.")
 
-        # 2) Precompute runs for each remaining patient
-        runs_by_patient = {}
+        # 2) Precompute blocks for each remaining patient
+        blocks_by_patient = {}
         for pid in filtered_patients:
             sample_ids = list(self.index_by_subject_id.get(pid))
-            runs = self.find_consecutive_runs(sample_ids, window_length=self.window_length)
+            blocks = self.find_consecutive_blocks(sample_ids)
             
-            # Filter runs by minimum length requirement
-            valid_runs = [r for r in runs if r["length"] >= self.total_needed]
-            if len(valid_runs) > 0:
-                runs_by_patient[pid] = valid_runs
-            # else: patient will be excluded (no runs long enough)
-        print(f"[MetaTaskDataset] {len(runs_by_patient)} patients remain after filtering runs by length >= {self.total_needed}.")
+            # Filter blocks by minimum length requirement
+            valid_blocks = [r for r in blocks if r["length"] >= self.total_needed]
+            if len(valid_blocks) > 0:
+                blocks_by_patient[pid] = valid_blocks
+            # else: patient will be excluded (no blocks long enough)
+        print(f"[MetaTaskDataset] {len(blocks_by_patient)} patients remain after filtering blocks by length >= {self.total_needed}.")
 
-        # 3) Remove patients without valid runs
-        self.patient_ids = sorted([pid for pid, patient_runs in runs_by_patient.items() if len(patient_runs) > 0])
-        self.runs_by_patient = {pid: runs_by_patient[pid] for pid in self.patient_ids}
-        print(f"[MetaTaskDataset] {len(self.patient_ids)} patients remain after final filtering by the number of runs per patient.")
+        # 3) Remove patients without valid blocks
+        self.patient_ids = sorted([pid for pid, patient_blocks in blocks_by_patient.items() if len(patient_blocks) > 0])
+        self.blocks_by_patient = {pid: blocks_by_patient[pid] for pid in self.patient_ids}
+        print(f"[MetaTaskDataset] {len(self.patient_ids)} patients remain after final filtering by the number of blocks per patient.")
         
         if len(self.patient_ids) == 0:
             raise ValueError(
@@ -128,7 +128,7 @@ class MetaTaskDataset(Dataset):
         # For debug/visibility
         print(f"[MetaTaskDataset] Initialized with {len(self.patient_ids)} patients (k_support={self.k_support}, k_query={self.k_query}).")
 
-    def find_consecutive_runs(self, sample_list, window_length):
+    def find_consecutive_blocks(self, sample_list):
         r"""
         Identifies and groups segments of samples that form a continuous, 
         uninterrupted chronological sequence.
@@ -144,94 +144,106 @@ class MetaTaskDataset(Dataset):
         Returns
         ------------
         output param 1 (list):
-            A list of dictionaries, where each dictionary represents a continuous run. 
+            A list of dictionaries, where each dictionary represents a continuous block. 
             Keys include 'start_idx', 'end_idx', 'length', 'start_time', 'end_time', 
             and the ordered 'sample_ids'.
         """
+        
         if sample_list is None:
             return []
 
-        samples = list(sample_list)
-        n = len(samples)
-        if n == 0:
+        # Ensure a list copy
+        sample_ids = list(sample_list)
+        if len(sample_ids) == 0:
             return []
 
-        valid_samples = []
+        starts = []
+        ends = []
 
-        # Expect PhysioDataset to expose an opened LMDB transaction as `lmdbtxn`
+        # Load timestamps preserving sample_id order
         lmdbtxn = getattr(self.ds, "lmdbtxn")
-        if lmdbtxn is None:
-            # If PhysioDataset doesn't expose a transaction, raise a clear error.
-            raise RuntimeError("[MetaTaskDataset] PhysioDataset must expose `lmdbtxn` (an open LMDB transaction) for timestamp reads.")
+        for sid in sample_ids:
 
-        # Read timestamps for each sample. Keep those with valid timestamps.
-        for sid in samples:
-            key = f"{sid}-timestamp".encode()
-            raw = lmdbtxn.get(key)
+            raw = lmdbtxn.get(f"{sid}-timestamp".encode())
             if raw is None:
-                raise ValueError(f"[MetaTaskDataset] Sample {sid} missing timestamp in LMDB.")
+                raise ValueError(f"Missing timestamp for sample {sid}")
+
             ts = np.squeeze(np.frombuffer(raw, dtype="float32"))
             if ts.size == 0:
-                raise ValueError(f"[MetaTaskDataset] Sample {sid} has empty timestamp in LMDB.")
-            valid_samples.append((sid, float(ts[0]), float(ts[-1])))
+                raise ValueError(f"Empty timestamp for sample {sid}")
 
-        if len(valid_samples) == 0:
+            starts.append(float(ts[0]))
+            ends.append(float(ts[-1]))
+
+        if len(starts) == 0 or len(ends) == 0:
             return []
+        
+        # Preserve original ordering from sample_list
+        # some subjects exhibit subsets of sample dis with different sample ids 
+        # but same start time
+        starts = np.array(starts)
+        ends = np.array(ends)
 
-        # Unpack and sort by start time
-        sample_ids = [x[0] for x in valid_samples]
-        starts = np.array([x[1] for x in valid_samples], dtype=float)
-        ends = np.array([x[2] for x in valid_samples], dtype=float)
+        blocks = []
 
-        order = np.argsort(starts)
-        sorted_ids = [sample_ids[i] for i in order]
-        sorted_starts = starts[order]
-        sorted_ends = ends[order]
+        block_start = 0
 
-        # Single-window case -> single run
-        if len(sorted_starts) <= 1:
-            return [{
-                "start_idx": 0,
-                "end_idx": 0,
-                "length": 1,
-                "start_time": float(sorted_starts[0]),
-                "end_time": float(sorted_ends[0]),
-                "sample_ids": [sorted_ids[0]]
-            }]
+        # Remove window_length from signature, or make it drive the threshold:
+        gap_threshold = 0.5  # seconds; end-to-start gap above this implies a removed-artifact boundary
+        for i in range(len(sample_ids) - 1):
 
-        # Compute diffs of consecutive START times
-        diffs = np.diff(sorted_starts)
+            current_end = ends[i]
+            next_start = starts[i + 1]
 
-        # Threshold: if gap between starts larger than window_length + 0.5s -> break
-        threshold = float(window_length) + 0.5
+            # --------------------------------------------------
+            # CASE 1:
+            # timestamp reset -> new monitoring session
+            # --------------------------------------------------
+            if next_start <= starts[i]:
 
-        runs = []
-        run_start = 0
-        for i, gap in enumerate(diffs):
-            if gap > threshold:
-                run_end = i
-                runs.append({
-                    "start_idx": run_start,
-                    "end_idx": run_end,
-                    "length": run_end - run_start + 1,
-                    "start_time": float(sorted_starts[run_start]),
-                    "end_time": float(sorted_ends[run_end]),
-                    "sample_ids": sorted_ids[run_start:run_end+1]
+                block_end = i
+                blocks.append({
+                    "start_idx": block_start,
+                    "end_idx": block_end,
+                    "length": block_end - block_start + 1,
+                    "start_time": starts[block_start],
+                    "end_time": ends[block_end],
+                    "sample_ids": sample_ids[block_start:block_end + 1]
                 })
-                run_start = i + 1
+                block_start = i + 1
+                continue
 
-        # Add last run
-        if run_start <= len(sorted_ids) - 1:
-            runs.append({
-                "start_idx": run_start,
-                "end_idx": len(sorted_ids) - 1,
-                "length": len(sorted_ids) - run_start,
-                "start_time": float(sorted_starts[run_start]),
-                "end_time": float(sorted_ends[-1]),
-                "sample_ids": sorted_ids[run_start:]
-            })
+            # --------------------------------------------------
+            # CASE 2:
+            # gap between end of current window and start of next
+            # exceeds threshold → artifact removal created a discontinuity
+            # --------------------------------------------------
+            gap = next_start - current_end
 
-        return runs
+            if gap > gap_threshold:
+
+                block_end = i
+                blocks.append({
+                    "start_idx": block_start,
+                    "end_idx": block_end,
+                    "length": block_end - block_start + 1,
+                    "start_time": starts[block_start],
+                    "end_time": ends[block_end],
+                    "sample_ids": sample_ids[block_start:block_end + 1]
+                })
+                block_start = i + 1
+
+        # Final block
+        blocks.append({
+            "start_idx": block_start,
+            "end_idx": len(sample_ids) - 1,
+            "length": len(sample_ids) - block_start,
+            "start_time": starts[block_start],
+            "end_time": ends[-1],
+            "sample_ids": sample_ids[block_start:]
+        })
+
+        return blocks
 
     def _sample_indices_for_patient(self, pid: str) -> Tuple[List[int], List[int]]:
         r"""
@@ -260,18 +272,18 @@ class MetaTaskDataset(Dataset):
             query_ids: A list of sample IDs representing the "future" evaluation 
             data for the task.
         """
-        runs = self.runs_by_patient.get(pid)
-        if not runs:
-            raise ValueError(f"No valid runs for patient {pid} at sampling time.")
+        blocks = self.blocks_by_patient.get(pid)
+        if not blocks:
+            raise ValueError(f"No valid blocks for patient {pid} at sampling time.")
 
-        # choose a run randomly among valid runs (reproducible via self.rng)
-        run = self.rng.choice(runs)
+        # choose a run randomly among valid blocks (reproducible via self.rng)
+        run = self.rng.choice(blocks)
         sample_ids = run["sample_ids"]
         run_len = len(sample_ids)
         total_needed = self.total_needed
 
         if run_len < total_needed:
-            # This should not happen because we filtered runs by length >= total_needed at init,
+            # This should not happen because we filtered blocks by length >= total_needed at init,
             # but double-check to be safe.
             raise ValueError(f"Chosen run is too short for patient {pid} (run_len={run_len} < needed={total_needed})")
         

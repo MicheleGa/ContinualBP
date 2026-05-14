@@ -4,6 +4,7 @@ folders_to_add = ['data']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import pyCompare
 from sklearn.metrics import r2_score
@@ -223,7 +224,7 @@ def plot_r_squared(gt, pd, name='', save_path='./figs/', figsize=(10, 8)):
     plt.close()
 
 
-def bhs_grade(differences, thresholds=[5, 10, 15], title=''):
+def     bhs_grade(differences, thresholds=[5, 10, 15], title=''):
     r"""
     Calculates the BHS grade for a list of blood pressure differences.
 
@@ -249,13 +250,20 @@ def bhs_grade(differences, thresholds=[5, 10, 15], title=''):
     print(f'{title}:\n\t\t {within_5}% \t {within_10}% \t {within_15}%')
     
     if within_5 >= 60 and within_10 >= 85 and within_15 >= 95:
-        return "A"
+        grade = "A"
     elif within_5 >= 50 and within_10 >= 75 and within_15 >= 90:
-        return "B"
+        grade = "B"
     elif within_5 >= 40 and within_10 >= 65 and within_15 >= 85:
-        return "C"
+        grade = "C"
     else:
-        return "D"
+        grade = "D"
+
+    return {
+        "grade": grade,
+        "within_5": within_5,
+        "within_10": within_10,
+        "within_15": within_15,
+    }
     
 
 def aami_grade(differences, mean_threshold=5, std_dev_threshold=8):
@@ -280,12 +288,18 @@ def aami_grade(differences, mean_threshold=5, std_dev_threshold=8):
     std_dev = np.std(differences)
 
     if abs(mean_diff) <= mean_threshold and std_dev <= std_dev_threshold:
-        return "Acceptable"
+        grade = "Acceptable"
     else:
-        return "Unacceptable"
+        grade = "Unacceptable"
+
+    return {
+        "grade": grade,
+        "mean": mean_diff,
+        "std": std_dev,
+    }
     
 
-def call_metric(targets, outputs, config, figure_savepath, plot=False):
+def call_metric(targets, outputs, config, figure_savepath, log_savepath=None, plot=False):
     r"""
     Evaluates blood pressure estimation performance by calculating regression losses, 
     clinical standards (BHS/AAMI), and generating statistical validation plots.
@@ -303,6 +317,9 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
         
     figure_savepath (str): 
         The directory path where generated Bland-Altman and R² plots will be saved.
+    
+    log_savepath (str, optional): 
+        The directory path where the metrics results will be saved as CSVs.
         
     plot (bool): 
         Flag to determine whether to generate and save visualization plots.
@@ -369,14 +386,73 @@ def call_metric(targets, outputs, config, figure_savepath, plot=False):
             name='DBP',
             save_path=os.path.join(figure_savepath, 'dbp_r_squared_coefficient.jpg')
         )
+    
+    # ---- R² ----
+    sbp_r2 = r2_score(targets_sbp_values, outputs_sbp_values)
+    dbp_r2 = r2_score(targets_dbp_values, outputs_dbp_values)
 
     # ---- STANDARDS ----
-    print(f'BHS standard grade for SBP: {bhs_grade(sbp_errors, title="SBP")}')
-    print(f'BHS standard grade for DBP: {bhs_grade(dbp_errors, title="DBP")}')
-    print(f'AAMI grade for SBP: {aami_grade(sbp_errors)}')
-    print(f'AAMI grade for DBP: {aami_grade(dbp_errors)}')
+    sbp_bhs = bhs_grade(sbp_errors, title="SBP")
+    dbp_bhs = bhs_grade(dbp_errors, title="DBP")
 
-    return metrics
+    sbp_aami = aami_grade(sbp_errors)
+    dbp_aami = aami_grade(dbp_errors)
+
+    print(f'BHS standard grade for SBP: {sbp_bhs["grade"]}')
+    print(f'BHS standard grade for DBP: {dbp_bhs["grade"]}')
+
+    print(f'AAMI grade for SBP: {sbp_aami["grade"]}')
+    print(f'AAMI grade for DBP: {dbp_aami["grade"]}')
+
+    # ---- SAVE METRICS CSV ----
+    metrics_df = pd.DataFrame([
+        {
+            "Type": "SBP",
+
+            # AAMI
+            "ME": sbp_aami["mean"],
+            "STD": sbp_aami["std"],
+            "AAMI_Grade": sbp_aami["grade"],
+
+            # BHS
+            "BHS_Grade": sbp_bhs["grade"],
+            "Pct_<=5": sbp_bhs["within_5"],
+            "Pct_<=10": sbp_bhs["within_10"],
+            "Pct_<=15": sbp_bhs["within_15"],
+
+            # R^2
+            "R2": sbp_r2,
+        },
+
+        {
+            "Type": "DBP",
+
+            # AAMI
+            "ME": dbp_aami["mean"],
+            "STD": dbp_aami["std"],
+            "AAMI_Grade": dbp_aami["grade"],
+
+            # BHS
+            "BHS_Grade": dbp_bhs["grade"],
+            "Pct_<=5": dbp_bhs["within_5"],
+            "Pct_<=10": dbp_bhs["within_10"],
+            "Pct_<=15": dbp_bhs["within_15"],
+
+            # R^2
+            "R2": dbp_r2,
+        }
+    ])
+
+    if log_savepath is not None:
+
+        csv_path = os.path.join(
+            log_savepath,
+            "evaluation_metrics.csv"
+        )
+        metrics_df.to_csv(csv_path, index=False)
+        print(f"Metrics CSV saved to: {csv_path}")
+
+    return metrics, metrics_df
 
 
 def compute_transfer_metrics_from_matrix(errors_matrix):

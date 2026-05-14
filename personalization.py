@@ -27,6 +27,7 @@ if __name__ == "__main__":
     checkpoint_path = os.path.join("./checkpoints/", args.expname, run_name)
     tensorboard_path = os.path.join("./tensorboard/", args.expname, run_name)
     figure_path = os.path.join("./figs/", args.expname, run_name)
+    logs_path = os.path.join("./logs/", args.expname, run_name)
 
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
@@ -38,6 +39,7 @@ if __name__ == "__main__":
     print(f'Checkpoint folder: {checkpoint_path}')
     print(f'Tensorboard folder: {tensorboard_path}')
     print(f'Figure folder: {figure_path}')
+    print(f'Logs folder: {logs_path}')
 
     # Load configuration into a dict
     config = dict()
@@ -46,6 +48,7 @@ if __name__ == "__main__":
     config['checkpoint_path'] = checkpoint_path
     config['tensorboard_path'] = tensorboard_path
     config['figure_path'] = figure_path
+    config['logs_path'] = logs_path
 
     print('Configuration for the run:')
     pprint.pprint(config, width=1)

@@ -1,8 +1,7 @@
 import os
 import sys
-folders_to_add = ['models']
-for folder in folders_to_add:
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
+from collections import defaultdict
+from statistics import mean
 import argparse
 import time
 import yaml
@@ -11,8 +10,8 @@ import numpy as np
 import random
 import torch
 import torch.nn.functional as F
-from models import BIOT, TCN, Proto, ResGruNet
-from models.component_factory import BPRegressor
+from deployment.Proto import Proto
+from deployment.deployment_component_factory import BPRegressor
 
 
 def parseargs():
@@ -320,36 +319,7 @@ def get_encoder_architecture(config):
     """
     encoder = None
     
-    if config['model_name'] == 'ResGruNet':   
-        encoder = ResGruNet.ResGruNet(
-            ecg=config['ecg'], 
-            fs=config['fs'], 
-            input_seq_len_s=config['input_seq_len_s'],
-            embed_dim=config['embed_dim']
-        )
-    elif config['model_name'] == 'TCN':
-        input_size = 2 if config['ecg'] else 1
-        input_length = config['input_seq_len_s'] * config['fs']
-        output_size = config['embed_dim']
-        channel_sizes = [input_size, 16, 32, 48, 64, 96, output_size]
-        kernel_size = [7] * 7                           
-        
-        encoder = TCN.TCN(
-            input_size=input_size,
-            output_size=output_size,
-            channel_sizes=channel_sizes,
-            kernel_size=kernel_size,
-            input_length=input_length
-        )
-    elif config['model_name'] == 'BIOT':
-        encoder = BIOT.BIOT(
-            ecg=config['ecg'],
-            fs=config['fs'],
-            input_seq_len_s=config['input_seq_len_s'],
-            embed_dim=config['embed_dim'],
-            pretrained_path=config['pretrained_encoder_ckpt_path']
-        )
-    elif config['model_name'] == 'Proto':
+    if config['model_name'] == 'Proto':
         encoder = Proto.Proto(
             ecg=config['ecg'], 
             fs=config['fs'], 
@@ -680,3 +650,75 @@ def compute_embedding_stats(encoder, dataloader, device):
     std = np.std(all_embs, axis=0)
     std[std == 0] = np.finfo(np.float32).eps
     return mean, std
+
+
+def flatten_profiling_report(report):
+    r"""
+    Flattens the profiling report into a CSV-friendly dictionary.
+    Per-step arrays are summarized using averages.
+    """
+
+    flat = {}
+
+    # calibration
+    flat['calibration_time_s'] = report.get('calibration_time_s', 0.0)
+
+    # per-step summaries
+    per_step = report.get('per_step', {})
+
+    for key, value in per_step.items():
+        if isinstance(value, list):
+            if len(value) == 0:
+                flat[f'{key}_mean'] = 0.0
+            elif isinstance(value[0], bool):
+                flat[f'{key}_mean'] = float(np.mean(value))
+            else:
+                flat[f'{key}_mean'] = float(np.mean(value))
+
+            flat[f'{key}_sum'] = float(np.sum(value)) if len(value) > 0 else 0.0
+            flat[f'{key}_count'] = len(value)
+
+    # final metrics
+    final_keys = [
+        'peak_memory_mb',
+        'n_steps',
+        'n_adaptations',
+        'adaptation_rate',
+        'total_tta_time_s',
+        'total_prediction_time_s',
+        'total_feature_extraction_time_s',
+        'total_drift_detection_time_s',
+        'total_adaptation_time_s',
+        'estimated_time_if_always_adapted_s',
+        'time_saved_by_drift_detection_s'
+    ]
+
+    for key in final_keys:
+        flat[key] = report.get(key, 0.0)
+
+    return flat
+
+
+
+def aggregate_profiling_reports(reports):
+    r"""
+    Aggregates multiple profiling reports across subjects.
+    """
+
+    if len(reports) == 0:
+        return {}
+
+    aggregate = defaultdict(list)
+
+    for report in reports:
+        flat = flatten_profiling_report(report)
+
+        for key, value in flat.items():
+            aggregate[key].append(value)
+
+    summary = {}
+
+    for key, values in aggregate.items():
+        summary[key] = float(mean(values))
+
+    return summary

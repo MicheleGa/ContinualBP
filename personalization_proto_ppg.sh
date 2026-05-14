@@ -30,7 +30,6 @@ python personalization.py \
     --num_blocks 1 \
     --replay_buffer_size 64 \
     --inner_adapt 'head' \
-    --plot_personalization \
     --setup_type 'fixed' \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
@@ -64,7 +63,6 @@ python personalization.py \
     --num_blocks 1 \
     --replay_buffer_size 64 \
     --inner_adapt 'head' \
-    --plot_personalization \
     --setup_type 'fixed' \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 

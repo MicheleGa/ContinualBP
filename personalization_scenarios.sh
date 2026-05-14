@@ -1,7 +1,7 @@
 # Personalization
 
 # Personalization Scenarios: Abrupt Shifts & Mixed Shifts (Gradual Shifts is inside the script personalizaiton_proto_ppg.sh)
-experiment_name="personalization_proto_ppg_batch_size_16_abrupt_shifts"
+experiment_name="personalization_proto_ppg_calibration_size_4_abrupt_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
@@ -34,7 +34,7 @@ python personalization.py \
     --setup_type 'fixed' \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
-experiment_name="personalization_proto_ppg_batch_size_16_mixed_shifts"
+experiment_name="personalization_proto_ppg_calibration_size_4_mixed_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \

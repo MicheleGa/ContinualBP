@@ -5,6 +5,8 @@ import pprint
 import numpy as np
 import pandas as pd
 import lmdb
+import multiprocessing
+from functools import partial
 import torch
 from torch.utils.data import Dataset
 from preprocessing_utils.data_visualization import (
@@ -168,20 +170,19 @@ class OnlineDatasetBase(Dataset):
         ], dim=-1)
 
         return signals, annotation, timestamp
-        
+
 
 class OnlineSubjectDataset(OnlineDatasetBase):
     def __init__(self, batch_size, num_batches, num_blocks, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.filter_subjects_by_min_block_length(
-            window_length=kwargs['input_seq_len_s'], 
             batch_size=batch_size,
             num_batches=num_batches,
             num_blocks=num_blocks
         )
 
-    def find_consecutive_blocks(self, sample_list, window_length):
+    def find_consecutive_blocks(self, sample_list):
         r"""
         Identifies and groups segments of samples that form a continuous, 
         uninterrupted chronological sequence.
@@ -201,96 +202,104 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             Keys include 'start_idx', 'end_idx', 'length', 'start_time', 'end_time', 
             and the ordered 'sample_ids'.
         """
+        
         if sample_list is None:
             return []
 
         # Ensure a list copy
-        samples = list(sample_list)
-        n = len(samples)
-        if n == 0:
+        sample_ids = list(sample_list)
+        if len(sample_ids) == 0:
             return []
 
-        starts = np.zeros(n, dtype=float)
-        ends = np.zeros(n, dtype=float)
-        valid_samples = []
-        
-        # Read timestamps for each sample. Keep those with valid timestamps.
-        for i, sid in enumerate(samples):
-            key = f"{sid}-timestamp".encode()
-            raw = self.lmdbtxn.get(key)
+        starts = []
+        ends = []
+
+        # Load timestamps preserving sample_id order
+        for sid in sample_ids:
+
+            raw = self.lmdbtxn.get(f"{sid}-timestamp".encode())
             if raw is None:
-                # Skip samples without timestamps
-                raise ValueError("Found a sample without timestamp. Exiting ...")
+                raise ValueError(f"Missing timestamp for sample {sid}")
+
             ts = np.squeeze(np.frombuffer(raw, dtype="float32"))
             if ts.size == 0:
-                # Skip samples with empty timestamps
-                raise ValueError("Found a sample with an empty timestamp. Exiting ...")
-            
-            valid_samples.append((sid, float(ts[0]), float(ts[-1])))
-        
-        if len(valid_samples) == 0:
+                raise ValueError(f"Empty timestamp for sample {sid}")
+
+            starts.append(float(ts[0]))
+            ends.append(float(ts[-1]))
+
+        if len(starts) == 0 or len(ends) == 0:
             return []
-
-        # Unpack and sort by start time
-        sample_ids = [x[0] for x in valid_samples]
-        starts = np.array([x[1] for x in valid_samples], dtype=float)
-        ends = np.array([x[2] for x in valid_samples], dtype=float)
-
-        order = np.argsort(starts)
-        sorted_ids = [sample_ids[i] for i in order]
-        sorted_starts = starts[order]
-        sorted_ends = ends[order]
         
-        # Compute diffs between consecutive START times
-        if len(sorted_starts) <= 1:
-            # Single window -> a single run
-            return [{
-                "start_idx": 0,
-                "end_idx": 0,
-                "length": 1,
-                "start_time": float(sorted_starts[0]),
-                "end_time": float(sorted_ends[0]),
-                "sample_ids": [sorted_ids[0]]
-            }]
+        # Preserve original ordering from sample_list
+        # some subjects exhibit subsets of sample dis with different sample ids 
+        # but same start time
+        starts = np.array(starts)
+        ends = np.array(ends)
 
-        diffs = np.diff(sorted_starts)
-        # Consider only strictly positive diffs for median (just in case of duplicated timestamps)
-        
-        # Estimate a reasonable threshold to decide when a gap separates runs:
-        # the gap exists between two consecutive windows if diff is greater then the window length plus a small delta (0.5)
-        # if the end of a window and the ebginning of the next one is more then half-a second delta, then there is a gap 
-        threshold = float(window_length) + 0.5
-
-        # Group into blocks: whenever gap > threshold we cut the block
         blocks = []
+
         block_start = 0
-        for i, gap in enumerate(diffs):
-            if gap > threshold:
+
+        # Remove window_length from signature, or make it drive the threshold:
+        gap_threshold = 0.5  # seconds; end-to-start gap above this implies a removed-artifact boundary
+        for i in range(len(sample_ids) - 1):
+
+            current_end = ends[i]
+            next_start = starts[i + 1]
+
+            # --------------------------------------------------
+            # CASE 1:
+            # timestamp reset -> new monitoring session
+            # --------------------------------------------------
+            if next_start <= starts[i]:
+
                 block_end = i
                 blocks.append({
                     "start_idx": block_start,
                     "end_idx": block_end,
                     "length": block_end - block_start + 1,
-                    "start_time": float(sorted_starts[block_start]),
-                    "end_time": float(sorted_ends[block_end]),
-                    "sample_ids": sorted_ids[block_start:block_end+1]
+                    "start_time": starts[block_start],
+                    "end_time": ends[block_end],
+                    "sample_ids": sample_ids[block_start:block_end + 1]
+                })
+                block_start = i + 1
+                continue
+
+            # --------------------------------------------------
+            # CASE 2:
+            # gap between end of current window and start of next
+            # exceeds threshold → artifact removal created a discontinuity
+            # --------------------------------------------------
+            gap = next_start - current_end
+
+            if gap > gap_threshold:
+
+                block_end = i
+                blocks.append({
+                    "start_idx": block_start,
+                    "end_idx": block_end,
+                    "length": block_end - block_start + 1,
+                    "start_time": starts[block_start],
+                    "end_time": ends[block_end],
+                    "sample_ids": sample_ids[block_start:block_end + 1]
                 })
                 block_start = i + 1
 
-        # Add last block if it exists
-        if block_start <= len(sorted_ids) - 1:
-            blocks.append({
-                "start_idx": block_start,
-                "end_idx": len(sorted_ids) - 1,
-                "length": len(sorted_ids) - block_start,
-                "start_time": float(sorted_starts[block_start]),
-                "end_time": float(sorted_ends[-1]),
-                "sample_ids": sorted_ids[block_start:]
-            })
+        # Final block
+        blocks.append({
+            "start_idx": block_start,
+            "end_idx": len(sample_ids) - 1,
+            "length": len(sample_ids) - block_start,
+            "start_time": starts[block_start],
+            "end_time": ends[-1],
+            "sample_ids": sample_ids[block_start:]
+        })
 
         return blocks
+    
 
-    def filter_subjects_by_min_block_length(self, window_length, batch_size, num_batches, num_blocks):
+    def filter_subjects_by_min_block_length(self, batch_size, num_batches, num_blocks):
         r"""
         Filters subjects based on:
         1. Block length sufficient to contain `num_batches * batch_size` windows.
@@ -300,8 +309,6 @@ class OnlineSubjectDataset(OnlineDatasetBase):
 
         Parameters
         ----------
-        window_length : int
-            Length of each input window in seconds.
         batch_size : int
             Number of windows in each batch.
         num_batches : int
@@ -325,7 +332,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
                 continue
 
             # 1) Identify raw blocks of consecutive windows for this subject (without trimming yet)
-            blocks = self.find_consecutive_blocks(sample_ids, window_length)
+            blocks = self.find_consecutive_blocks(sample_ids)
 
             valid_blocks = []
             kept_sample_ids = []
@@ -353,7 +360,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
                 continue
 
             # 4) Keep only chronologically ordered subset of valid samples
-            kept_sample_ids = sorted(set(kept_sample_ids))
+            kept_sample_ids = list(dict.fromkeys(kept_sample_ids))
             self.index_by_subject_id[subj] = kept_sample_ids
 
         # Remove subjects without enough valid blocks
@@ -366,7 +373,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         print(f"[Filtering] Subjects remaining: {len(self.subjects_for_personalization)} (removed {len(subjects_to_remove)})")
 
 
-    def get_subject_blocks(self, subject_id, window_length, batch_size: int = 16, num_batches: int = 3, num_blocks: int = 3):
+    def get_subject_blocks(self, subject_id, batch_size: int = 16, num_batches: int = 3, num_blocks: int = 3):
         r"""
         Build subject blocks using fixed interleaved adaptation/validation windows.
 
@@ -390,7 +397,7 @@ class OnlineSubjectDataset(OnlineDatasetBase):
         index_list = list(self.index_by_subject_id[subject_id])
 
         # Collect valid block indices
-        blocks = self.find_consecutive_blocks(index_list, window_length)
+        blocks = self.find_consecutive_blocks(index_list)
         
         # Skip blocks shorter than required minimum (should not happen as get_subject_blocks should be called after the initial filtering of subjects)
         if len(blocks) < num_blocks:
@@ -437,6 +444,37 @@ class OnlineSubjectDataset(OnlineDatasetBase):
             self.lmdbenv = None
 
 
+def evaluate_config(config_params, args):
+    """
+    Worker function to evaluate a single (A, B) configuration.
+    """
+    A, B = config_params
+    
+    # Instantiate the dataset (this opens its own LMDB env in this process)
+    ds = OnlineSubjectDataset(
+        seed=args.seed,
+        lmdb_folder=os.path.join(args.dataset_folder, args.name),
+        fs=args.fs,
+        input_seq_len_s=args.input_seq_len_s,
+        ecg=args.ecg,
+        savepath=os.path.join(args.save_path, args.name),
+        batch_size=args.personalization_batch_size,
+        num_batches=B,
+        num_blocks=A
+    )
+
+    n_patients = len(ds.subjects_for_personalization)
+    
+    # Explicitly cleanup to ensure LMDB environment is closed
+    del ds
+    
+    return {
+        "A": A,
+        "B": B,
+        "N_patients": n_patients
+    }
+    
+    
 def pareto_frontier(df):
     r"""
     Identifies the Pareto frontier (non-dominated set) from a DataFrame based on 
@@ -528,7 +566,7 @@ if __name__ == "__main__":
         num_batches=args.num_batches,
         num_blocks=args.num_blocks
     )
-    
+  
     # Notice that at this point subjects with insufficient runs have been removed
     subject_id = online_physio_dataset.subjects_for_personalization[1] # random.choice(list(online_physio_dataset.index_by_subject_id))
     print(f"Subject selected {subject_id}")
@@ -554,7 +592,7 @@ if __name__ == "__main__":
     all_blocks = []
     for subj in online_physio_dataset.subjects_for_personalization:
         index_list = list(online_physio_dataset.index_by_subject_id[subj])
-        blocks = online_physio_dataset.find_consecutive_blocks(index_list, args.input_seq_len_s)
+        blocks = online_physio_dataset.find_consecutive_blocks(index_list)
         all_blocks.append(blocks)
 
     # Plot distribution across all subjects
@@ -593,44 +631,27 @@ if __name__ == "__main__":
     else:
         raise ValueError("Unsupported batch size, please add the corresponding A and B ranges to the code")
     
-    results = []
-    
-    for A in A_values:
-        for B in B_values:
+    # 1. Prepare the list of all configurations to test
+    configs = [(A, B) for A in A_values for B in B_values]
 
-            args.num_blocks = A
-            args.num_batches = B
+    print(f"Starting parallel evaluation of {len(configs)} configurations...")
 
-            block_length = args.num_batches * args.personalization_batch_size
-            
-            online_physio_dataset = OnlineSubjectDataset(
-                seed=args.seed,
-                lmdb_folder=os.path.join(args.dataset_folder, args.name),
-                fs=args.fs,
-                input_seq_len_s=args.input_seq_len_s,
-                ecg=args.ecg,
-                savepath=root_figs_folder,
-                batch_size=args.personalization_batch_size,
-                num_batches=args.num_batches,
-                num_blocks=args.num_blocks
-            )
+    # 2. Use multiprocessing Pool
+    # We use 'spawn' or 'forkserver' on some systems for better LMDB/CUDA stability
+    # num_workers can be set to multiprocessing.cpu_count()
+    num_workers = args.loader_worker
 
-            N = len(online_physio_dataset.subjects_for_personalization)
+    # partial is used to pass the 'args' object to every worker call
+    worker_func = partial(evaluate_config, args=args)
 
-            results.append({
-                "A": A,
-                "B": B,
-                "N_patients": N
-            })
-            
-            # Trigger __del__
-            del online_physio_dataset
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        # pool.map maintains order, ensuring results align with expectations
+        results = pool.map(worker_func, configs)
 
-    
-    # Cvt ot dataframe
+    # 3. Convert to dataframe and continue with Pareto analysis as before
     df = pd.DataFrame(results)
     
-    # Extract the apreto frontier
+    # 4. Extract the pareto frontier
     pareto_df = pareto_frontier(df)
     
     feasible_df = df[df["N_patients"] >= 85]
@@ -661,7 +682,7 @@ if __name__ == "__main__":
         .iloc[0]
     )
     
-    # Plot the pareto frontier
+    # 5. Plot the pareto frontier
     plot_pareto_frontier(
         df,
         pareto_feasible,
@@ -670,7 +691,7 @@ if __name__ == "__main__":
         gradual_shift_stressed,
         savepath=os.path.join(
             root_figs_folder,
-            f"pareto_frontier_{args.personalization_batch_size}_num_blocks_{args.num_blocks}_vs_num_batches_{args.num_batches}.png"
+            f"pareto_frontier_{args.personalization_batch_size}.png"
         )
     )
     

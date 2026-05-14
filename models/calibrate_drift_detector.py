@@ -21,21 +21,29 @@ from data.online_dataset import OnlineSubjectDataset
 from data.preprocessing_utils.data_visualization import plot_subject_annotation_blocks, plot_drift_calibration_summary, plot_param_updates
     
 
-def subject_calibration_with_feature_replay(baseline, dataset, subject_id, subj_dir, calibration_phase_size, ert, window_size, n_bootstraps, writer, device, config):
+def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, calibration_phase_size, ert, window_size, n_bootstraps, writer, device, config):
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
     
-    if config['plot_personalization']:
-        # Plot subject blocks and SBP/DBP/MAP drifts
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
+    
+    # Set stream kwargs based on the dataset and optionally
+    # plot subject blocks and SBP/DBP/MAP drifts
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
+    
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -61,7 +69,7 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, subj_
     enc, ph = pretrained_learner.encoder.to(device), pretrained_learner.prediction_head.to(device)
 
     # Feature replay buffer
-    replay_buffer = ReservoirReplayBuffer(max_size=config['replay_buffer_size'])
+    replay_buffer = ReservoirReplayBuffer(seed=config['seed'], max_size=config['replay_buffer_size'])
     
     # Prepare data structures for evaluation  w/ online TTA
     
@@ -100,12 +108,7 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, subj_
     step_idx = 0
     
     # ---- PERSONALIZATION ----
-    for batch_info in dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        ):
+    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
         # CALIBRATION PHASE 
         if calibration_phase_size > 0 and step_idx < calibration_phase_size:
@@ -483,9 +486,9 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, subj_
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -508,18 +511,18 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, subj_
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
     
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
@@ -532,7 +535,7 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, subj_
         dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
         
         plot_fname = f"ert{ert}_w{window_size}_detector_summary.png"
-        plot_path  = os.path.join(baseline_path, plot_fname)
+        plot_path  = os.path.join(figs_baseline_path, plot_fname)
     
         plot_drift_calibration_summary(
             targets_log=targets_log,
@@ -647,14 +650,18 @@ def calibrate_drift_detector(config, device):
                     for subject_counter, subject_id in enumerate(test_subjects):
                         
                         try:
-                            subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
-                            os.makedirs(subj_dir, exist_ok=True)
+                            figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
+                            os.makedirs(figs_subj_dir, exist_ok=True)
+                            
+                            logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}")
+                            os.makedirs(logs_subj_dir, exist_ok=True)
                             
                             stats = subject_calibration_with_feature_replay(
                                 baseline='feature_replay',
                                 dataset=online_physio_dataset,
                                 subject_id=subject_id,
-                                subj_dir=subj_dir,
+                                figs_subj_dir=figs_subj_dir,
+                                logs_subj_dir=logs_subj_dir, 
                                 calibration_phase_size=calibration_phase_size,
                                 ert=ert,
                                 window_size=window_size,
@@ -712,3 +719,5 @@ def calibrate_drift_detector(config, device):
     df.sort_values("ert_relative_error", inplace=True, ascending=True)
     save_path = os.path.join(config['detector_calibration_csv_path'], f"{config['drift_detector_type']}_calibration_results.csv")
     df.to_csv(save_path, index=False)
+    
+    print(f'[Drift Detection] Drift dector calibration completed! results saved at {save_path} ')

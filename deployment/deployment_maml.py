@@ -1,5 +1,3 @@
-# All credits for this file to the wonderful Learn2Learn library: https://github.com/learnables/learn2learn/tree/master
-
 import traceback
 import torch
 from torch import nn

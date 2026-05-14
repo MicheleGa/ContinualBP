@@ -1,7 +1,7 @@
-# Drift Aware Personalization
+# Personalization
 
-# FeatureDriftDetector with Online MMD w/ reinitialization
-experiment_name="feature_replay_personalization_proto_ppg_calibration_size_4_drift_aware_online_mmd"
+# PPG head only adaptation
+experiment_name="pixel_feature_replay_deployment_drift"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
@@ -11,7 +11,7 @@ python Proto.py \
     --batch_size 16 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
-python personalization.py \
+python deployment_personalization.py \
     --model models.Proto \
     --dataset_name pulse_db_vital_db_percentile \
     --expname "$experiment_name" \
@@ -37,5 +37,5 @@ python personalization.py \
     --detector_ert 32 \
     --detector_n_bootstraps 500 \
     --baselines "feature_replay" \
+    --use_pixel \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
-

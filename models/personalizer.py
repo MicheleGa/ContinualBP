@@ -77,8 +77,8 @@ def eval_model_on_sample_set(encoder, prediction_head, dataset, sample_list, dev
     encoder.eval()
     prediction_head.eval()
     with torch.no_grad():
-        for i in range(0, len(sample_list), B):
-            batch_ids = sample_list[i:i + B]
+        for eval_idx in range(0, len(sample_list), B):
+            batch_ids = sample_list[eval_idx:eval_idx + B]
             batch = [dataset.__getitem__(sid) for sid in batch_ids]
 
             signals = torch.stack([s for s, _, _ in batch]).to(device)
@@ -119,7 +119,7 @@ def eval_model_on_sample_set(encoder, prediction_head, dataset, sample_list, dev
     )
     
 
-def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Performs the 'no adapt' personalization baseline by evaluating a pretrained model across 
     sequential data blocks without updating weights to establish a performance floor.
@@ -135,8 +135,11 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific results and plots.
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
         
     writer (SummaryWriter): 
         TensorBoard logger for tracking metrics during the personalization process.
@@ -162,49 +165,30 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -391,9 +375,9 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -416,25 +400,25 @@ def personalize_no_adapt(baseline, dataset, subject_id, subj_dir, writer, device
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
     
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Executes the 'Calibration-only' personalization baseline where the model adapts 
     once to the first available data block (or the first block exceeding a drift threshold) 
@@ -451,9 +435,11 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
-        
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.    
     writer (SummaryWriter): 
         TensorBoard logger for tracking training and validation loss during the one-time adaptation.
         
@@ -478,49 +464,30 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -640,6 +607,7 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
             
             # During calibration, depending on the device resources, either all model parameters 
             # or only the head parameters can be updated 
+            calibration_features = None
             if config['inner_adapt'] == 'all':
                 
                 # Update also encoder: trian first with head for calibration and then predict feats for detector init
@@ -764,9 +732,9 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -789,25 +757,25 @@ def personalize_calibration_only(baseline, dataset, subject_id, subj_dir, writer
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
 
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
         
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics
 
 
-def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Executes the 'Online' personalization baseline where the model continuously adapts to new 
     data blocks as they arrive, either at every step or based on a drift detection trigger.
@@ -823,9 +791,12 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
-        
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
+            
     writer (SummaryWriter): 
         TensorBoard logger for tracking training and validation loss for each online adaptation step.
         
@@ -850,49 +821,30 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:   
+        blocks = dataset.get_subject_blocks(**stream_kwargs) 
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -1011,7 +963,8 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
             )
             
             # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
+            # or only the head parameters can be updated
+            calibration_features = None 
             if config['inner_adapt'] == 'all':
                 
                 # Update also encoder: trian first with head for calibration and then predict feats for detector init
@@ -1192,9 +1145,9 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -1217,25 +1170,25 @@ def personalize_online(baseline, dataset, subject_id, subj_dir, writer, device, 
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
     
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Executes the 'Online From Scratch' personalization baseline. Unlike the 'online' 
     baseline, this method begins with a randomly initialized (fresh) model and 
@@ -1252,9 +1205,12 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
-        
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
+            
     writer (SummaryWriter): 
         TensorBoard logger for tracking training and validation loss for each online adaptation step.
         
@@ -1279,49 +1235,30 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize encoder and prediction head (fresh weights)
     encoder_fresh = get_encoder_architecture(config)
@@ -1584,9 +1521,9 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -1609,27 +1546,27 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, subj_dir, wri
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
     
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
     
-def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
-    Executes the 'Feature Replay' personalization Cl algorithm that mitigates catastrophic 
+    Executes the 'Feature Replay' personalization CL algorithm that mitigates catastrophic 
     forgetting by storing previously seen latent features in a reservoir buffer and 
     interleaving them with current data during adaptation.
     
@@ -1644,8 +1581,11 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
         
     writer (SummaryWriter): 
         TensorBoard logger for tracking training and validation loss during the adaptation steps.
@@ -1671,49 +1611,30 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
         
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -1739,7 +1660,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     enc, ph = pretrained_learner.encoder.to(device), pretrained_learner.prediction_head.to(device)
 
     # Feature replay buffer
-    replay_buffer = ReservoirReplayBuffer(max_size=config['replay_buffer_size'])
+    replay_buffer = ReservoirReplayBuffer(seed=config['seed'], max_size=config['replay_buffer_size'])
     
     # Prepare data structures for evaluation  w/ online TTA
     
@@ -1838,6 +1759,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
             
             # During calibration, depending on the device resources, either all model parameters 
             # or only the head parameters can be updated 
+            calibration_features = None
             if config['inner_adapt'] == 'all':
                 
                 # Update also encoder: trian first with head for calibration and then predict feats for detector init
@@ -1968,15 +1890,15 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
         
         if config['setup_type'] == 'drift':
             # Detect data drifts with detector
-            for i in range(features.shape[0]):
+            for feat_idx in range(features.shape[0]):
                 # Add batch dimension before prediction
-                detection_report = drift_detector.predict(features[i].cpu().numpy())
+                detection_report = drift_detector.predict(features[feat_idx].cpu().numpy())
                 drift_flag = detection_report["data"]["is_drift"]
 
                 # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
                 if drift_detector.t >= config['detector_window_size']:
                     if drift_flag == 1:
-                        global_window_idx = step_idx * config['personalization_batch_size'] + i
+                        global_window_idx = step_idx * config['personalization_batch_size'] + feat_idx
                         detection_timesteps.append(global_window_idx)
                         do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
         
@@ -2124,7 +2046,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
         past_batches.append(sample_ids)
         
         # ---------- Evaluate on ALL PREVIOUS batches (for BWT/AE) ----------
-        for i, past_ids in enumerate(past_batches):
+        for idx, past_ids in enumerate(past_batches):
 
             sbp_mae_i, sbp_std_i, dbp_mae_i, dbp_std_i, outs_i, tgts_i = eval_model_on_sample_set(
                     enc, ph, dataset,
@@ -2133,8 +2055,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx - config['calibration_phase_size'], idx] = sbp_mae_i
+            dbp_errors_matrix[step_idx - config['calibration_phase_size'], idx] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -2146,9 +2068,9 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -2171,18 +2093,18 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
     
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
@@ -2194,7 +2116,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
         dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
         
         plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
-        plot_path  = os.path.join(baseline_path, plot_fname)
+        plot_path  = os.path.join(figs_baseline_path, plot_fname)
     
         plot_drift_calibration_summary(
             targets_log=targets_log,
@@ -2214,7 +2136,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, subj_dir, writer, 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Executes the 'Learning without Forgetting' (LwF) personalization CL algorithm. This approach 
     combines a standard supervised loss on new data with a distillation loss that 
@@ -2232,8 +2154,11 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
         
     writer (SummaryWriter): 
         TensorBoard logger for tracking total loss, distillation loss, and validation performance.
@@ -2259,49 +2184,30 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -2424,6 +2330,7 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
             
             # During calibration, depending on the device resources, either all model parameters 
             # or only the head parameters can be updated 
+            calibration_features = None
             if config['inner_adapt'] == 'all':
                 
                 # Update also encoder: trian first with head for calibration and then predict feats for detector init
@@ -2619,9 +2526,9 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -2644,25 +2551,25 @@ def personalize_lwf(baseline, dataset, subject_id, subj_dir, writer, device, con
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
 
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Executes the 'Elastic Weight Consolidation' (EWC) personalization CL algorithm. This approach slows 
     down learning on weights that are important for previous data blocks by adding a quadratic penalty based on the Fisher Information Matrix.
@@ -2678,9 +2585,12 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
-        
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
+            
     writer (SummaryWriter): 
         TensorBoard logger for tracking training loss (including EWC penalty) and validation loss.
         
@@ -2705,49 +2615,30 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -2872,6 +2763,7 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
             
             # During calibration, depending on the device resources, either all model parameters 
             # or only the head parameters can be updated 
+            calibration_features = None
             if config['inner_adapt'] == 'all':
                 
                 # Update also encoder: trian first with head for calibration and then predict feats for detector init
@@ -3089,9 +2981,9 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -3114,25 +3006,25 @@ def personalize_ewc(baseline, dataset, subject_id, subj_dir, writer, device, con
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
 
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, config):
+def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
     r"""
     Executes the 'Averaged Gradient Episodic Memory' (A-GEM) personalization CL algorithm. 
     This method ensures that the update gradient for the current data block does not 
@@ -3151,8 +3043,11 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     subject_id (int/str): 
         The unique identifier for the subject being personalized.
         
-    subj_dir (str): 
-        The root directory for saving subject-specific logs, CSVs, and visualization plots.
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
         
     writer (SummaryWriter): 
         TensorBoard logger for tracking training loss and gradient projection events.
@@ -3178,49 +3073,30 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
         A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
     """
     # ---- INITIALIZATION ----
-    baseline_path = os.path.join(subj_dir, baseline)
-    os.makedirs(baseline_path, exist_ok=True)
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
     
     # Set stream kwargs based on the dataset and optionally
     # plot subject blocks and SBP/DBP/MAP drifts
-    stream_kwargs = None
-    if 'aurora' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, 
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        stream_kwargs = dict(
-            subject_id=subject_id,
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-
-        if config['plot_personalization']:    
-            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
     
-    elif 'vital_db' in config['dataset_name'].lower():
-        blocks = dataset.get_subject_blocks(
-            subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
         
-        stream_kwargs = dict(
-            subject_id=subject_id, window_length=config['input_seq_len_s'],
-            batch_size=config['personalization_batch_size'],
-            num_batches=config['num_batches'],
-            num_blocks=config['num_blocks']
-        )
-        
-        if config['plot_personalization']:
-            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(subj_dir, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
-    else:
-        raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
@@ -3246,7 +3122,7 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     enc, ph = pretrained_learner.encoder.to(device), pretrained_learner.prediction_head.to(device)
     
     # Feature replay buffer
-    replay_buffer = ReservoirReplayBuffer(max_size=config.get('replay_buffer_size'))
+    replay_buffer = ReservoirReplayBuffer(seed=config['seed'], max_size=config['replay_buffer_size'])
     
     # Prepare data structures for evaluation  w/ online TTA
     
@@ -3343,6 +3219,7 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
             
             # During calibration, depending on the device resources, either all model parameters 
             # or only the head parameters can be updated 
+            calibration_features = None
             if config['inner_adapt'] == 'all':
                 
                 # Update also encoder: trian first with head for calibration and then predict feats for detector init
@@ -3571,9 +3448,9 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
-    sbp_df_err.to_csv(os.path.join(baseline_path, "sbp_error_matrix.csv"), index=False)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
     dbp_df_err = pd.DataFrame(dbp_errors_matrix)
-    dbp_df_err.to_csv(os.path.join(baseline_path, "dbp_error_matrix.csv"), index=False)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
         
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
@@ -3596,18 +3473,18 @@ def personalize_agem(baseline, dataset, subject_id, subj_dir, writer, device, co
     # Save update logs per baseline
     df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(baseline_path, "param_update_log.csv")
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
     df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(baseline_path, "param_updates.png")
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
     plot_param_updates(df_updates, subject_id, plot_path)
 
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(baseline_path, "targets_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
     with open(log_json_path, "w") as f:
         json.dump(targets_log, f)
     
-    log_json_path = os.path.join(baseline_path, "predictions_log.json")
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
@@ -3689,9 +3566,13 @@ def personalization(tensorboard_path, config, device):
     }
     
     # Create aggregate directory
-    agg_dir = os.path.join(config['figure_path'], 'aggregate_metrics')
-    if not os.path.exists(agg_dir):
-        os.makedirs(agg_dir)
+    figs_agg_dir = os.path.join(config['figure_path'], 'aggregate_metrics')
+    if not os.path.exists(figs_agg_dir):
+        os.makedirs(figs_agg_dir)
+    
+    logs_agg_dir = os.path.join(config['logs_path'], 'aggregate_metrics')
+    if not os.path.exists(logs_agg_dir):
+        os.makedirs(logs_agg_dir)
         
     if config['setup_type'] == 'drift':
         print(f"[Personalization] Personalization performed with feature-based drift detection")
@@ -3699,8 +3580,11 @@ def personalization(tensorboard_path, config, device):
     for subject_counter, subject_id in enumerate(personalization_subjects):
         print(f"[Personalization] {subject_counter + 1}/{len(personalization_subjects)} personalizing model on subject {subject_id}")
         
-        subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
-        os.makedirs(subj_dir, exist_ok=True)
+        figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
+        os.makedirs(figs_subj_dir, exist_ok=True)
+        
+        logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}")
+        os.makedirs(logs_subj_dir, exist_ok=True)
         
         # Setup Tensorboard
         writer = SummaryWriter(log_dir=os.path.join(tensorboard_path, f"subject_{subject_id}"))
@@ -3719,7 +3603,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir,
                     writer=writer,
                     device=device, 
                     config=config
@@ -3729,7 +3614,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir, 
                     writer=writer,
                     device=device, 
                     config=config
@@ -3739,7 +3625,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir, 
                     writer=writer,
                     device=device, 
                     config=config
@@ -3749,7 +3636,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir, 
                     writer=writer,
                     device=device, 
                     config=config
@@ -3759,7 +3647,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir,
                     writer=writer,
                     device=device, 
                     config=config
@@ -3769,7 +3658,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir, 
                     writer=writer,
                     device=device, 
                     config=config
@@ -3779,7 +3669,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir,
                     writer=writer,
                     device=device, 
                     config=config
@@ -3789,7 +3680,8 @@ def personalization(tensorboard_path, config, device):
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
-                    subj_dir=subj_dir, 
+                    figs_subj_dir=figs_subj_dir,
+                    logs_subj_dir=logs_subj_dir,
                     writer=writer,
                     device=device, 
                     config=config
@@ -3808,28 +3700,24 @@ def personalization(tensorboard_path, config, device):
         if outs_and_tgts is None:
             raise ValueError("Outputs and targets for a subject cannot be None ...")
 
-        subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
-        if not os.path.exists(subj_dir):
-            os.makedirs(subj_dir)
-
-        # --- Save baseline_metrics as CSV (AA and BWT per baseline) ---
+        # --- Save baseline_metrics as CSV (AE and BWT per baseline) ---
         sbp_df_metrics = pd.DataFrame.from_dict(sbp_baseline_metrics, orient='index')
-        sbp_csv_path = os.path.join(subj_dir, f'subject_{subject_id}_sbp_baseline_metrics.csv')
+        sbp_csv_path = os.path.join(logs_subj_dir, f'subject_{subject_id}_sbp_baseline_metrics.csv')
         sbp_df_metrics.to_csv(sbp_csv_path, index=True)
         dbp_df_metrics = pd.DataFrame.from_dict(dbp_baseline_metrics, orient='index')
-        dbp_csv_path = os.path.join(subj_dir, f'subject_{subject_id}_dbp_baseline_metrics.csv')
+        dbp_csv_path = os.path.join(logs_subj_dir, f'subject_{subject_id}_dbp_baseline_metrics.csv')
         dbp_df_metrics.to_csv(dbp_csv_path, index=True)
         print(f"[Personalization] Saved SBP/DBP baseline metrics CSV to {sbp_csv_path} ✓")
 
         # Plot and save MAE per block using the standalone function
-        plot_blockwise_mae(per_block_stats=per_block_stats, subject_id=subject_id, index_to_plot='sbp', savepath=os.path.join(subj_dir, f'subject_{subject_id}_sbp_blockwise_mae.png'))
-        plot_blockwise_mae(per_block_stats=per_block_stats, subject_id=subject_id, index_to_plot='dbp', savepath=os.path.join(subj_dir, f'subject_{subject_id}_dbp_blockwise_mae.png'))
+        plot_blockwise_mae(per_block_stats=per_block_stats, subject_id=subject_id, index_to_plot='sbp', savepath=os.path.join(figs_subj_dir, f'subject_{subject_id}_sbp_blockwise_mae.png'))
+        plot_blockwise_mae(per_block_stats=per_block_stats, subject_id=subject_id, index_to_plot='dbp', savepath=os.path.join(figs_subj_dir, f'subject_{subject_id}_dbp_blockwise_mae.png'))
 
         # ---- Call metric plots for each baseline ----
         for b, (outs, tgts) in outs_and_tgts.items():
             if outs.shape[0] > 0:
                 print(f"[Personalization] {subject_counter + 1}/{len(personalization_subjects)} Results for {subject_id} with baseline {b}")
-                call_metric(tgts, outs, config, os.path.join(subj_dir, b), plot=True)
+                call_metric(tgts, outs, config, figure_savepath=os.path.join(figs_subj_dir, b), log_savepath=os.path.join(logs_subj_dir, b), plot=True)
                 # append to global for aggregated metrics later
                 if b in global_outs_and_tgts:
                     global_outs_and_tgts[b].append((outs, tgts))
@@ -3838,9 +3726,9 @@ def personalization(tensorboard_path, config, device):
         # Using only SBP as DBP is the same
         updates_per_baseline = {}
         for b in baselines:
-            updates_log = pd.read_csv(os.path.join(subj_dir, b, 'param_update_log.csv'))
+            updates_log = pd.read_csv(os.path.join(logs_subj_dir, b, 'param_update_log.csv'))
             updates_per_baseline[b] = (updates_log['n_updated_params'] > 0).sum()
-        update_fig_path = os.path.join(subj_dir, f"subject_{subject_id}_update_summary.png")
+        update_fig_path = os.path.join(figs_subj_dir, f"subject_{subject_id}_update_summary.png")
         plot_update_summary_table(updates_per_baseline, update_fig_path)
         print(f"[Personalization] Saved update summary figure for subject {subject_id} ✓")
 
@@ -3849,10 +3737,10 @@ def personalization(tensorboard_path, config, device):
         if config['num_personalization_subjects'] > 0 and subject_counter > config['num_personalization_subjects']:
             break
 
-    # ---- Aggregate AA and BWT across subjects ----
+    # ---- Aggregate AE and BWT across subjects ----
     all_metrics_sbp = {b: {"AE": [], "BWT": []} for b in global_outs_and_tgts.keys()}
     for subject_id in personalization_subjects:
-        subj_csv = os.path.join(config['figure_path'], f"subject_{subject_id}", f"subject_{subject_id}_sbp_baseline_metrics.csv")
+        subj_csv = os.path.join(config['logs_path'], f"subject_{subject_id}", f"subject_{subject_id}_sbp_baseline_metrics.csv")
         if os.path.exists(subj_csv):
             df = pd.read_csv(subj_csv, index_col=0)
             for b in df.index:
@@ -3863,7 +3751,7 @@ def personalization(tensorboard_path, config, device):
                     
     all_metrics_dbp = {b: {"AE": [], "BWT": []} for b in global_outs_and_tgts.keys()}
     for subject_id in personalization_subjects:
-        subj_csv = os.path.join(config['figure_path'], f"subject_{subject_id}", f"subject_{subject_id}_dbp_baseline_metrics.csv")
+        subj_csv = os.path.join(config['logs_path'], f"subject_{subject_id}", f"subject_{subject_id}_dbp_baseline_metrics.csv")
         if os.path.exists(subj_csv):
             df = pd.read_csv(subj_csv, index_col=0)
             for b in df.index:
@@ -3885,7 +3773,7 @@ def personalization(tensorboard_path, config, device):
             print(f'\t- BWT: {bwt_mean:.4f} ± {bwt_std:.4f}')
 
     sbp_df_agg = pd.DataFrame(sbp_agg_rows)
-    sbp_agg_csv_path = os.path.join(agg_dir, 'sbp_aggregate_baseline_metrics.csv')
+    sbp_agg_csv_path = os.path.join(logs_agg_dir, 'sbp_aggregate_baseline_metrics.csv')
     sbp_df_agg.to_csv(sbp_agg_csv_path, index=False)
     
     dbp_agg_rows = []
@@ -3900,7 +3788,7 @@ def personalization(tensorboard_path, config, device):
             print(f'\t- BWT: {bwt_mean:.4f} ± {bwt_std:.4f}')
 
     dbp_df_agg = pd.DataFrame(dbp_agg_rows)
-    dbp_agg_csv_path = os.path.join(agg_dir, 'dbp_aggregate_baseline_metrics.csv')
+    dbp_agg_csv_path = os.path.join(logs_agg_dir, 'dbp_aggregate_baseline_metrics.csv')
     dbp_df_agg.to_csv(dbp_agg_csv_path, index=False)
 
     # ---- Aggregate call_metric across subjects ----
@@ -3909,8 +3797,14 @@ def personalization(tensorboard_path, config, device):
             print(f'[Personalization] Aggregated personalization results (BHS/AAMI/Bland-Altman/R²) for the baseline {b}')
             all_outs = np.concatenate([o for o, _ in data_list], axis=0)
             all_tgts = np.concatenate([t for _, t in data_list], axis=0)
-            call_metric(all_tgts, all_outs, config, os.path.join(agg_dir, f"aggregate_{b}_metrics"), plot=True)
+            
+            aggregated_metric_fig_path = os.path.join(figs_agg_dir, f"aggregate_{b}_metrics")
+            os.makedirs(aggregated_metric_fig_path, exist_ok=True)
+            aggregated_metric_log_path = os.path.join(logs_agg_dir, f"aggregate_{b}_metrics")
+            os.makedirs(aggregated_metric_log_path, exist_ok=True)
+            
+            call_metric(all_tgts, all_outs, config, figure_savepath=aggregated_metric_fig_path, log_savepath=aggregated_metric_log_path, plot=True)
 
-    print(f"[Personalization] Saved aggregated metrics to {agg_dir} ✓")
+    print(f"[Personalization] Saved aggregated metrics to {figs_agg_dir} and {logs_agg_dir} ✓")
 
     print(f"[Personalization] Personalization completed ✓")

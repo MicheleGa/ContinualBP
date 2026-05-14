@@ -1019,7 +1019,7 @@ def plot_block_length_statistics(dataset, savepath='./data_figs', keep_longest=F
     block_lengths_by_subject = {}
 
     for subj in dataset.subjects_for_personalization:
-        blocks = dataset.find_consecutive_blocks(dataset.index_by_subject_id[subj], dataset.input_seq_len_s)
+        blocks = dataset.find_consecutive_blocks(dataset.index_by_subject_id[subj])
         lengths = [b["length"] for b in blocks]
 
         if not lengths:
@@ -1074,7 +1074,7 @@ def plot_meta_dataset_run_distribution(meta_ds, dataset_name="train", savepath='
     ----------
     meta_ds : MetaTaskDataset
         The MetaTaskDataset instance (train, val, or test) containing
-        the precomputed 'runs_by_patient' dictionary.
+        the precomputed 'blocks_by_patient' dictionary.
 
     dataset_name : str, optional
         Name of the dataset split (e.g., "train", "val", "test").
@@ -1085,8 +1085,8 @@ def plot_meta_dataset_run_distribution(meta_ds, dataset_name="train", savepath='
         Default is 10 (i.e., bins like 1-10, 11-20, etc.).
     """
     # Extract number of runs per patient
-    patient_ids = list(meta_ds.runs_by_patient.keys())
-    num_runs = np.array([len(meta_ds.runs_by_patient[pid]) for pid in patient_ids], dtype=int)
+    patient_ids = list(meta_ds.blocks_by_patient.keys())
+    num_runs = np.array([len(meta_ds.blocks_by_patient[pid]) for pid in patient_ids], dtype=int)
 
     if len(num_runs) == 0:
         raise ValueError("No patient runs found in the provided MetaTaskDataset.")

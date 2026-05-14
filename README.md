@@ -210,8 +210,18 @@ python -m venv venv
 source ./venv/bin/activate
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 pip install numpy==1.24.3 matplotlib==3.9.2 scikit-learn==1.6.1 seaborn==0.13.2 pandas==1.5.3 markdown==3.4.1 tensorboard==2.17.0
-pip install netron==8.1.5 thop torchinfo==1.8.0 pyCompare lmdb pyampd wfdb==4.0.0 
-pip install PyWavelets==1.5.0 EMD-signal==1.6.4 einops linear_attention_transformer mat73 transformers learn2learn neuorkit2==0.2.12
+pip install thop torchinfo==1.8.0 pyCompare lmdb pyampd wfdb==4.0.0 
+pip install PyWavelets==1.5.0 EMD-signal==1.6.4 einops mat73 neurokit2==0.2.12 PyYAML transformers linear_attention_transformer
+```
+
+For deployment on Raspberry Pi/Google Pixel
+
+```bash
+python -m venv venv
+source ./venv/bin/activate
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+pip install numpy==1.24.3 matplotlib==3.9.2 scikit-learn==1.6.1 seaborn==0.13.2 pandas==1.5.3 markdown==3.4.1
+pip install thop torchinfo==1.8.0 pyCompare PyYAML tqdm
 ```
 
 ## Data Provisioning & Preprocessing

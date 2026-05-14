@@ -7,6 +7,7 @@ for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import shutil
 import json
+import pickle
 import argparse
 import re
 import yaml
@@ -20,19 +21,54 @@ from thop import profile
 from models.Proto import Proto
 from models.component_factory import BPRegressor
 
+def plot_blood_pressure_results(subject_id, baseline_outputs, baseline_targets):
+    """
+    Flattens batched SBP/DBP arrays and plots time series comparison.
+    """
+    # 1. Concatenate the list of numpy arrays into single continuous arrays
+    # Each array is shape (Batch, 2), where index 0 is SBP and index 1 is DBP
+    preds = np.concatenate(baseline_outputs, axis=0)
+    targets = np.concatenate(baseline_targets, axis=0)
 
-def analyze_logs_and_plot(log_file_path, fig_root, exp_fig_root, exp_drift_aware_fig_root):
+    # 2. Extract SBP and DBP columns
+    sbp_pred, dbp_pred = preds[:, 0], preds[:, 1]
+    sbp_true, dbp_true = targets[:, 0], targets[:, 1]
+
+    # 3. Create the plot
+    plt.figure(figsize=(14, 7))
+    
+    # Plot SBP
+    plt.plot(sbp_true, label='SBP Target', color='royalblue', 
+             linestyle='-', marker='o', markersize=4, alpha=0.7)
+    plt.plot(sbp_pred, label='SBP Prediction', color='navy', 
+             linestyle='--', marker='s', markersize=4, alpha=0.8)
+    
+    # Plot DBP
+    plt.plot(dbp_true, label='DBP Target', color='salmon', 
+             linestyle='-', marker='o', markersize=4, alpha=0.7)
+    plt.plot(dbp_pred, label='DBP Prediction', color='darkred', 
+             linestyle='--', marker='s', markersize=4, alpha=0.8)
+
+    # Formatting
+    plt.title(f'SBP/DBP Time Series {subject_id}: Ground Truth vs Prediction', fontsize=14)
+    plt.xlabel('Time Step (Samples)', fontsize=12)
+    plt.ylabel('Pressure (mmHg)', fontsize=12)
+    plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0))
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.tight_layout()
+    
+    plt.show()
+
+def analyze_logs_and_plot(
+    log_file_path, 
+    fig_root, 
+    exp_fig_root, 
+    exp_pi_deployment_drift_aware_fig_root
+):
     
     print("[Log Analysis] Analyzing log files ...")
     for baseline_name in [
-        #'no_adapt',
-        #'first_batch_finetune',
-        #'online',
-        #'online_from_scratch',
         'feature_replay',
-        #'lwf',
-        #'ewc',
-        #'agem'
     ]:
         baseline_fig_root = os.path.join(fig_root, baseline_name)
         if os.path.exists(baseline_fig_root):
@@ -164,6 +200,8 @@ def analyze_logs_and_plot(log_file_path, fig_root, exp_fig_root, exp_drift_aware
         
         subject_drift_scores   = {}   # median |Δ SBP| per subject
         subject_updates_drift  = {}   # drift-aware update count per subject
+        total_drift_unaware_updates = 0
+        total_drift_aware_updates = 0
         
         for subject in personalization_subjects:
             # Get number of updates without drift detection
@@ -176,51 +214,54 @@ def analyze_logs_and_plot(log_file_path, fig_root, exp_fig_root, exp_drift_aware
             df_updates = pd.read_csv(exp_param_log_path)
             exp_num_updates = (df_updates["n_updated_params"] > 0).sum()
             
-            # Get number of updates with drift detection
-            exp_drift_param_log_path = os.path.join(
-                exp_drift_aware_fig_root,
+            # Get number of updates with drift detection on Pi
+            subject_results_path = os.path.join(
+                exp_pi_deployment_drift_aware_fig_root,
                 f"subject_{subject}",
                 baseline_name,
-                "param_update_log.csv"
+                f"results_from_pi_{subject}.pkl"
             )
-            df_updates_drift = pd.read_csv(exp_drift_param_log_path)
-            exp_drift_num_updates = (df_updates_drift["n_updated_params"] > 0).sum()
+            with open(subject_results_path, "rb") as f:
+                subject_results = pickle.load(f)
             
+            baseline_outputs, baseline_targets, prof = subject_results
+            
+            if False: 
+                plot_blood_pressure_results(subject, baseline_outputs=baseline_outputs, baseline_targets=baseline_targets)
+    
+            exp_drift_num_updates = prof["n_adaptations"]
+           
+            for k, v in prof.items():
+                print(k, v)
             print(f"[Log Analysis] Updates for subject {subject} (non-drift vs drift) {exp_num_updates} - {exp_drift_num_updates}")
-            
+        
             # Get targets for drift calculation
             # -> same for either drift non-aware and drift-aware
-            exp_targets_log_path = os.path.join(
-                exp_fig_root,
-                f"subject_{subject}",
-                baseline_name,
-                "targets_log.json"
-            )
-            with open(exp_targets_log_path, "r") as f:
-                targets_log = json.load(f)
                 
             # -------------------------------------------------------
             # Aggregate SBP values and compute first-order derivative
             # -------------------------------------------------------
             # Compute diff within each batch to avoid artificial jumps
             # at batch boundaries, then pool all intra-batch deltas.
-            sbp_deltas = []
-            for log in targets_log:
-                sbp_batch = np.array(log['sbp_values'], dtype=float)
-                if len(sbp_batch) > 1:
-                    sbp_deltas.extend(np.diff(sbp_batch).tolist())
+            all_sbp = np.concatenate([
+                np.asarray(tgt[:, 0], dtype=float)
+                for tgt in baseline_targets
+                if len(tgt) > 0
+            ])
+
+            sbp_diff_magnitude = np.abs(np.diff(all_sbp))
+
+            variability_intensity = np.median(sbp_diff_magnitude)
 
             # Median of absolute first-order differences:
             # high value → subject has frequent / steep SBP swings (drift-prone)
-            sbp_drift_score = float(np.median(np.abs(sbp_deltas))) if sbp_deltas else 0.0
 
-            subject_drift_scores[subject] = sbp_drift_score
+            subject_drift_scores[subject] = float(variability_intensity)
             subject_updates_drift[subject] = int(exp_drift_num_updates)
-
-        # --------
-        # PLOTTING
-        # --------
-        
+            
+            total_drift_unaware_updates += len(prof['per_step']['did_adapt']) 
+            total_drift_aware_updates += prof['per_step']['did_adapt'].count(True)
+            
         # Ensure correct ordering using sorted dataframe
         subjects_ordered = df_sbp_sorted["subject"].tolist()
 
@@ -238,7 +279,14 @@ def analyze_logs_and_plot(log_file_path, fig_root, exp_fig_root, exp_drift_aware
         # Correlation between SBP MAE and SBP derivative
         r_value, p_value = pearsonr(sbp_mae_arr, drift_score_arr)
         r_squared = r_value ** 2
-
+        
+        # Calculate the adaptation frequency reduction
+        frequency_saving = (total_drift_unaware_updates -  total_drift_aware_updates) / total_drift_unaware_updates
+        frequency_saving *= 100
+        # --------
+        # PLOTTING
+        # --------
+        
         # Plot 1 — Ranked MAE
         plt.figure(figsize=(12, 6))
         plt.plot(df["SBP_MAE"].sort_values().values, label="SBP MAE")
@@ -366,9 +414,10 @@ def analyze_logs_and_plot(log_file_path, fig_root, exp_fig_root, exp_drift_aware
         plt.xticks(x_ticks, [""] * len(x_ticks))
         plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
-        plt.xlabel("Subjects (ranked by SBP MAE)", fontsize=14)
+        plt.xlabel("Subjects", fontsize=14)
         plt.ylabel("Number of drift-aware updates", fontsize=14)
-        plt.title("Drift-aware update counts per subject", fontsize=14)
+        plt.suptitle("Drift-aware update counts per subject", fontsize=16)
+        plt.title(f"Update frequency reduction: {round(frequency_saving, 2)}%", fontsize=14)
         plt.grid(axis="y", alpha=0.4)
 
         OUTPUT_UPDATES_ONLY = os.path.join(
@@ -1226,7 +1275,7 @@ def parseargs():
     parser.add_argument('--config_yaml_path', default='', type=str, help='path to the configuration YAML file for the experiments')
     parser.add_argument('--fig_root', default='', type=str, help='path to figure folder where to store the result analysis outputs')
     parser.add_argument('--exp_fig_root', default='', type=str, help='path to figure folder of each subject analyzed in an experiment (subfolder inside fig_root)')
-    parser.add_argument('--exp_fig_root_drift_aware', default='', type=str, help='drift-aware experiment folder')
+    parser.add_argument('--exp_pi_deployment_drift_aware_fig_root', default='', type=str, help='deployment on Pi drift-aware experiment folder')
 
     return parser.parse_args()
 
@@ -1235,7 +1284,7 @@ if __name__ == "__main__":
     args = parseargs()
     
     # Collect metrics from the experiment log file and organize them in CSVs
-    analyze_logs_and_plot(args.log_file_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
+    analyze_logs_and_plot(args.log_file_path, args.fig_root, args.exp_fig_root, args.exp_pi_deployment_drift_aware_fig_root)
         
     # Aggregates results over patients and correlates them to SBP variability
     #aggregate_patient_level_target_statistics_and_plot(args.fig_root, args.exp_fig_root)
