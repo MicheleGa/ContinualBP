@@ -33,4 +33,6 @@ logs/
 # Tensorboard logs
 tensorboard/
 
+# Back up dir
+back_up
 

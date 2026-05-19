@@ -1932,7 +1932,7 @@ def plot_drift_calibration_summary(
     p_dbp_vals = np.array(p_dbp_vals, dtype=float)
  
     # Boundaries (in window-index units)
-    calib_end     = calibration_phase_size * batch_size   # first TTA window
+    calib_end     = calibration_phase_size   # first TTA window
     total_windows = int(window_indices.max()) + 1 if len(window_indices) else calib_end
  
     # Figure

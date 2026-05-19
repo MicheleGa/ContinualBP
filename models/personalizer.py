@@ -9,7 +9,6 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from models.maml import MAML
 from models.DriftDetectors import MMDDriftOnline, LSDDDriftOnline
 from component_factory import ReservoirReplayBuffer, Model
@@ -119,7 +118,7 @@ def eval_model_on_sample_set(encoder, prediction_head, dataset, sample_list, dev
     )
     
 
-def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Performs the 'no adapt' personalization baseline by evaluating a pretrained model across 
     sequential data blocks without updating weights to establish a performance floor.
@@ -140,9 +139,6 @@ def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-        
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking metrics during the personalization process.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model inference.
@@ -218,7 +214,7 @@ def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -236,73 +232,11 @@ def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj
     targets_log = []
     predictions_log = []
     
-    # Drift detector placeholders
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
-        
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            enc.eval(); ph.eval()
-            with torch.no_grad():
-                calibration_features = enc(calibration_signals)
-                
-            # Encoder params for logging
-            n_updated_calibration = 0
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
                 
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
@@ -362,8 +296,8 @@ def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -418,9 +352,9 @@ def personalize_no_adapt(baseline, dataset, subject_id, figs_subj_dir, logs_subj
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_first_batch_finetune(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
-    Executes the 'Calibration-only' personalization baseline where the model adapts 
+    Executes the 'First-batch-fine-tune' personalization baseline where the model adapts 
     once to the first available data block (or the first block exceeding a drift threshold) 
     and then remains frozen for all subsequent blocks.
     
@@ -440,8 +374,6 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.    
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking training and validation loss during the one-time adaptation.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -519,7 +451,7 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -528,7 +460,10 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
     baseline_block_dbp_std = []
     baseline_outputs = []
     baseline_targets = []
-
+    
+    # First batch-finetune
+    first_batch_finetuned = False
+    
     # Track updates per baseline
     param_update_log = []
     total_params = sum(p.numel() for p in Model(enc, ph).parameters())
@@ -537,128 +472,12 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            calibration_features = None
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-            
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
             
         # ---------- Evaluate before adaptation ----------
@@ -695,16 +514,82 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
             "dbp_values": outs_before[:, 1].tolist(),
         })
         
-        # --- No more adaptation for this baseline (calibration only) ---
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        # Log updated parameters
-        param_update_log.append({
-            "step_idx": step_idx,
-            "update_mode": config['inner_adapt'], # irrelevant for this baseline, maintained for consistency with other baselines
-            "n_updated_params": 0 if step_idx > config['calibration_phase_size'] else n_updated_calibration,
-            "total_params": total_params,
-            "fraction_updated": 0
-        })
+        if not first_batch_finetuned:
+            # ----- Feature drift tracking -----
+            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
+
+            signals = torch.stack([x for x, _, _ in sample_batch]).to(device)
+            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
+            
+            # Extract features with the frozen encoder
+            with torch.no_grad():
+                features = enc(signals) 
+            
+            # ---------- Adaptation ----------
+            
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
+            
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updates during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
+            
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+
+            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head',
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
+
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # Training data/labels are already prepared for the current batch
+            for step in range(config["personalization_steps"]):
+                
+                # Train prediction head
+                ph.train()
+                
+                out = ph(train_features)
+                loss = criterion(out, train_targets)
+                
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                train_loss = loss.item()
+                
+            # Set to eval mode after adaptation
+            ph.eval()
+        
+            # --- No more adaptation for this baseline (calibration only) ---
+            first_batch_finetuned = True
+        else:    
+            # Log updated parameters
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": config['inner_adapt'], # irrelevant for this baseline, maintained for consistency with other baselines
+                "n_updated_params": 0,
+                "total_params": total_params,
+                "fraction_updated": 0
+            })
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -719,8 +604,8 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -775,7 +660,7 @@ def personalize_calibration_only(baseline, dataset, subject_id, figs_subj_dir, l
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics
 
 
-def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Executes the 'Online' personalization baseline where the model continuously adapts to new 
     data blocks as they arrive, either at every step or based on a drift detection trigger.
@@ -796,9 +681,6 @@ def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_d
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-            
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking training and validation loss for each online adaptation step.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -876,7 +758,7 @@ def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_d
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -894,128 +776,12 @@ def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_d
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated
-            calibration_features = None 
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-             
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
         # ---------- Evaluate before adaptation ----------
@@ -1083,12 +849,9 @@ def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_d
         total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
 
         # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
-            
         param_update_log.append({
             "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+            "update_mode": 'head',
             "n_updated_params": n_updated,
             "total_params": total_params,
             "fraction_updated": n_updated / total_params
@@ -1132,8 +895,8 @@ def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_d
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1      
@@ -1188,7 +951,7 @@ def personalize_online(baseline, dataset, subject_id, figs_subj_dir, logs_subj_d
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Executes the 'Online From Scratch' personalization baseline. Unlike the 'online' 
     baseline, this method begins with a randomly initialized (fresh) model and 
@@ -1210,9 +973,6 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-            
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking training and validation loss for each online adaptation step.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -1276,7 +1036,7 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -1294,104 +1054,12 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration with fresh weights, we always update teh full model
-                
-            # Update also encoder: trian first with head for calibration and then predict feats for detector init
-            # -> train first with head for calibration
-            # -> then predict feats for detector init
-            enc.train(); ph.train()
-            for step in range(config["personalization_steps"]):
-                out = ph(enc(calibration_signals))
-                loss = criterion(out, calibration_targets)
-
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-            
-            enc.eval(); ph.eval()
-            with torch.no_grad():
-                calibration_features = enc(calibration_signals)
-                
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-                
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
            
         # ---------- Evaluate before adaptation ----------
@@ -1449,7 +1117,7 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
             adapted_encoder=enc, 
             adapted_head=ph, 
             base_lr=config['personalization_lr'], 
-            mode='head', # only head is updated during online TTA
+            mode='all', # This baseline starts from scratch so we updated the full model online
             opt_type=config['inner_opt'].lower(), 
             config=config
         )
@@ -1458,13 +1126,9 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
         n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
         total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
-            
         param_update_log.append({
             "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+            "update_mode": 'all',
             "n_updated_params": n_updated,
             "total_params": total_params,
             "fraction_updated": n_updated / total_params
@@ -1508,8 +1172,8 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1  
@@ -1564,7 +1228,7 @@ def personalize_online_from_scratch(baseline, dataset, subject_id, figs_subj_dir
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
     
-def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Executes the 'Feature Replay' personalization CL algorithm that mitigates catastrophic 
     forgetting by storing previously seen latent features in a reservoir buffer and 
@@ -1586,9 +1250,6 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-        
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking training and validation loss during the adaptation steps.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -1669,7 +1330,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -1689,7 +1350,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     
     # Drift detector placeholders
     drift_detector = None
-    calibration_ids = []
+    detector_initialized = False
     detection_timesteps = []
     
     # Important for logging
@@ -1698,147 +1359,6 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            calibration_features = None
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-            
-            if config['setup_type'] == 'drift':
-                # Initialize drfit detector
-                # NOTE: only after calibration completion
-                reference_data = calibration_features.detach().clone()
-
-                if config['drift_detector_type'] == 'mmd':
-                    drift_detector = MMDDriftOnline(
-                        x_ref=reference_data.cpu().numpy(),
-                        ert=config['detector_ert'],
-                        window_size=config['detector_window_size'],
-                        n_bootstraps=config['detector_n_bootstraps'],
-                        backend='pytorch',
-                        verbose=False
-                    )
-                elif config['drift_detector_type'] == 'lsdd':
-                    drift_detector = LSDDDriftOnline(
-                        x_ref=reference_data.cpu().numpy(),
-                        ert=config['detector_ert'],
-                        window_size=config['detector_window_size'],
-                        n_bootstraps=config['detector_n_bootstraps'],
-                        backend='pytorch',
-                        verbose=False
-                    )
-                else:
-                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
-
-                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
-                
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
         # ---------- Evaluate before adaptation ----------
@@ -1887,57 +1407,31 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
         
         # ---------- Decide adaptation ----------
         do_adapt = False
-        
-        if config['setup_type'] == 'drift':
-            # Detect data drifts with detector
-            for feat_idx in range(features.shape[0]):
-                # Add batch dimension before prediction
-                detection_report = drift_detector.predict(features[feat_idx].cpu().numpy())
-                drift_flag = detection_report["data"]["is_drift"]
 
-                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
-                if drift_detector.t >= config['detector_window_size']:
-                    if drift_flag == 1:
-                        global_window_idx = step_idx * config['personalization_batch_size'] + feat_idx
-                        detection_timesteps.append(global_window_idx)
-                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
-        
-        # If not drift setup: adapt by default (every block) for adaptive baselines
-        if config.get("setup_type") == "fixed":
+        if config['setup_type'] == 'fixed':
             do_adapt = True
-        elif config.get("setup_type") == "drift":
-            # Use detector for each adaptive baseline
-            if not do_adapt:
-                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-                if step_idx == config['calibration_phase_size']:
-                    # No parameters are updated exceet for the calibraiton ones
-                    n_updated = n_updated_calibration
 
-                    param_update_log.append({
-                        "step_idx": step_idx,
-                        "update_mode": config['inner_adapt'],
-                        "n_updated_params": n_updated,
-                        "total_params": total_params,
-                        "fraction_updated": n_updated / total_params
-                    })
-                elif step_idx > config['calibration_phase_size']:
-                    # No parameters are updated
-                    n_updated = 0
+        elif config['setup_type'] == 'drift':
+            # NOTE: Before the detector is initialized, always adapt.
+            if not detector_initialized:
+                do_adapt = True
+            else:
+                # Use drift detector to decide
+                for i in range(features.shape[0]):
+                    detection_report = drift_detector.predict(features[i].cpu().numpy())
+                    drift_flag = detection_report["data"]["is_drift"]
+                    
+                    if drift_detector.t >= config['detector_window_size']:
+                        if drift_flag == 1:
+                            global_window_idx = step_idx * config['personalization_batch_size'] + i
+                            detection_timesteps.append(global_window_idx)
+                            do_adapt = True
 
-                    param_update_log.append({
-                        "step_idx": step_idx,
-                        "update_mode": 'head',
-                        "n_updated_params": n_updated,
-                        "total_params": total_params,
-                        "fraction_updated": n_updated / total_params
-                    })
-                else:
-                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
         else:
             raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
 
         if do_adapt:
-            # ---------- Adaptation ----------
+            # ---------- Adaptation (head only) ----------
             
             # Use features and targets for adaptation
             train_features = features
@@ -1956,14 +1450,10 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
             # Encoder params for logging
             n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
             total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
-
-            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-            if step_idx == config['calibration_phase_size']:
-                n_updated += n_updated_calibration
                 
             param_update_log.append({
                 "step_idx": step_idx,
-                "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+                "update_mode": 'head',
                 "n_updated_params": n_updated,
                 "total_params": total_params,
                 "fraction_updated": n_updated / total_params
@@ -2005,20 +1495,27 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
                 
             # Set to eval mode after adaptation
             ph.eval()
+        
+        else:
+            # No adaptation this step
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head',
+                "n_updated_params": 0,
+                "total_params": total_params,
+                "fraction_updated": 0.0
+            })
+        
+        # Always update the replay buffer to maintain a diverse feature set
+        # -> otherwise the buffer will be filled up without features before the drift 
+        with torch.no_grad():
+            replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
             
-            # Update replay buffer 
-            with torch.no_grad():
-                replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
-            
-            # Detector re-init when buffer has enough samples for a new reference set
-            if config['setup_type'] == 'drift' and len(replay_buffer) > (config['personalization_batch_size'] * config['calibration_phase_size']):
-                
-                drift_detector = None
-                
-                # Re-initialize drfit detector
-                # NOTE: only after having updated the replay buffer
+        # Detector init/re-init when buffer has enough samples for the reference set
+        if config['setup_type'] == 'drift':
+            if len(replay_buffer) >= config['calibration_phase_size'] and (not detector_initialized or do_adapt):
                 reference_data = torch.stack(replay_buffer.features).numpy().copy()
-                
+
                 if config['drift_detector_type'] == 'mmd':
                     drift_detector = MMDDriftOnline(
                         x_ref=reference_data,
@@ -2040,7 +1537,11 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
                 else:
                     raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
 
-                print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples from the replay_buffer ✓")
+                if not detector_initialized:
+                    detector_initialized = True
+                    print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
+                else:
+                    print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples ✓")  
         
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
@@ -2055,8 +1556,8 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], idx] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], idx] = dbp_mae_i
+            sbp_errors_matrix[step_idx, idx] = sbp_mae_i
+            dbp_errors_matrix[step_idx, idx] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -2110,7 +1611,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
 
     if config['setup_type'] == 'drift':    
         
-        print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {(step_idx - config['calibration_phase_size']) * config['personalization_batch_size']} steps with drift detection after calibration ✓")
+        print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {step_idx * config['personalization_batch_size']} steps with drift detection after calibration ✓")
         # Calibration summary plot
         sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
         dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
@@ -2136,7 +1637,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Executes the 'Learning without Forgetting' (LwF) personalization CL algorithm. This approach 
     combines a standard supervised loss on new data with a distillation loss that 
@@ -2159,9 +1660,6 @@ def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-        
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking total loss, distillation loss, and validation performance.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -2242,7 +1740,7 @@ def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -2260,128 +1758,12 @@ def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
 
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            calibration_features = None
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-        
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
         # ---------- Evaluate before adaptation ----------
@@ -2447,14 +1829,10 @@ def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
         # Encoder params for logging
         n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
         total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
-
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
             
         param_update_log.append({
             "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+            "update_mode": 'head',
             "n_updated_params": n_updated,
             "total_params": total_params,
             "fraction_updated": n_updated / total_params
@@ -2513,8 +1891,8 @@ def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -2569,7 +1947,7 @@ def personalize_lwf(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Executes the 'Elastic Weight Consolidation' (EWC) personalization CL algorithm. This approach slows 
     down learning on weights that are important for previous data blocks by adding a quadratic penalty based on the Fisher Information Matrix.
@@ -2590,9 +1968,6 @@ def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-            
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking training loss (including EWC penalty) and validation loss.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -2675,7 +2050,7 @@ def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -2693,128 +2068,12 @@ def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            calibration_features = None
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-            
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
              
         # ---------- Evaluate before adaptation ----------
@@ -2881,13 +2140,9 @@ def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
         n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
         total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
-            
         param_update_log.append({
             "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+            "update_mode": 'head',
             "n_updated_params": n_updated,
             "total_params": total_params,
             "fraction_updated": n_updated / total_params
@@ -2968,8 +2223,8 @@ def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1   
@@ -3024,7 +2279,7 @@ def personalize_ewc(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir,
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, writer, device, config):
+def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
     r"""
     Executes the 'Averaged Gradient Episodic Memory' (A-GEM) personalization CL algorithm. 
     This method ensures that the update gradient for the current data block does not 
@@ -3048,9 +2303,6 @@ def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir
     
     logs_subj_dir (str:)
         The root directory for saving subject-specific logs and CSVs.
-        
-    writer (SummaryWriter): 
-        TensorBoard logger for tracking training loss and gradient projection events.
         
     device (torch.device): 
         The computational device (CPU/CUDA) used for model training and inference.
@@ -3131,7 +2383,7 @@ def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - config['calibration_phase_size']
+    T = config['num_batches'] * config['num_blocks'] 
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -3149,128 +2401,12 @@ def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir
     targets_log = []
     predictions_log = []
     
-    # Calibration ids
-    calibration_ids = []
-    
     # Important for logging
     step_idx = 0
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            calibration_features = None
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-            
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
         # ---------- Evaluate before adaptation ----------
@@ -3337,13 +2473,9 @@ def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir
         n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
         total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
 
-        # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-        if step_idx == config['calibration_phase_size']:
-            n_updated += n_updated_calibration
-            
         param_update_log.append({
             "step_idx": step_idx,
-            "update_mode": 'head' if step_idx > config['calibration_phase_size'] else config['inner_adapt'],
+            "update_mode": 'head',
             "n_updated_params": n_updated,
             "total_params": total_params,
             "fraction_updated": n_updated / total_params
@@ -3435,8 +2567,8 @@ def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir
                     config
                 )
 
-            sbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - config['calibration_phase_size'], i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -3491,7 +2623,7 @@ def personalize_agem(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir
     return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics 
 
 
-def personalization(tensorboard_path, config, device):
+def personalization(config, device):
     r"""
     Orchestrates the personalization and continual learning evaluation of blood pressure 
     estimation models. This function initializes datasets, loads a meta-pretrained model 
@@ -3586,9 +2718,6 @@ def personalization(tensorboard_path, config, device):
         logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}")
         os.makedirs(logs_subj_dir, exist_ok=True)
         
-        # Setup Tensorboard
-        writer = SummaryWriter(log_dir=os.path.join(tensorboard_path, f"subject_{subject_id}"))
-        
         sbp_baseline_metrics = {}
         dbp_baseline_metrics = {}
         per_block_stats = {}
@@ -3605,18 +2734,16 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir,
-                    writer=writer,
                     device=device, 
                     config=config
                 )
-            elif b == 'calibration_only':
-                baseline_per_block_stats, baseline_outs_and_tgts, baseline_sbp_baseline_metrics, baseline_dbp_baseline_metrics = personalize_calibration_only(
+            elif b == 'first_batch_finetune':
+                baseline_per_block_stats, baseline_outs_and_tgts, baseline_sbp_baseline_metrics, baseline_dbp_baseline_metrics = personalize_first_batch_finetune(
                     baseline=b, 
                     dataset=online_physio_dataset, 
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir, 
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3627,7 +2754,6 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir, 
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3638,7 +2764,6 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir, 
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3649,7 +2774,6 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir,
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3660,7 +2784,6 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir, 
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3671,7 +2794,6 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir,
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3682,7 +2804,6 @@ def personalization(tensorboard_path, config, device):
                     subject_id=subject_id, 
                     figs_subj_dir=figs_subj_dir,
                     logs_subj_dir=logs_subj_dir,
-                    writer=writer,
                     device=device, 
                     config=config
                 )
@@ -3694,8 +2815,6 @@ def personalization(tensorboard_path, config, device):
             dbp_baseline_metrics[b] = baseline_dbp_baseline_metrics
             per_block_stats[b] = baseline_per_block_stats
             outs_and_tgts[b] = baseline_outs_and_tgts
-            
-        writer.close()
         
         if outs_and_tgts is None:
             raise ValueError("Outputs and targets for a subject cannot be None ...")

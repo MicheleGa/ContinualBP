@@ -1,14 +1,14 @@
 # Personalization
 
 # PPG head only adaptation
-experiment_name="personalization_no_adapt_proto_ppg_calibration_size_4"
+experiment_name="personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -20,12 +20,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
@@ -35,14 +34,14 @@ python personalization.py \
     --baselines "no_adapt" \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
-experiment_name="personalization_calibration_only_proto_ppg_calibration_size_4"
+experiment_name="personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -54,29 +53,28 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
     --inner_adapt 'head' \
     --plot_personalization \
     --setup_type 'fixed' \
-    --baselines "calibration_only" \
+    --baselines "first_batch_finetune" \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
-experiment_name="personalization_online_proto_ppg_calibration_size_4"
+experiment_name="personalization_online_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -88,12 +86,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
@@ -103,14 +100,14 @@ python personalization.py \
     --baselines "online" \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
-experiment_name="personalization_online_from_scratch_proto_ppg_calibration_size_4"
+experiment_name="personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -122,12 +119,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
@@ -137,14 +133,14 @@ python personalization.py \
     --baselines "online_from_scratch" \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
-experiment_name="personalization_feature_replay_proto_ppg_calibration_size_4"
+experiment_name="personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -156,12 +152,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
@@ -172,14 +167,14 @@ python personalization.py \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
 
-experiment_name="personalization_lwf_proto_ppg_calibration_size_4"
+experiment_name="personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -191,12 +186,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
@@ -207,14 +201,14 @@ python personalization.py \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
 
-experiment_name="personalization_ewc_proto_ppg_calibration_size_4"
+experiment_name="personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -226,12 +220,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \
@@ -242,14 +235,14 @@ python personalization.py \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
 
-experiment_name="personalization_agem_proto_ppg_calibration_size_4"
+experiment_name="personalization_agem_proto_ppg_calibration_size_1_gradual_shifts"
 mkdir "logs/$experiment_name"
 cd ./models
 python Proto.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --batch_size 16 \
+    --batch_size 4 \
     > "../logs/$experiment_name/${experiment_name}_summary.log"
 cd ..
 python personalization.py \
@@ -261,12 +254,11 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_16/proto_ppg_percentile_group_layer_norm_kq_16-Proto-2026_05_04-17_16_13/proto_ppg_percentile_group_layer_norm_kq_16_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
     --personalization_batch_size 4 \
-    --calibration_phase_size 4 \
     --num_batches 72 \
     --num_blocks 1 \
     --replay_buffer_size 64 \

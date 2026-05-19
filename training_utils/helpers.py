@@ -99,12 +99,12 @@ def parseargs():
     parser.add_argument('--eval_steps', default=8, type=int, help='inner steps for meta-learning evaluation')
    
     # Personalization Setup
-    parser.add_argument('--baselines', default=['no_adapt', 'calibration_only', 'online', 'online_from_scratch', 'feature_replay', 'lwf', 'ewc', 'agem'], type=str, nargs='+', help='Baselines to employ for personalization')
+    parser.add_argument('--baselines', default=['no_adapt', 'first_batch_finetune', 'online', 'online_from_scratch', 'feature_replay', 'lwf', 'ewc', 'agem'], type=str, nargs='+', help='Baselines to employ for personalization')
     parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
     parser.add_argument('--pretraining_feats_stats', default=None, type=str, help='path to the features statistics during pretraining')
     parser.add_argument('--detector_calibration_csv_path', default=None, type=str, help='path to the folder where the calibration results CSV file should be saved')
     parser.add_argument('--num_personalization_subjects', default=0, type=int, help='number of subjects to for personalization')
-    parser.add_argument('--calibration_phase_size', default=4, type=int, help='number of batches for the calibration phase on-device')
+    parser.add_argument('--calibration_phase_size', default=1, type=int, help='number of batches for the calibration phase on-device')
     parser.add_argument('--personalization_steps', default=8, type=int, help='number of gradient steps for personalization')
     parser.add_argument('--personalization_lr', default=1e-2, type=float, help='learning rate for personalization')
     parser.add_argument('--plot_personalization', action=argparse.BooleanOptionalAction, default=False, help='whether to plot the subject annotation over the total windows or not')
@@ -121,7 +121,7 @@ def parseargs():
     parser.add_argument('--detector_window_size', default=2, type=int, help='window size for the drift detector (# of samples)')
     parser.add_argument('--detector_ert', default=16, type=int, help='ERT target for the drift detector')
     parser.add_argument('--detector_n_bootstraps', default=1000, type=int, help='number of bootstrap samples for the drift detector')
-    parser.add_argument('--use_raspberry_pi', action=argparse.BooleanOptionalAction, default=False, help='whether to use the Raspberry Pi during deployment or not')
+    parser.add_argument('--use_pi', action=argparse.BooleanOptionalAction, default=False, help='whether to use the Raspberry Pi during deployment or not')
     parser.add_argument('--use_pixel', action=argparse.BooleanOptionalAction, default=False, help='whether to use the Google Pixel during deployment or not')
     
     args = parser.parse_args()

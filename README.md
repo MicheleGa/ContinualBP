@@ -221,7 +221,7 @@ python -m venv venv
 source ./venv/bin/activate
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
 pip install numpy==1.24.3 matplotlib==3.9.2 scikit-learn==1.6.1 seaborn==0.13.2 pandas==1.5.3 markdown==3.4.1
-pip install thop torchinfo==1.8.0 pyCompare PyYAML tqdm
+pip install thop torchinfo==1.8.0 pyCompare PyYAML tqdm psutil
 ```
 
 ## Data Provisioning & Preprocessing

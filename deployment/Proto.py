@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torchinfo import summary
 from thop import profile, clever_format
-from deployment.deployment_component_factory import BPRegressor
+from deployment_component_factory import BPRegressor
 
 
 class TemporalResBlock(nn.Module):

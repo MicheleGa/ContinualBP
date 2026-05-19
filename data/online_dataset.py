@@ -575,7 +575,6 @@ if __name__ == "__main__":
         import pickle
         blocks = online_physio_dataset.get_subject_blocks(
             subject_id, 
-            window_length=args.input_seq_len_s, 
             batch_size=args.personalization_batch_size,
             num_batches=args.num_batches,
             num_blocks=args.num_blocks
@@ -601,7 +600,6 @@ if __name__ == "__main__":
     # Plot the Annotation statistics for the runs
     blocks = online_physio_dataset.get_subject_blocks(
         subject_id, 
-        window_length=args.input_seq_len_s, 
         batch_size=args.personalization_batch_size,
         num_batches=args.num_batches,
         num_blocks=args.num_blocks
@@ -683,17 +681,17 @@ if __name__ == "__main__":
     )
     
     # 5. Plot the pareto frontier
-    plot_pareto_frontier(
-        df,
-        pareto_feasible,
-        selected,
-        abrupt_shift_stressed,
-        gradual_shift_stressed,
-        savepath=os.path.join(
-            root_figs_folder,
-            f"pareto_frontier_{args.personalization_batch_size}.png"
-        )
-    )
+    #plot_pareto_frontier(
+    #    df,
+    #    pareto_feasible,
+    #    selected,
+    #    abrupt_shift_stressed,
+    #    gradual_shift_stressed,
+    #    savepath=os.path.join(
+    #        root_figs_folder,
+    #        f"pareto_frontier_{args.personalization_batch_size}.png"
+    #    )
+    #)
     
     print("[Pareto] Selected configurations with at least 85 patients:")
     print("Mixed-Shifts Set:")

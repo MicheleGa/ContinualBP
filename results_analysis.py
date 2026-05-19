@@ -1,1277 +1,1221 @@
 
-from collections import OrderedDict
 import os
+from pathlib import Path
 import sys
-folders_to_add = ['models']
-for folder in folders_to_add:
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import shutil
 import json
 import pickle
 import argparse
 import re
+from collections import Counter
 import yaml
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import spearmanr, pearsonr
-import torch
-from thop import profile
-from models.Proto import Proto
-from models.component_factory import BPRegressor
 
-def plot_blood_pressure_results(subject_id, baseline_outputs, baseline_targets):
-    """
-    Flattens batched SBP/DBP arrays and plots time series comparison.
-    """
-    # 1. Concatenate the list of numpy arrays into single continuous arrays
-    # Each array is shape (Batch, 2), where index 0 is SBP and index 1 is DBP
-    preds = np.concatenate(baseline_outputs, axis=0)
-    targets = np.concatenate(baseline_targets, axis=0)
-
-    # 2. Extract SBP and DBP columns
-    sbp_pred, dbp_pred = preds[:, 0], preds[:, 1]
-    sbp_true, dbp_true = targets[:, 0], targets[:, 1]
-
-    # 3. Create the plot
-    plt.figure(figsize=(14, 7))
+def resource_profiling(baseline, profiling_path, deployment_device):
+ 
+    profiling_path = Path(profiling_path)
     
-    # Plot SBP
-    plt.plot(sbp_true, label='SBP Target', color='royalblue', 
-             linestyle='-', marker='o', markersize=4, alpha=0.7)
-    plt.plot(sbp_pred, label='SBP Prediction', color='navy', 
-             linestyle='--', marker='s', markersize=4, alpha=0.8)
+    # Containers 
+    per_step_latency_keys = [
+        # per TTA step (appended in loop)
+        'feature_extraction_s',    # enc(signals) latency
+        'prediction_s',            # pred(feats) latency
+        'drift_detection_s',        # drift_detector.predict() loop latency
+        'adaptation_s',            # entire do_adapt block latency
+        'head_adapt_s',            # prediction head adapt latency
+        'drift_detector_reinit_s', # drift detector re-init latency
+        'total_step_s',            # wall time for the full TTA step
+    ]
     
-    # Plot DBP
-    plt.plot(dbp_true, label='DBP Target', color='salmon', 
-             linestyle='-', marker='o', markersize=4, alpha=0.7)
-    plt.plot(dbp_pred, label='DBP Prediction', color='darkred', 
-             linestyle='--', marker='s', markersize=4, alpha=0.8)
-
-    # Formatting
-    plt.title(f'SBP/DBP Time Series {subject_id}: Ground Truth vs Prediction', fontsize=14)
-    plt.xlabel('Time Step (Samples)', fontsize=12)
-    plt.ylabel('Pressure (mmHg)', fontsize=12)
-    plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0))
-    plt.grid(True, linestyle=':', alpha=0.6)
-    plt.tight_layout()
+    # Memory key definitions
+    # Scalar fields: one value per subject
+    aggregate_memory_keys = [
+        'model_memory_mb',         # fixed RAM cost of keeping the model in memory.
+        'rss_before_tta_mb',       # fixed cost that must fit in RAM regardless of the data stream.
+        'peak_tta_rss_mb',         # highest RSS observed during the TTA loop
+        'peak_incremental_tta_mb', # memory the TTA algorithm itself requires on top of the loaded model
+        'peak_process_rss_mb',     # process-wide RSS: upper-bound RAM budget
+        'tm_peak_run_kb',          # peak Python-heap usage over the entire run (kB)
+    ]
     
-    plt.show()
-
-def analyze_logs_and_plot(
-    log_file_path, 
-    fig_root, 
-    exp_fig_root, 
-    exp_pi_deployment_drift_aware_fig_root
-):
+    # Per-step delta fields: aggregated as max-per-subject
+    per_step_memory_keys = [
+        'tm_current_kb',            # absolute Python-heap usage at the end of each step
+        'tm_head_adapt_kb',         # delta during head adaptation
+        'tm_detector_reinit_kb',    # delta during detector reinit
+    ]
+ 
+    # Per_subject_means[key] = list of one mean per subject
+    # -> give same weight to subjects with lots/few adaptations
+    per_step_per_subject_means = {k: [] for k in per_step_latency_keys}
+ 
+    # Scalar memory: list of one value per subject → mean ± std
+    aggregate_memory_per_subject   = {k: [] for k in aggregate_memory_keys}
     
-    print("[Log Analysis] Analyzing log files ...")
-    for baseline_name in [
-        'feature_replay',
-    ]:
-        baseline_fig_root = os.path.join(fig_root, baseline_name)
-        if os.path.exists(baseline_fig_root):
-            shutil.rmtree(baseline_fig_root)
-        os.makedirs(baseline_fig_root)
-
-        OUTPUT_SUMMARY_CSV = os.path.join(baseline_fig_root, "parsed_per_patient_summary.csv")
-        OUTPUT_MAE_PLOT = os.path.join(baseline_fig_root, "parsed_per_patient_mae_ranked.png")
-        OUTPUT_GRADE_PLOT = os.path.join(baseline_fig_root, "parsed_bhs_grade_distribution.png")
-
-
-        # --------------------------------
-        # Regex patterns matching the logs
-        # --------------------------------
-
-        re_subject_header = re.compile(
-            r"Results for (p\d+) with baseline ([a-zA-Z0-9_]+)"
-        )
-
-        re_sbp_mae = re.compile(
-            r"SBP MAE μ ([\d\.]+) ± ([\d\.]+)"
-        )
-
-        re_dbp_mae = re.compile(
-            r"DBP MAE μ ([\d\.]+) ± ([\d\.]+)"
-        )
-
-        re_sbp_bhs_perc = re.compile(
-            r"SBP:\s*([\d\.]+)%\s*([\d\.]+)%\s*([\d\.]+)%"
-        )
-
-        re_dbp_bhs_perc = re.compile(
-            r"DBP:\s*([\d\.]+)%\s*([\d\.]+)%\s*([\d\.]+)%"
-        )
-
-        re_sbp_grade = re.compile(
-            r"BHS standard grade for SBP: ([A-D])"
-        )
-
-        re_dbp_grade = re.compile(
-            r"BHS standard grade for DBP: ([A-D])"
-        )
-
-
-        records = []
-        current = {}
-
-        with open(log_file_path, "r") as f:
-            for line in f.readlines():
-                line = line.strip()
-
-                # Detect header: subject + baseline
-                m = re_subject_header.search(line)
-                if m:
-                    # If we were collecting a previous block, store it
-                    if "subject" in current:
-                        records.append(current)
-                    subject_id, baseline = m.groups()
-                    current = {
-                        "subject": subject_id,
-                        "baseline": baseline,
-                    }
-                    continue
-
-                # Extract SBP/DBP MAE ± std
-                m = re_sbp_mae.search(line)
-                if m:
-                    current["SBP_MAE"] = float(m.group(1))
-                    current["SBP_STD"] = float(m.group(2))
-                    continue
-
-                m = re_dbp_mae.search(line)
-                if m:
-                    current["DBP_MAE"] = float(m.group(1))
-                    current["DBP_STD"] = float(m.group(2))
-                    continue
-
-                # Extract BHS percentage lines
-                m = re_sbp_bhs_perc.search(line)
-                if m:
-                    current["SBP_p<=5"] = float(m.group(1))
-                    current["SBP_p<=10"] = float(m.group(2))
-                    current["SBP_p<=15"] = float(m.group(3))
-                    continue
-
-                m = re_dbp_bhs_perc.search(line)
-                if m:
-                    current["DBP_p<=5"] = float(m.group(1))
-                    current["DBP_p<=10"] = float(m.group(2))
-                    current["DBP_p<=15"] = float(m.group(3))
-                    continue
-
-                # Extract BHS letter grade
-                m = re_sbp_grade.search(line)
-                if m:
-                    current["SBP_BHS"] = m.group(1)
-                    continue
-
-                m = re_dbp_grade.search(line)
-                if m:
-                    current["DBP_BHS"] = m.group(1)
-                    continue
-
-        # Add final block
-        if "subject" in current:
-            records.append(current)
-
-        # Create DataFrame
-        df = pd.DataFrame(records)
-
-        # N.B. — filter only continual_replay baseline
-        df = df[df["baseline"] == baseline_name].reset_index(drop=True)
-        df.to_csv(OUTPUT_SUMMARY_CSV, index=False)
-        print(f"[Log Analysis] Saved → {OUTPUT_SUMMARY_CSV}")
-
-        # Sort by increasing SBP MAE
-        df_sbp_sorted = df.sort_values(by="SBP_MAE", ascending=True).reset_index(drop=True)
-
-        # Save to CSV
-        df_sbp_sorted.to_csv(os.path.join(baseline_fig_root, "df_sorted_by_SBP_MAE.csv"),
-                            index=False)
-
-        print("[Log Analysis] Saved → df_sorted_by_SBP_MAE.csv")
+    # Per-step memory: list of per-subject MAX delta → mean ± std of maxes
+    # Rationale: memory is governed by its peak, not its average.
+    # Averaging signed deltas collapses to ~0 due to PyTorch allocator caching.
+    per_step_memory_peak_per_subject = {k: [] for k in per_step_memory_keys}
+ 
+    # Drift-aware update count per subject
+    subject_frequency_savings = [] 
+    subject_updates_drift = {}
+    subject_total_update_opportunities = {}
+    
+    if not profiling_path.exists():
+        print(f"Error: The path {profiling_path} does not exist.")
+        return
+    
+    for subject_dir in profiling_path.iterdir():
         
-        # ----------------------------------------------------------
-        # Get number of updates and target values for drift analysis
-        # ----------------------------------------------------------
-        personalization_subjects = df_sbp_sorted['subject'].tolist()
-        
-        subject_drift_scores   = {}   # median |Δ SBP| per subject
-        subject_updates_drift  = {}   # drift-aware update count per subject
-        total_drift_unaware_updates = 0
-        total_drift_aware_updates = 0
-        
-        for subject in personalization_subjects:
-            # Get number of updates without drift detection
-            exp_param_log_path = os.path.join(
-                exp_fig_root,
-                f"subject_{subject}",
-                baseline_name,
-                "param_update_log.csv"
-            )
-            df_updates = pd.read_csv(exp_param_log_path)
-            exp_num_updates = (df_updates["n_updated_params"] > 0).sum()
+        if subject_dir.is_dir() and subject_dir.name.startswith("subject_"):
+            subject_id = subject_dir.name.split('_')[-1]
             
-            # Get number of updates with drift detection on Pi
-            subject_results_path = os.path.join(
-                exp_pi_deployment_drift_aware_fig_root,
-                f"subject_{subject}",
-                baseline_name,
-                f"results_from_pi_{subject}.pkl"
-            )
-            with open(subject_results_path, "rb") as f:
-                subject_results = pickle.load(f)
+            profiling_json_path = subject_dir / "profiling" / f"{baseline}_profiling_report.json"
             
-            baseline_outputs, baseline_targets, prof = subject_results
+            with open(profiling_json_path, "r", encoding="utf-8") as f:
+                prof = json.load(f)
+            
+            pred_json_path = subject_dir / baseline / "predictions_log.json"
+            tgt_json_path = subject_dir / baseline / "targets_log.json"
+            
+            with open(pred_json_path, "r", encoding="utf-8") as f:
+                baseline_outputs = json.load(f)
+                
+            with open(tgt_json_path, "r", encoding="utf-8") as f:
+                baseline_targets = json.load(f)
             
             if False: 
-                plot_blood_pressure_results(subject, baseline_outputs=baseline_outputs, baseline_targets=baseline_targets)
-    
-            exp_drift_num_updates = prof["n_adaptations"]
-           
-            for k, v in prof.items():
-                print(k, v)
-            print(f"[Log Analysis] Updates for subject {subject} (non-drift vs drift) {exp_num_updates} - {exp_drift_num_updates}")
-        
-            # Get targets for drift calculation
-            # -> same for either drift non-aware and drift-aware
-                
-            # -------------------------------------------------------
-            # Aggregate SBP values and compute first-order derivative
-            # -------------------------------------------------------
-            # Compute diff within each batch to avoid artificial jumps
-            # at batch boundaries, then pool all intra-batch deltas.
-            all_sbp = np.concatenate([
-                np.asarray(tgt[:, 0], dtype=float)
-                for tgt in baseline_targets
-                if len(tgt) > 0
-            ])
-
-            sbp_diff_magnitude = np.abs(np.diff(all_sbp))
-
-            variability_intensity = np.median(sbp_diff_magnitude)
-
-            # Median of absolute first-order differences:
-            # high value → subject has frequent / steep SBP swings (drift-prone)
-
-            subject_drift_scores[subject] = float(variability_intensity)
-            subject_updates_drift[subject] = int(exp_drift_num_updates)
+                plot_blood_pressure_results(subject_id, baseline_outputs=baseline_outputs, baseline_targets=baseline_targets)
             
-            total_drift_unaware_updates += len(prof['per_step']['did_adapt']) 
-            total_drift_aware_updates += prof['per_step']['did_adapt'].count(True)
-            
-        # Ensure correct ordering using sorted dataframe
-        subjects_ordered = df_sbp_sorted["subject"].tolist()
-
-        sbp_mae_arr = df_sbp_sorted["SBP_MAE"].values
-
-        updates_arr = np.array(
-            [subject_updates_drift[s] for s in subjects_ordered],
-            dtype=float
-        )
-
-        drift_score_arr = np.array(
-            [subject_drift_scores[s] for s in subjects_ordered],
-            dtype=float
-        )
-        # Correlation between SBP MAE and SBP derivative
-        r_value, p_value = pearsonr(sbp_mae_arr, drift_score_arr)
-        r_squared = r_value ** 2
-        
-        # Calculate the adaptation frequency reduction
-        frequency_saving = (total_drift_unaware_updates -  total_drift_aware_updates) / total_drift_unaware_updates
-        frequency_saving *= 100
-        # --------
-        # PLOTTING
-        # --------
-        
-        # Plot 1 — Ranked MAE
-        plt.figure(figsize=(12, 6))
-        plt.plot(df["SBP_MAE"].sort_values().values, label="SBP MAE")
-        plt.plot(df["DBP_MAE"].sort_values().values, label="DBP MAE")
-        plt.title("Per-Patient MAE (Ranked) — Parsed From Logs")
-        plt.xlabel("Patients (sorted)")
-        plt.ylabel("MAE (mmHg)")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_MAE_PLOT, dpi=300)
-        plt.close()
-        print(f"[Log Analysis] Saved → {OUTPUT_MAE_PLOT}")
-
-
-        # Plot 2 — BHS Grade distribution
-        print(baseline_name)
-        plt.figure(figsize=(10, 4))
-
-        grades_sbp = df["SBP_BHS"].value_counts()
-        grades_dbp = df["DBP_BHS"].value_counts()
-
-        # Build a common index (union of SBP & DBP grades)
-        all_grades = sorted(set(grades_sbp.index).union(set(grades_dbp.index)))
-
-        # Reindex so both have the same length
-        grades_sbp = grades_sbp.reindex(all_grades, fill_value=0)
-        grades_dbp = grades_dbp.reindex(all_grades, fill_value=0)
-
-        width = 0.35
-        idx = np.arange(len(all_grades))
-
-        plt.bar(idx - width / 2, grades_sbp.values, width, label="SBP")
-        plt.bar(idx + width / 2, grades_dbp.values, width, label="DBP")
-
-        plt.xticks(idx, all_grades)
-        plt.ylabel("Number of Patients")
-        plt.title("BHS Grade Distribution — Parsed From Logs")
-        plt.grid(axis="y")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_GRADE_PLOT, dpi=300)
-        plt.close()
-        print(f"[Log Analysis] Saved → {OUTPUT_GRADE_PLOT}")
-        
-        # Plot 3 - Correlation plot: SBP MAE vs SBP derivative
-        print(f"[Log Analysis] Pearson r = {r_value:.4f}, R² = {r_squared:.4f}, p = {p_value:.4e}")
-        x_ticks = np.arange(len(subjects_ordered))
-
-        fig = plt.figure(figsize=(14, 10))
-        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 1], hspace=0.05)
-
-        fig.suptitle(
-            f"Correlation SBP MAE vs SBP derivative: R² = {r_squared:.3f} (r = {r_value:.3f}, p = {p_value:.2e})",
-            fontsize=16
-        )
-
-        # ── Subplot 1: SBP MAE ──
-        ax1 = fig.add_subplot(gs[0])
-        ax1.bar(x_ticks, sbp_mae_arr, color="forestgreen", width=0.7)
-
-        ax1.set_ylabel("SBP MAE (mmHg)", fontsize=14)
-        #ax1.set_title("SBP MAE per subject", fontsize=14)
-        ax1.grid(axis="y", alpha=0.4)
-        ax1.tick_params(labelsize=12)
-        ax1.set_xticklabels([])  # hide x labels
-
-        # ── Subplot 2 (BROKEN AXIS): SBP derivative ──
-        ax2_top = fig.add_subplot(gs[1], sharex=ax1)
-        ax2_bottom = fig.add_subplot(gs[2], sharex=ax1)
-
-        # Plot both
-        ax2_top.bar(x_ticks, drift_score_arr, color="darkorange", width=0.7)
-        ax2_bottom.bar(x_ticks, drift_score_arr, color="darkorange", width=0.7)
-
-        # Set y-limits (broken region between 3 and 12)
-        ax2_bottom.set_ylim(0, 2)
-        ax2_top.set_ylim(12, max(drift_score_arr) * 1.1)
-
-        # Hide spines between axes
-        ax2_top.spines['bottom'].set_visible(False)
-        ax2_bottom.spines['top'].set_visible(False)
-
-        ax2_top.tick_params(labeltop=False)
-        ax2_bottom.xaxis.tick_bottom()
-
-        # Diagonal break marks
-        d = .5
-        kwargs = dict(marker=[(-1, -d), (1, d)], markersize=12,
-                    linestyle="none", color='k', mec='k', mew=1, clip_on=False)
-
-        ax2_top.plot([0, 1], [0, 0], transform=ax2_top.transAxes, **kwargs)
-        ax2_bottom.plot([0, 1], [1, 1], transform=ax2_bottom.transAxes, **kwargs)
-
-        # Labels
-        ax2_bottom.set_xlabel("Subjects (ranked by increasing SBP MAE)", fontsize=14)
-        ax2_bottom.set_ylabel("Median |ΔSBP| (mmHg)", fontsize=14)
-
-        #ax2_top.set_title("SBP first-order derivative per subject", fontsize=14)
-
-        ax2_top.grid(axis="y", alpha=0.4)
-        ax2_bottom.grid(axis="y", alpha=0.4)
-
-        # X ticks
-        ax2_bottom.set_xticks(x_ticks)
-        ax2_bottom.set_xticklabels([""] * len(x_ticks))
-
-        plt.tight_layout()
-
-        OUTPUT_DRIFT_CORR_PLOT = os.path.join(
-            baseline_fig_root,
-            "sbp_mae_vs_sbp_derivative.png"
-        )
-
-        plt.savefig(OUTPUT_DRIFT_CORR_PLOT, dpi=300)
-        plt.close()
-
-        print(f"[Log Analysis] Saved → {OUTPUT_DRIFT_CORR_PLOT}")
-        
-        # Plot 4 — Drift-aware updates only
-        plt.figure(figsize=(12, 6))
-        x_ticks = np.arange(len(subjects_ordered))
-
-        plt.bar(x_ticks, updates_arr, color="steelblue", width=0.7)
-        plt.xticks(x_ticks, [""] * len(x_ticks))
-        plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-        plt.xlabel("Subjects", fontsize=14)
-        plt.ylabel("Number of drift-aware updates", fontsize=14)
-        plt.suptitle("Drift-aware update counts per subject", fontsize=16)
-        plt.title(f"Update frequency reduction: {round(frequency_saving, 2)}%", fontsize=14)
-        plt.grid(axis="y", alpha=0.4)
-
-        OUTPUT_UPDATES_ONLY = os.path.join(
-            baseline_fig_root,
-            "drift_updates_per_subject.png"
-        )
-
-        plt.tight_layout()
-        plt.savefig(OUTPUT_UPDATES_ONLY, dpi=300)
-        plt.close()
-
-        print(f"[Log Analysis] Saved → {OUTPUT_UPDATES_ONLY}")
-
-        
-def aggregate_patient_level_target_statistics_and_plot(fig_root, exp_fig_root):
-    r"""
-    Aggregates patient-specific blood pressure statistics to analyze how temporal drift and variability correlate with personalization performance.
-    
-    Parameters
-    ------------
-    fig_root (str): 
-        The root directory containing baseline folders and previously generated MAE summary CSVs.
-        
-    exp_fig_root (str): 
-        The source directory where individual subject CSV files containing target statistics over time are stored.
-    """
-    
-    print("[Result Analysis] Patient level SBP statistics vs SBP MAE ...")
-    for baseline_name in [
-        'no_adapt',
-        'first_batch_finetune',
-        'online',
-        'online_from_scratch',
-        'feature_replay',
-        'lwf',
-        'ewc',
-        'agem'
-    ]:
-        baseline_fig_root = os.path.join(fig_root, baseline_name)
-
-        # Read CSV file  with sorted SBP MAE
-        try:
-            df_sbp_sorted = pd.read_csv(os.path.join(baseline_fig_root, "df_sorted_by_SBP_MAE.csv"))
-        except:
-            print(f"No file found at {os.path.join(baseline_fig_root, 'df_sorted_by_SBP_MAE.csv')}") 
-            
-        personalization_subjects = df_sbp_sorted['subject'].tolist()
-        rows = []
-
-        for subject_id in personalization_subjects:
-            path = os.path.join(
-                exp_fig_root,
-                f"subject_{subject_id}",
-                f"subject_{subject_id}_target_stats_over_time.csv"
+            # ---------------------------------------------------
+            # Update frequency reduction statistics
+            # ---------------------------------------------------
+ 
+            did_adapt = prof['per_step']['did_adapt']
+            total_possible_updates = len(did_adapt)
+            actual_updates = did_adapt.count(True)
+ 
+            saved_updates = total_possible_updates - actual_updates
+            subject_saving = (
+                saved_updates / total_possible_updates
+                if total_possible_updates > 0 else 0.0
             )
-            df = pd.read_csv(path)
-
-            rows.append({
-                "subject": subject_id,
-                "mean_SBP": df["mean_SBP"].mean(),
-                "std_SBP": df["std_SBP"].mean(),
-                "std_mean_SBP_over_time": df["mean_SBP"].std(),
-                "mean_std_SBP_over_time": df["std_SBP"].mean()
-            })
-
-        df_patients = pd.DataFrame(rows)       
-        df_patients.to_csv(
-            os.path.join(baseline_fig_root, "patient_target_summary.csv"),
-            index=False
+ 
+            # Store per-subject statistics
+            subject_frequency_savings.append(subject_saving)
+            subject_updates_drift[subject_id] = actual_updates
+            subject_total_update_opportunities[subject_id] = (
+                total_possible_updates
+            )
+            
+            # -------------------------------
+            # Collect Latencies & Peak memory
+            # -------------------------------
+            
+            # Latency
+            for key in per_step_latency_keys:
+                values = prof['per_step'][key]
+                if len(values) > 0:
+                    per_step_per_subject_means[key].append(np.mean(values))
+ 
+            # Memory
+            # Scalar memory collection
+            for key in aggregate_memory_keys:
+                aggregate_memory_per_subject[key].append(prof[key])
+ 
+            # Per-step memory collection (peak per subject)
+            # We take max() across steps because the worst-case allocation spike
+            # is what determines whether the device runs out of RAM.
+            # Small or negative deltas elsewhere are allocator noise, not savings.
+            for key in per_step_memory_keys:
+                values = prof['per_step'].get(key, [])
+                if len(values) > 0:
+                    per_step_memory_peak_per_subject[key].append(max(values))
+ 
+    # Clinical Metrics Report
+    aggregated_clinical_metrics_csv = pd.read_csv(
+        os.path.join(
+            profiling_path,
+            "aggregate_metrics", 
+            f"aggregate_{baseline}_metrics", 
+            "evaluation_metrics.csv"
         )
-     
-        df_merged = df_sbp_sorted.merge(df_patients, on="subject")
-        df_merged = df_merged.sort_values("SBP_MAE")
-
-        df_merged.to_csv(
-            os.path.join(baseline_fig_root, "patient_sbp_mae_with_target_stats.csv"), 
-            index=False
-        )
-        
-        # --------
-        # PLOTTING
-        # --------
-        
-        df = df_merged.sort_values("SBP_MAE").reset_index(drop=True)
-        
-        # Plot 1: SBP variability vs personalization difficulty
-        rank = np.arange(len(df))
-
-        plt.figure(figsize=(12, 8))
-        plt.plot(rank, df["std_mean_SBP_over_time"], label="Temporal drift (std of mean SBP)")
-        plt.plot(rank, df["mean_std_SBP_over_time"], label="Avg within-block SBP std")
-
-        plt.xlabel("Patient rank (low → high SBP MAE)")
-        plt.ylabel("SBP variability [mmHg]")
-        plt.title("SBP variability vs personalization difficulty")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(baseline_fig_root, "sbp_variability_vs_personalization_difficulty.png"),
-            dpi=300
-        )
-        plt.close()
-        print("[Result Analysis] Saved → sbp_variability_vs_personalization_difficulty.png")
-        
-        # Plot 2: Rank-segmented violin / box plots
-        # Create rank bins
-        df["rank_bin"] = pd.qcut(
-            df.index,
-            q=[0, 0.25, 0.75, 1.0],
-            labels=["Low", "Medium", "High"]
-        )
-
-        plt.figure(figsize=(10, 7))
-        sns.violinplot(
-            data=df,
-            x="rank_bin",
-            y="std_mean_SBP_over_time",
-            inner="box"
-        )
-
-        plt.xlabel("Patient group (by SBP MAE)")
-        plt.ylabel("Temporal SBP drift")
-        plt.title("SBP drift across personalization difficulty regimes")
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(baseline_fig_root, "sbp_drift_across_personalization_difficulty.png"),
-            dpi=300
-        )
-        plt.close()
-        print("[Result Analysis] Saved → sbp_drift_across_personalization_difficulty.png")
-        
-        # Plot 3: 2D density + contour plot (subgroups as regions)
-        plt.figure(figsize=(10, 9))
-        sns.kdeplot(
-            data=df,
-            x="std_mean_SBP_over_time",
-            y="mean_std_SBP_over_time",
-            fill=True,
-            cmap="Blues",
-            thresh=0.05
-        )
-
-        plt.scatter(
-            df["std_mean_SBP_over_time"],
-            df["mean_std_SBP_over_time"],
-            c=df["SBP_MAE"],
-            cmap="plasma",
-            s=30,
-            edgecolor="k",
-            alpha=0.7
-        )
-
-        plt.xlabel("Temporal SBP drift")
-        plt.ylabel("Avg within-block SBP std")
-        plt.title("Patient density w.r.t. SBP variability")
-        plt.colorbar(label="SBP MAE")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(baseline_fig_root, "patient_density_in_sbp_variability.png"),
-            dpi=300
-        )
-        plt.close()
-        print(f"[Result Analysis] Saved → patient_density_in_sbp_variability.png")
-        
-        # ---- Correlation Analysis ----
-        rho, p = spearmanr(
-            df_merged["std_mean_SBP_over_time"],
-            df_merged["SBP_MAE"]
-        )
-
-        print(f"[Result Analysis] Correlation between temporal SBP drift and personalization MAE for {baseline_name}:")
-        print(f"\t Spearman ρ = {rho:.3f}")
-        print(f"\t R² (ρ²) = {rho**2:.3f}")
-        print(f"\t p-value = {p:.2e}")
+    )
+    print(f"\n--> Deployment ~ Clinical Metrics: ====")
+    print(aggregated_clinical_metrics_csv)
     
-
-def bytes_from_params(n_params, precision_bits):
-    r"""
-    Calculates the memory footprint in bytes based on the number of parameters and their bit precision.
-    
-    Parameters
-    ------------
-    n_params (int): 
-        The total count of parameters in the model or dataset.
-        
-    precision_bits (int): 
-        The number of bits used per parameter (e.g., 32 for float32, 16 for float16).
-        
-    Returns
-    ------------
-    output param 1:
-        The total size in bytes as an integer.   
-    """
-    return int(n_params * (precision_bits // 8))
-
-
-def calculate_activation_memory(model, dummy_input):
-    r"""
-    Calculates the total memory occupied by activations during a single forward pass.
-    Source: https://huggingface.co/blog/train_memory
-    
-    Parameters
-    ------------
-    model (torch.nn.Module): 
-        The neural network model to be analyzed.
-        
-    dummy_input (torch.Tensor): 
-        A sample input tensor of the appropriate shape for the model's forward pass.
-        
-    Returns
-    ------------
-    output param 1:
-        The total activation memory in bytes as an integer.   
-    """
-    activation_sizes = []
-
-    def forward_hook(model, input, output):
-        """
-        Hook to calculate activation size for each module.
-        The .element_size() method returns the size in bytes of each element in the tensor.
-        """
-        if isinstance(output, torch.Tensor):
-            activation_sizes.append(output.numel() * output.element_size())
-        elif isinstance(output, (tuple, list)):
-            for tensor in output:
-                if isinstance(tensor, torch.Tensor):
-                    activation_sizes.append(tensor.numel() * tensor.element_size())
-        
-    # Register hooks for each submodule
-    hooks = []
-    for submodule in model.modules():
-        hooks.append(submodule.register_forward_hook(forward_hook))
-
-    # Perform a forward pass with a dummy input
-    model.eval()  # No gradients needed for memory measurement
-    with torch.no_grad():
-        model(dummy_input)
-
-    # Clean up hooks
-    for hook in hooks:
-        hook.remove()
-        
-    return sum(activation_sizes)
-
-
-def collect_subject_metrics(exp_root, total_adapt_macs, total_adapt_prediction_macs, total_test_macs, drift_aware=False):
-    r"""
-    Aggregates computational complexity metrics and adaptation statistics across all processed subjects.
-    
-    Parameters
-    ------------
-    exp_root (str): 
-        The root directory containing individual subject folders and their corresponding update logs.
-        
-    total_adapt_macs (float): 
-        The number of Multiply-Accumulate operations (MACs) required for a single update.
-        
-    total_adapt_prediction_macs (float): 
-        The number of MACs required for a prediction during the adaptation phase per block.
-        
-    total_test_macs (float): 
-        The number of MACs required for a prediction during the testing phase per block.
-        
-    drift_aware (bool): 
-        A flag indicating whether the data collection is part of a drift-aware adaptation strategy.
-        
-    Returns
-    ------------
-    output param 1:
-        A pandas DataFrame containing subject IDs, update counts, and total MAC counts for each patient.   
-    """
-    
-    rows = []
-
-    for subj_dir in os.listdir(exp_root):
-        if not subj_dir.startswith("subject_"):
-            continue
-
-        subject_id = subj_dir.split("_")[1]
-
-        # Collect updates info
-        path = os.path.join(
-            exp_root,
-            subj_dir,
-            "feature_replay",
-            "param_update_log.csv"
-        )
-
-        df = pd.read_csv(path)
-        total_blocks = df.shape[0]
-        num_updates = (df["n_updated_params"] > 0).sum()
-
-        total_adapt_macs_patient = total_adapt_macs * num_updates
-        total_adapt_pred_macs_patient = total_adapt_prediction_macs * total_blocks
-        total_test_macs_patient = total_test_macs * total_blocks
-
-        total_macs_patient = (
-            total_adapt_macs_patient
-            + total_adapt_pred_macs_patient
-            + total_test_macs_patient
-        )
-
-        # Collect AE info for ranking
-        # -> columns naming could be improved
-        sbp_path = os.path.join(
-            exp_root,
-            subj_dir,
-            f"{subj_dir}_sbp_baseline_metrics.csv"
-        )
-
-        df_sbp = pd.read_csv(sbp_path)
-        feature_replay_sbp_aa = df_sbp.loc[df_sbp["Unnamed: 0"] == "feature_replay", "AA"].iloc[0]
-        
-        dbp_path = os.path.join(
-            exp_root,
-            subj_dir,
-            f"{subj_dir}_dbp_baseline_metrics.csv"
-        )
-
-        df_dbp = pd.read_csv(dbp_path)
-        feature_replay_dbp_aa = df_dbp.loc[df_dbp["Unnamed: 0"] == "feature_replay", "AA"].iloc[0]
-        
-        rows.append({
-            "subject": subject_id,
-            "drift_aware": drift_aware,
-            "total_blocks": total_blocks,
-            "num_updates": num_updates,
-            "total_macs": total_macs_patient,
-            "adapt_macs": total_adapt_macs_patient,
-            "sbp_aa": feature_replay_sbp_aa,
-            "dbp_aa": feature_replay_dbp_aa            
-        })
-
-    return pd.DataFrame(rows)
-
-
-def read_feature_replay_aa(csv_path):
-    r"""
-    Extracts the mean Average Accuracy (AA) for the feature replay baseline from a results CSV.
-    
-    Parameters
-    ------------
-    csv_path (str): 
-        The file path to the CSV containing performance metrics for various baselines.
-        
-    Returns
-    ------------
-    output param 1:
-        The mean Average Accuracy value as a float.   
-    """
-    df = pd.read_csv(csv_path)
-    aa_value = df.loc[df["Baseline"] == "feature_replay", "AA_mean"].iloc[0]
-    return aa_value
-
-
-def relative_degradation(aware, unaware):
-    r"""
-    Calculates the percentage change in performance between aware and unaware drift updates.
-    Positive value = worse performance (higher AA).
-    Negative value = improvement.
-    
-    Parameters
-    ------------
-    aware (float): 
-        The metric value (e.g., Average Accuracy) from the drift-aware model.
-        
-    unaware (float): 
-        The metric value from the standard or drift-unaware model used as a baseline.
-        
-    Returns
-    ------------
-    output param 1: 
-        The relative change expressed as a percentage.   
-    """
-    return (aware - unaware) / unaware * 100
-
-
-def resource_usage_profile(config_file_path, root_savepath, exp_fig_root, drift_aware_roots):
-    r"""
-    Profiles the computational resources and memory footprint of the Continual Learning algorithm (Feature Replay) and generates comparative reports between drift-aware and drift-unaware settings.
-    
-    Parameters
-    ------------
-    config_file_path (str): 
-        Path to the YAML configuration file containing model architecture and training hyperparameters.
-        
-    root_savepath (str): 
-        The primary directory where the resource usage profiles and generated plots will be stored.
-        
-    exp_fig_root (str): 
-        The directory containing experiment results for the standard (drift-unaware) baseline.
-        
-    drift_aware_roots (str): 
-        The list of directories containing experiment results for the drift-aware adaptation strategy.
-    """
-    
-    OUT_FIG_ROOT = os.path.join(root_savepath, "resource_usage_profile")
-    os.makedirs(OUT_FIG_ROOT, exist_ok=True) 
-    
-    # Get configuration parameters
-    with open(config_file_path, "r") as f:
-        setup = yaml.safe_load(f)
-
-    # Setup Configuration
-    precision_bits = int(setup.get('precision_bits', 32)) # Deafult to float32 if not specified
-    adapt_bs = int(setup.get('personalization_batch_size'))
-    test_bs = int(setup.get('validation_batch_size'))
-    
-    # NOTE: during an update the best model is selected helding out 0.25 of the personalization batch as validation, 
-    # therefore the personliazaiton batch size and the replayed samples are personalization_bs * 0.75
-    # -> overestimation with the full adapt_bs
-    num_replay_samples_per_update = adapt_bs
-    
-    input_seq_len_s = int(setup.get('input_seq_len_s'))
-    sampling_frequency = setup.get('fs')
-    input_channels = 2 if setup.get('ecg') else 1
-    feature_embed_dim = int(setup.get('embed_dim'))
-    replay_buffer_size = int(setup.get('replay_buffer_size'))
-    
-    steps_per_update = int(setup.get('personalization_steps'))
-    alpha_backward = 2 # fwd+bwd MACs as 2 times the fwd MACs
-    
-    # ---- Resource Usage Estimation for the Model ----
-    print("[Resource Usage Profile] Instantiating the encoder and the head ...")
-
-    # Instantiate encoder
-    encoder = Proto(setup.get('ecg'), sampling_frequency, input_seq_len_s, feature_embed_dim)
-    x = torch.rand(1, input_seq_len_s * sampling_frequency, input_channels) # N.B. batch size 1 for profiling
-    
-    encoder_forward_macs_sample, encoder_params = profile(encoder, inputs=(x,))
-    encoder_forward_m_macs_sample = (encoder_forward_macs_sample) / 1e6
-    encoder_params_mb = bytes_from_params(encoder_params, precision_bits=precision_bits) / (1024**2)
-    
-    encoder_act_bytes = calculate_activation_memory(encoder, x)
-    encoder_act_bytes_mb = encoder_act_bytes / (1024**2)
-        
-    print(f'[Resource Usage Profile] Proto Encoder has:') 
-    print(f'\t- {encoder_params} params ({encoder_params_mb:.2f} MB)')
-    print(f'\t- {encoder_forward_m_macs_sample:.2f} M MACs per sample')
-    print(f'\t- {encoder_act_bytes_mb:.2f} MB forward peak activation bytes')
-    
-    # Instantiate head
-    head = BPRegressor(encoder.embed_dim, 3)
-    y = torch.rand(1, encoder.embed_dim) # N.B. batch size 1 for profiling
-    
-    head_forward_macs_sample, head_params = profile(head, inputs=(y,))
-    head_forward_k_macs_sample = (head_forward_macs_sample) / 1e3
-    head_params_kb = bytes_from_params(head_params, precision_bits=precision_bits) / 1024
-    
-    head_act_bytes = calculate_activation_memory(head, y)
-    head_act_bytes_kb = head_act_bytes / 1024
-
-    print(f'[Resource Usage Profile] Proto Head has:') 
-    print(f'\t- {head_params} params ({head_params_kb:.2f} kB)')
-    print(f'\t- {head_forward_k_macs_sample:.2f} k MACs per sample')
-    print(f'\t- {head_act_bytes_kb:.2f} kB forward peak activation bytes')
-    
-    # ---- Resource Usage Estimation for the Feature Replay Algorithm ----
-    
-    # NOTE: On update, the head has also the feature replay buffer batch
-    # NOTE: Assume that personalization, evaluation, and replayed feature batch sizes are equal
-    # NOTE: Keep in mind to check the batch size used in thop, it should be 1
-    # NOTE: An update is w/ frozen encoder and head-only updates
-    # NOTE: Excluding the replay buffer update operations (e.g. reservoir operations for buffer update)
-    
-    # ---- MACs for adaptation ----    
-    
-    # The CL algorithm always predicts the training batch + validation batch to ensure a prediction for all samples (necessary in a real system)
-    total_adapt_prediction_macs = (encoder_forward_macs_sample + head_forward_macs_sample) * adapt_bs
-    
-    # MACs for head when encoder is frozen and there are the replay buffer features
-    macs_head_forward_per_update_step = head_forward_macs_sample * (adapt_bs + num_replay_samples_per_update)
-    macs_head_forward_backward_per_update_step = alpha_backward * macs_head_forward_per_update_step
-    
-    # Multiply by steps to get the MACs related to the updated head when updating only the head
-    macs_head_total =  steps_per_update * macs_head_forward_backward_per_update_step
-    
-    # Encoder MACs per update are simply the encoder batch forward by the number of steps
-    macs_encoder_total = encoder_forward_macs_sample * adapt_bs
-    
-    # Total MACs per update with frozen encoder (input = one personalization batch)
-    total_adapt_macs = macs_encoder_total + macs_head_total 
-     
-    # Optimizer operations, assuming Adam formula is the following:
-    # Adam Optimizer - Operation Count Per Parameter
-    # ================================================
-    # Formula:
-    #   m_t = β₁ · m_{t-1} + (1 - β₁) · g_t
-    #   v_t = β₂ · v_{t-1} + (1 - β₂) · g_t²
-    #   m̂_t = m_t / (1 - β₁^t)
-    #   v̂_t = v_t / (1 - β₂^t)
-    #   θ_t = θ_{t-1} - α · m̂_t / (√v̂_t + ε)
-    #
-    # Operation Count:
-    # ┌─────────────────┬───────┬──────────────────────────────────────────┐
-    # │ Operation Type  │ Count │ Where Used                               │
-    # ├─────────────────┼───────┼──────────────────────────────────────────┤
-    # │ Multiplication  │   5   │ β₁·m_{t-1}, (1-β₁)·g_t, β₂·v_{t-1},    │
-    # │                 │       │ (1-β₂)·g_t², α·[...]                    │
-    # │ Addition        │   3   │ m_t sum, v_t sum, √v̂_t + ε              │
-    # │ Subtraction     │   1   │ θ_{t-1} - [...]                         │
-    # │ Division        │   3   │ m_t/(1-β₁^t), v_t/(1-β₂^t), m̂_t/[...] │
-    # │ Square          │   1   │ g_t²                                     │
-    # │ Square Root     │   1   │ √v̂_t                                     │
-    # ├─────────────────┼───────┼──────────────────────────────────────────┤
-    # │ TOTAL           │  14   │                                          │
-    # └─────────────────┴───────┴──────────────────────────────────────────┘
-    #optimizer_ops = 14
-    # For N updated parameters: 14N operations per optimizer step
-    # -> these are FLOPs and not MACs
-    #optimizer_ops_per_update = steps_per_update * head_params * optimizer_ops
-    #
-    # NOTE: also reservoir sampling requires ops that are neglected here
-    
-    # ---- MACs for testing ----
-    # Encoder forward + head forward (input = one validation batch)
-    # with a single step since this is inference and without replay buffer, buffer is only for training
-    total_test_macs = (encoder_forward_macs_sample + head_forward_macs_sample) * test_bs
-    
-    
-    # ---- CL algorithm occupation in memory as number of bytes ----
-    model_params = bytes_from_params(encoder_params + head_params, precision_bits)
-    
-    # Input size
-    # During adaptation the fact that we have also validation inference and also the prediction inferece on the training data (necessary in a real system) 
-    # does not matter from a storage point of view as adaptation costs dominate the memory usage
-    # -> we use adapt_bs instead of splitting into adapt and val sizes
-    adapt_input_batch_bytes = bytes_from_params(adapt_bs * input_seq_len_s * sampling_frequency * input_channels, precision_bits)
-    adapt_feature_batch_size = bytes_from_params((adapt_bs + num_replay_samples_per_update) * feature_embed_dim, precision_bits)
-    
-    test_input_batch_bytes = bytes_from_params(test_bs * input_seq_len_s * sampling_frequency * input_channels, precision_bits)
-    test_feature_batch_size = bytes_from_params(test_bs * feature_embed_dim, precision_bits)
-    
-    # Feature replay memory occupation
-    replay_buffer_total_bytes = bytes_from_params(replay_buffer_size * feature_embed_dim, precision_bits)
-    
-    # Gradients bytes
-    adapt_gradients_bytes = bytes_from_params(head_params, precision_bits)
-    
-    # Optimizer states in bytes
-    # -> we use Adam, that stores and update momentum and variance, hence two values for each update parameters
-    optimizer_states_bytes = bytes_from_params(2 * head_params, precision_bits)
-    
-    # Activation memory during adaptation (defined as any intermediate output of the encoder/head layers)
-    # -> total memory for activations (upper bound)
-    head_forward_backward_activations_bytes = head_act_bytes * alpha_backward
-    adapt_activation_forward_backward_bytes = encoder_act_bytes * adapt_bs # personalization + val batch size 
-    adapt_activation_forward_backward_bytes += head_forward_backward_activations_bytes * (adapt_bs + num_replay_samples_per_update) # adapt batch size
-    
-    # Total algorithm occupation in memory during update
-    # -> encoder is never updated, so it never does a backward pass
-    total_adapt_memory = adapt_input_batch_bytes + adapt_feature_batch_size + model_params + adapt_activation_forward_backward_bytes + adapt_gradients_bytes + optimizer_states_bytes + replay_buffer_total_bytes
-    
-    # Activation memory during testing (defined as any intermediate output of the encoder/head layers)
-    # -> total memory for activations (upper bound)
-    test_activation_forward_bytes = (encoder_act_bytes + head_act_bytes) * test_bs
-    
-    # Total algorithm occupation in memory during inference 
-    # replay buffer is in memory even if it is not used during inference, gradients/optimziers may even be deallocated
-    total_test_memory = test_input_batch_bytes + test_feature_batch_size + model_params + test_activation_forward_bytes + replay_buffer_total_bytes  
-    
-    print(f"[Resource Usage Profile] Feature Replay Algorithm Resource Usage:")
-    print(f"\t- Total model params (encoder + head): {model_params / (1024**2):.2f} MB")
-    print(f"\t- Total adaptation MACs per update: {total_adapt_macs / 1e6:.2f} M MACs")
-    print(f"\t- Total adaptation prediction MACs per update: {total_adapt_prediction_macs / 1e6:.2f} M MACs")
-    print(f"\t- Total testing MACs per inference: {total_test_macs / 1e6:.2f} M MACs")
-    print(f"\t- Sample memory: {bytes_from_params(input_seq_len_s * sampling_frequency * input_channels, precision_bits) / 1024:.2f} kB")
-    print(f"\t- Total replay buffer memory: {replay_buffer_total_bytes / 1024:.2f} kB")
-    print(f"\t- Total adaptation feature memory: {adapt_feature_batch_size / 1024:.2f} kB")
-    print(f"\t- Total adaptation memory: {total_adapt_memory / (1024**2):.2f} MB")
-    print(f"\t- Total adaptation forward/backward bytes: {adapt_activation_forward_backward_bytes / (1024**2):.2f} MB")
-    print(f"\t- Total adaptation head forward/backward bytes: {(head_forward_backward_activations_bytes * (adapt_bs + num_replay_samples_per_update)) / 1024:.2f} kB")
-    print(f"\t- Total adaptation gradient bytes: {adapt_gradients_bytes / 1024:.2f} kB")
-    print(f"\t- Total adaptation optimizer state bytes: {optimizer_states_bytes / 1024:.2f} kB")
-    print(f"\t- Total replay buffer memory: {replay_buffer_total_bytes / 1024:.2f} kB")
-    print(f"\t- Total testing batch memory: {test_input_batch_bytes / 1024:.2f} kB")
-    print(f"\t- Total testing activation memory: {test_activation_forward_bytes / (1024**2):.2f} MB")
-    print(f"\t- Total testing encoder memory: {(encoder_act_bytes * test_bs) / (1024**2):.2f} MB")
-    print(f"\t- Total testing feature memory: {test_feature_batch_size / 1024:.2f} kB")
-    print(f"\t- Total testing prediction head activation memory: {(head_act_bytes * test_bs) / 1024:.2f} kB")
-    print(f"\t- Total testing memory: {total_test_memory / (1024**2):.2f} MB")
-    print(f"\t- Total forward MACs encoder batch: {(encoder_forward_macs_sample * test_bs) / 1e6:.2f} M MACs")
-    print(f"\t- Total forward MACs head batch: {(head_forward_macs_sample * test_bs) / 1e3:.2f} k MACs")
-    print(f"\t- Total forward/backward MACs head batch: {macs_head_total / 1e6:.2f} M MACs")
-    
-    # Compute AA, MACs and number of updates per drift unaware cases
-    df_unaware = collect_subject_metrics(
-        exp_fig_root,
-        total_adapt_macs=total_adapt_macs,
-        total_adapt_prediction_macs=total_adapt_prediction_macs,
-        total_test_macs=total_test_macs,
-        drift_aware=False
+    # Calculate the adaptation frequency reduction
+    mean_frequency_saving = np.mean(subject_frequency_savings) * 100
+    std_frequency_saving = np.std(subject_frequency_savings) * 100
+ 
+    print(
+        f"\n--> Deployment ~ Update Frequency Reduction:"
+        f" {mean_frequency_saving:.1f}% ± "
+        f"{std_frequency_saving:.1f}%"
     )
     
-    # Read AA without drift-aware
-    sbp_path_unaware = os.path.join(
-        exp_fig_root,
-        "aggregate_metrics",
-        "sbp_aggregate_baseline_metrics.csv"
-    )
-    dbp_path_unaware = os.path.join(
-        exp_fig_root,
-        "aggregate_metrics",
-        "dbp_aggregate_baseline_metrics.csv"
-    )
-    aa_sbp_unaware = read_feature_replay_aa(sbp_path_unaware)
-    aa_dbp_unaware = read_feature_replay_aa(dbp_path_unaware)
-
-    all_updates = {}
-    subject_order = None
-    results = []
-
-    for drift_root in drift_aware_roots:
-
-        print(f"\n[Resource Usage Profile] Processing drift-aware experiment: {drift_root}")
-
-        df_aware = collect_subject_metrics(
-            drift_root,
-            total_adapt_macs=total_adapt_macs,
-            total_adapt_prediction_macs=total_adapt_prediction_macs,
-            total_test_macs=total_test_macs,
-            drift_aware=True
-        )
-
-        # ---- Read AA metrics ----
-        sbp_path_aware = os.path.join(
-            drift_root,
-            "aggregate_metrics",
-            "sbp_aggregate_baseline_metrics.csv"
-        )
-
-        dbp_path_aware = os.path.join(
-            drift_root,
-            "aggregate_metrics",
-            "dbp_aggregate_baseline_metrics.csv"
-        )
-
-        aa_sbp_aware = read_feature_replay_aa(sbp_path_aware)
-        aa_dbp_aware = read_feature_replay_aa(dbp_path_aware)
-
-        sbp_deg = relative_degradation(aa_sbp_aware, aa_sbp_unaware)
-        dbp_deg = relative_degradation(aa_dbp_aware, aa_dbp_unaware)
-
-        # ---- MAC savings ----        
-        df_merged = pd.merge(
-            df_unaware,
-            df_aware,
-            on="subject",
-            suffixes=("_unaware", "_aware")
-        )
-
-        df_merged["relative_macs_savings"] = (
-            (df_merged["total_macs_unaware"] - df_merged["total_macs_aware"])
-            / df_merged["total_macs_unaware"]
-        ) * 100
-
-        mac_savings_mean = df_merged["relative_macs_savings"].mean()
-
-        print(f"SBP AA degradation: {sbp_deg:+.2f}%")
-        print(f"DBP AA degradation: {dbp_deg:+.2f}%")
-        print(f"Relative MAC savings: {mac_savings_mean:.2f}%")
-
-        # ---- Histogram of updates per patient ----
-        df_sorted = df_merged.sort_values("subject")
-        
-        # Extract the threshold string as the experiment name
-        exp_name = drift_root.split('/')[2][-3:]
-        
-        plt.figure(figsize=(12,6))
-
-        plt.bar(
-            df_sorted["subject"],
-            df_sorted["num_updates_aware"]
-        )
-
-        plt.xticks(rotation=90)
-        plt.xlabel("Subjects", fontsize=12)
-        plt.ylabel("Number of drift-aware updates", fontsize=12)
-        plt.title("Drift-aware update frequency per subject", fontsize=14)
-
-        plt.tight_layout()
-
-        plt.savefig(
-            os.path.join(
-                OUT_FIG_ROOT,
-                f"drift_updates_histogram_{exp_name}.png"
-            ),
-            dpi=300
-        )
-
-        plt.close()
-        
-        # Store the number of updates for this experiment
-        # Select a subset of all_updates to improve readability of the plot
-        if exp_name == '0.1' or exp_name == '0.3' or exp_name == '0.5':
-            all_updates[exp_name] = df_sorted["num_updates_aware"].values
-            subject_order = df_sorted["subject"].values # subject order is always the same
-        
-        # ---- Store results ----
-        results.append({
-            "experiment": exp_name,
-            "sbp_degradation_percent": round(sbp_deg, 2),
-            "dbp_degradation_percent": round(dbp_deg, 2),
-            "mac_savings_percent": round(mac_savings_mean, 2)
-        })
+    # Latency
+    print("\n--> Per-step Latency Summary (mean ± std across subjects):")
+    for key in per_step_latency_keys:
+        arr = np.array(per_step_per_subject_means[key])
+        print(f"{key:45s}  {arr.mean()*1e3:7.2f} ± {arr.std()*1e3:6.2f} ms")
+ 
+    # Scalar memory summary
+    # Each value is already the right aggregate for the subject (a peak or
+    # a fixed snapshot), so mean ± std across subjects is directly meaningful.
+    print("\n--> Memory Summary — Aggregate (mean ± std across subjects):")
+    labels = {
+        'model_memory_mb':         'Model footprint (load cost)',
+        'rss_before_tta_mb':       'RSS before TTA loop (fixed cost)',
+        'peak_tta_rss_mb':         'Peak RSS during TTA loop (absolute)',
+        'peak_incremental_tta_mb': 'Peak incremental TTA memory',
+        'peak_process_rss_mb':     'Process-wide peak RSS (incl. imports)',
+        'tm_peak_run_kb':          'Peak Python-heap usage over the entire run (kB)'
+    }
+    for key in aggregate_memory_keys:
+        arr = np.array(aggregate_memory_per_subject[key])
+        print(f"  {labels[key]:50s}  {arr.mean():7.2f} ± {arr.std():5.2f} MB")
+ 
+    # Per-step memory summary
+    # Reported as mean ± std of the per-subject MAX delta.
+    # This answers: "what is the worst-case allocation spike for this section
+    # across subjects?"
+    print("\n--> Memory Summary — Per-step MAX delta (mean ± std across subjects):")
+    print("    NOTE: each subject contributes its worst-case step delta;")
+    print("    small values reflect allocator caching, not true zero cost.\n")
+    step_mem_labels = {
+        'tm_current_kb':            "Absolute Python-heap usage at the end of each step",
+        'tm_head_adapt_kb':         "Delta during head adaptation",
+        'tm_detector_reinit_kb':    "Delta during detector reinit"
+    }
+    for key in per_step_memory_keys:
+        arr = np.array(per_step_memory_peak_per_subject.get(key, []))
+        if arr.size > 0:
+            print(f"  {step_mem_labels[key]:45s}  {arr.mean():7.2f} ± {arr.std():5.2f} MB")
     
-    # For plotting readability check all_updates length
-    assert len(all_updates) == 3, f"Expected 3 experiments, found {len(all_updates)}"
-    
-    # Plot  num updates reduction
-    plt.figure(figsize=(14, 10))
-
-    # Define a custom Pastel RGB palette
-    pastel_rgb = [
-        (0.4, 0.6, 1.0),  # Muted Blue (Sky)
-        (1.0, 0.85, 0.30), # Golden Pastel Yellow
-        (1.0, 0.4, 0.4), # Muted Red (Salmon)
+    # --------
+    # PLOTTING
+    # --------      
+ 
+    # Plot 1: Drift-aware updates per subject
+    subject_ids = list(subject_updates_drift.keys())
+ 
+    drift_updates = [
+        subject_updates_drift[sid]
+        for sid in subject_ids
     ]
-    # Sort experiments by total updates descending 
-    # This ensures smaller bars are often drawn "on top" of larger ones if they share a baseline
-    sorted_exps = sorted(all_updates.items(), key=lambda x: np.mean(x[1]), reverse=True)
+ 
+    max_updates_per_subject = [
+        subject_total_update_opportunities[sid]
+        for sid in subject_ids
+    ]
+ 
+    x_ticks = np.arange(len(subject_ids))
+ 
+    plt.figure(figsize=(12, 8))
+ 
+    # Actual performed updates
+    plt.bar(
+        x_ticks,
+        drift_updates,
+        color="steelblue",
+        width=0.7,
+        label="Performed updates"
+    )
+ 
+    # Maximum possible updates
+    plt.plot(
+        x_ticks,
+        max_updates_per_subject,
+        color="darkred",
+        linestyle="--",
+        linewidth=2,
+        label="Maximum possible updates"
+    )
+ 
+    plt.xticks(x_ticks, [""] * len(x_ticks))
+ 
+    plt.gca().yaxis.set_major_locator(
+        plt.MaxNLocator(integer=True)
+    )
+ 
+    plt.xlabel("Subjects", fontsize=14)
+    plt.ylabel("Number of updates", fontsize=14)
+    plt.suptitle(
+        f"Drift-aware adaptation frequency per subject\n"
+        f"Average update reduction: "
+        f"{mean_frequency_saving:.1f}% ± "
+        f"{std_frequency_saving:.1f}%",
+        fontsize=16
+    )
+ 
+    plt.legend(fontsize=12)
+    plt.grid(axis="y", alpha=0.4)
+    plt.tight_layout()
+ 
+    save_path = (
+        f"./drift_updates_per_subject_on_"
+        f"{deployment_device}.png"
+    )
+ 
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"[Log Analysis] Saved → {save_path}")
+ 
+    # Plot 2: Latency breakdown
+    # Two-panel figure: top = per-step latencies, bottom = calibration
+    # latencies. Horizontal grouped bars with mean ± std error bars.
+    # Per-step and calibration are kept separate because they differ by
+    # ~3 orders of magnitude and combining them would crush the per-step bars.
+    #
+    # Per-step labels and colors — ordered from cheapest to most expensive
+    # so the reader's eye naturally moves from background cost to peak cost.
+    per_step_display = {
+        'prediction_s':             ('Prediction  ph(feats)',           '#4393c3'),
+        'feature_extraction_s':     ('Feature extraction  enc(x)',      '#2166ac'),
+        'drift_detection_s':        ('Drift detection  detector loop',  '#92c5de'),
+        'head_adapt_s':             ('Head adaptation  train loop',     '#d6604d'),
+        'drift_detector_reinit_s':  ('Detector reinit  reference copy', '#f4a582'),
+        'adaptation_s':             ('Full adaptation block',           '#b2182b'),
+        'total_step_s':             ('Total TTA step  (wall time)',     '#333333'),
+    }
+ 
+    fig, ax = plt.subplots(figsize=(12, 8))
+ 
+    # Panel A: per-step latencies
+    step_keys   = list(per_step_display.keys())
+    step_labels = [per_step_display[k][0] for k in step_keys]
+    step_colors = [per_step_display[k][1] for k in step_keys]
+ 
+    step_means = np.array([
+        np.array(per_step_per_subject_means[k]).mean() * 1e3   # → ms
+        for k in step_keys
+    ])
+    step_stds = np.array([
+        np.array(per_step_per_subject_means[k]).std() * 1e3
+        for k in step_keys
+    ])
+ 
+    y_pos = np.arange(len(step_keys))
+    bars  = ax.barh(
+        y_pos, step_means,
+        xerr=step_stds,
+        color=step_colors,
+        edgecolor='white',
+        height=0.6,
+        capsize=4,
+        error_kw=dict(elinewidth=1.2, ecolor='#555555')
+    )
+    # Annotate each bar with its value
+    for bar, mean, std in zip(bars, step_means, step_stds):
+        ax.text(
+            bar.get_width() + std + 0.3,
+            bar.get_y() + bar.get_height() / 2,
+            f"{mean:.1f} ± {std:.1f} ms",
+            va='center', ha='left', fontsize=9, color='#333333'
+        )
+ 
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(step_labels, fontsize=11)
+    ax.set_xlabel("Latency (ms)", fontsize=12)
+    ax.grid(axis='x', alpha=0.35)
+    ax.spines[['top', 'right']].set_visible(False)
+    # Add extra x-axis margin so annotations don't clip
+    ax.set_xlim(right=ax.get_xlim()[1] * 1.35)
+ 
+    fig.suptitle(f"Per-step latencies  (mean ± std across subjects) on {deployment_device}", fontsize=15, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    save_path = f"./latency_profile_on_{deployment_device}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[Log Analysis] Saved → {save_path}")
+ 
+    # Plot 3: Memory breakdown
+    model_arr       = np.array(aggregate_memory_per_subject['model_memory_mb'])
+    incremental_arr = np.array(aggregate_memory_per_subject['peak_incremental_tta_mb'])
+    rss_before_arr  = np.array(aggregate_memory_per_subject['rss_before_tta_mb'])
+    
+    runtime_arr     = rss_before_arr - model_arr
+ 
+    subject_ids = list(subject_updates_drift.keys())
+    n_subjects  = len(subject_ids)
+    x = np.arange(n_subjects)
+ 
+    per_step_mem_display = {
+        'tm_current_kb':            ('Abs. Python-heap usage (step end)',  '#d6604d'),
+        'tm_head_adapt_kb':         ('Delta during head adaptation',       '#4393c3'),
+        'tm_detector_reinit_kb':    ('Delta during detector reinit',       "#5ca708"),
+    }
+ 
+    fig, (ax_stack, ax_step_mem) = plt.subplots(
+        2, 1,
+        figsize=(14, 11),
+        gridspec_kw={'height_ratios': [3, len(per_step_mem_display)]}
+    )
+ 
+    # Panel A: stacked RSS per subject
+    ax_stack.bar(x, runtime_arr,     label="Library / runtime baseline", color='lightgrey',  width=0.6)
+    ax_stack.bar(x, model_arr,       label="Model footprint",             color='steelblue',  width=0.6,
+                 bottom=runtime_arr)
+    ax_stack.bar(x, incremental_arr, label="TTA incremental memory  [headline]",
+                 color='darkorange', width=0.6,
+                 bottom=runtime_arr + model_arr)
+ 
+    # Mean reference lines
+    ax_stack.axhline(
+        (runtime_arr + model_arr).mean(),
+        color='steelblue', linewidth=1.2, linestyle='--', alpha=0.7,
+        label=f"Mean fixed cost  {(runtime_arr + model_arr).mean():.1f} MB"
+    )
+    ax_stack.axhline(
+        (runtime_arr + model_arr + incremental_arr).mean(),
+        color='darkorange', linewidth=1.2, linestyle='--', alpha=0.7,
+        label=f"Mean total peak  {(runtime_arr + model_arr + incremental_arr).mean():.1f} MB"
+    )
+ 
+    ax_stack.set_xticks(x)
+    ax_stack.set_xticklabels([""] * n_subjects)
+    ax_stack.set_xlabel("Subjects", fontsize=12)
+    ax_stack.set_ylabel("RSS Memory (MB)", fontsize=12)
+    ax_stack.set_title("Absolute RSS breakdown per subject", fontsize=13)
+    ax_stack.legend(fontsize=10, loc='upper left')
+    ax_stack.grid(axis='y', alpha=0.35)
+    ax_stack.spines[['top', 'right']].set_visible(False)
+ 
+    # Panel B: per-step worst-case allocation spikes
+    mem_keys   = list(per_step_mem_display.keys())
+    mem_labels = [per_step_mem_display[k][0] for k in mem_keys]
+    mem_colors = [per_step_mem_display[k][1] for k in mem_keys]
+ 
+    mem_means = np.array([
+        np.array(per_step_memory_peak_per_subject.get(k, [0])).mean()
+        for k in mem_keys
+    ])
+    mem_stds = np.array([
+        np.array(per_step_memory_peak_per_subject.get(k, [0])).std()
+        for k in mem_keys
+    ])
+ 
+    y_pos_m = np.arange(len(mem_keys))
+    bars_m  = ax_step_mem.barh(
+        y_pos_m, mem_means,
+        xerr=mem_stds,
+        color=mem_colors,
+        edgecolor='white',
+        height=0.6,
+        capsize=4,
+        error_kw=dict(elinewidth=1.2, ecolor='#555555')
+    )
+    for bar, mean, std in zip(bars_m, mem_means, mem_stds):
+        ax_step_mem.text(
+            bar.get_width() + std + 0.05,
+            bar.get_y() + bar.get_height() / 2,
+            f"{mean:.2f} ± {std:.2f} MB",
+            va='center', ha='left', fontsize=9, color='#333333'
+        )
+ 
+    ax_step_mem.set_yticks(y_pos_m)
+    ax_step_mem.set_yticklabels(mem_labels, fontsize=11)
+    ax_step_mem.set_xlabel("Memory delta (MB)", fontsize=12)
+    ax_step_mem.set_title(
+        "Per-step worst-case allocation spike  (max across steps, mean ± std across subjects)\n"
+        "Note: values near zero reflect allocator caching, not true zero cost",
+        fontsize=11
+    )
+    ax_step_mem.grid(axis='x', alpha=0.35)
+    ax_step_mem.spines[['top', 'right']].set_visible(False)
+    ax_step_mem.set_xlim(right=ax_step_mem.get_xlim()[1] * 1.4)
+ 
+    fig.suptitle(f"Memory profile on {deployment_device}", fontsize=15, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    save_path = f"./memory_profile_on_{deployment_device}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[Log Analysis] Saved → {save_path}") 
+    
+           
+# ---------------------
+# LaTeX Table Generator
+# ---------------------
 
-    for i, (exp_name, updates) in enumerate(sorted_exps):
-        plt.bar(
-            subject_order, 
-            updates, 
-            label=f"thr: {exp_name}", 
-            color=pastel_rgb[i],
-            alpha=0.8,            # Increased opacity for better visibility
-            edgecolor=pastel_rgb[i], 
-            linewidth=1.2,        # Slightly thicker edge to define the overlap
-            width=0.8,
-            zorder=i              # Larger values at back, smaller values on top
+def aggregate_seed_dataframes(dataframes, bhs_columns=None):
+    """
+    Aggregate metrics across multiple seeds.
+
+    Parameters
+    ----------
+    dataframes : list[pd.DataFrame]
+        List of dataframes having identical structure.
+    bhs_columns : list[str]
+        Columns containing BHS grades (A/B/C/D).
+        These are aggregated using the mode.
+
+    Returns
+    -------
+    pd.DataFrame
+        Aggregated dataframe.
+    """
+
+    if bhs_columns is None:
+        bhs_columns = []
+
+    agg_df = dataframes[0].copy()
+
+    for col in agg_df.columns:
+
+        # -----------------------
+        # BHS columns -> use mode
+        # -----------------------
+        if col in bhs_columns:
+
+            modes = []
+
+            for idx in range(len(agg_df)):
+                values = [df.loc[idx, col] for df in dataframes]
+
+                # mode across seeds
+                mode_value = Counter(values).most_common(1)[0][0]
+                modes.append(mode_value)
+
+            agg_df[col] = modes
+
+        # ---------------------------
+        # Numeric columns -> use mean
+        # ---------------------------
+        else:
+
+            try:
+                stacked = np.stack([df[col].astype(float).values for df in dataframes])
+                agg_df[col] = stacked.mean(axis=0)
+
+            except:
+                # Non numeric and not BHS (e.g. "Type") -> keep first
+                pass
+
+    return agg_df
+
+
+def fmt(x):
+    """
+    Round numeric values to 1 decimals.
+    """
+    if isinstance(x, (int, float, np.floating)):
+        return f"{x:.1f}"
+    return str(x)
+
+def generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
+    aggregated_results,
+    baseline_display_names,
+    set_mapping,
+    ae_column="AE_mean",
+    bwt_column="BWT_mean",
+    me_column="ME",
+    std_column="STD",
+    bhs_column="BHS_Grade"
+):
+
+    latex = []
+    latex.append(r"\begin{table*}")
+    latex.append(r"    \centering")
+    latex.append(r"    \caption{Personalization results (averaged over three seeds) on Vital DB for continuous SBP/DBP estimation from PPG, divided into the three subject sets 1/2/3. Parentheses indicate the target thresholds for the clinical standards for both SBP/DBP. CL algorithms are in light gray.}")
+    latex.append(r"    \begin{tabular}{l|l|l|l|p{0.15\textwidth}|p{0.16\textwidth}|l}")
+    latex.append(r"        \hline")
+    latex.append(r"        \textbf{Set} & \textbf{Algorithm} & \textbf{AE}$\downarrow$ & \textbf{BWT}$\downarrow$ & \makecell[l]{\textbf{ME}$\downarrow$ \\ ($<$5 mmHg)} & \makecell[l]{\textbf{STD}$\downarrow$ \\ ($<$8 mmHg)} & \makecell[l]{\textbf{BHS}$\uparrow$ \\ (A)} \\")
+    latex.append(r"        \hline")
+
+    first_set = True
+
+    for set_id, shift_name in set_mapping.items():
+
+        first_algo = True
+
+        for baseline_key, display_name in baseline_display_names.items():
+
+            # ---------------------------
+            # Retrieve aggregated metrics
+            # ---------------------------
+
+            clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
+            sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
+            dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
+            
+            # -----------------------
+            # Assumes single-row CSVs
+            # -----------------------
+
+            ae_sbp = fmt(sbp_cl_df.iloc[0][ae_column])
+            ae_dbp = fmt(dbp_cl_df.iloc[0][ae_column])
+            
+            bwt_sbp = fmt(sbp_cl_df.iloc[0][bwt_column])
+            bwt_dbp = fmt(dbp_cl_df.iloc[0][bwt_column])
+
+            me_sbp = fmt(clinical_df.iloc[0][me_column])
+            me_dbp = fmt(clinical_df.iloc[1][me_column])
+            
+            std_sbp = fmt(clinical_df.iloc[0][std_column])
+            std_dbp = fmt(clinical_df.iloc[1][std_column])
+
+            bhs_sbp = clinical_df.iloc[0][bhs_column]
+            bhs_dbp = clinical_df.iloc[1][bhs_column]
+
+            # ---------
+            # Build row
+            # ---------
+
+            if first_algo:
+                row = f"        {set_id} "
+                first_algo = False
+            else:
+                row = "        "
+
+            if display_name == 'feat.replay':
+                row += r"& \cellcolor{lightgray!30}\textbf{feat.replay} "
+                row += (
+                    r"& \textbf{" + f"{ae_sbp} / {ae_dbp}" + "} "
+                    r"& \textbf{" + f"{bwt_sbp} / {bwt_dbp}" + "} "
+                    r"& \textbf{" + f"{me_sbp} / {me_dbp}" + "} "
+                    r"& \textbf{" + f"{std_sbp} / {std_dbp}" + "} "
+                    r"& \textbf{" + f"{bhs_sbp} / {bhs_dbp}" + "} \\\\"
+                )
+            elif display_name in {'LwF', 'EWC', 'AGEM'}:
+                row += r"& \cellcolor{lightgray!30}" + f"{display_name} "
+                row += (
+                    f"& {ae_sbp} / {ae_dbp} "
+                    f"& {bwt_sbp} / {bwt_dbp} "
+                    f"& {me_sbp} / {me_dbp} "
+                    f"& {std_sbp} / {std_dbp} "
+                    f"& {bhs_sbp} / {bhs_dbp} \\\\"
+                )
+            else:
+                row += (
+                    f"& {display_name} "
+                    f"& {ae_sbp} / {ae_dbp} "
+                    f"& {bwt_sbp} / {bwt_dbp} "
+                    f"& {me_sbp} / {me_dbp} "
+                    f"& {std_sbp} / {std_dbp} "
+                    f"& {bhs_sbp} / {bhs_dbp} \\\\"
+                )
+            
+                if display_name == 'online*':
+                    row += r"\cline{2-7}"
+                    
+            latex.append(row)
+
+        latex.append(r"        \hline")
+
+    latex.append(r"    \end{tabular}")
+    latex.append(r"    \label{tab:table_1}")
+    latex.append(r"\end{table*}")
+
+    return "\n".join(latex)
+
+
+def analyze_gradual_vs_mixed_vs_abrupt(baselines):
+    
+    aggregated_results = {}
+
+    for baseline, baseline_paths in baselines.items():
+
+        aggregated_results[baseline] = {}
+
+        # ---------------------------------
+        # Clinical Metrics (ME / STD / BHS)
+        # ---------------------------------
+
+        for shift_name, path_key in {
+            "gradual": "gradual_shifts_path",
+            "mixed": "mixed_shifts_path",
+            "abrupt": "abrupt_shifts_path"
+        }.items():
+
+            dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        f"aggregate_{baseline}_metrics",
+                        "evaluation_metrics.csv"
+                    ),
+                    usecols=["Type", "ME", "STD", "BHS_Grade"]            
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_41"],
+                        "aggregate_metrics",
+                        f"aggregate_{baseline}_metrics",
+                        "evaluation_metrics.csv"
+                    ),
+                    usecols=["Type", "ME", "STD", "BHS_Grade"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_40"],
+                        "aggregate_metrics",
+                        f"aggregate_{baseline}_metrics",
+                        "evaluation_metrics.csv"
+                    ),
+                    usecols=["Type", "ME", "STD", "BHS_Grade"]  
+                )
+            ]
+
+            aggregated_results[baseline][f"{shift_name}_clinical"] = (
+                aggregate_seed_dataframes(
+                    dfs,
+                    bhs_columns=["BHS_Grade"]   # adapt if column name differs
+                )
+            )
+
+        # -------------------------------------
+        # Continual Learning Metrics (AE / BWT)
+        # -------------------------------------
+
+        for shift_name, path_key in {
+            "gradual": "gradual_shifts_path",
+            "mixed": "mixed_shifts_path",
+            "abrupt": "abrupt_shifts_path"
+        }.items():
+
+            # ---------------------------
+            # SBP
+            # ---------------------------
+            sbp_dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_41"],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_40"],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                )
+            ]
+
+            # ---------------------------
+            # DBP
+            # ---------------------------
+            dbp_dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_41"],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_40"],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                )
+            ]
+
+            aggregated_results[baseline][f"{shift_name}_sbp_cl"] = (
+                aggregate_seed_dataframes(sbp_dfs)
+            )
+
+            aggregated_results[baseline][f"{shift_name}_dbp_cl"] = (
+                aggregate_seed_dataframes(dbp_dfs)
+            )
+
+    
+    baseline_display_names = {
+        "no_adapt": "no adapt",
+        "first_batch_finetune": "first-batch",
+        "online": "online",
+        "online_from_scratch": "online*",
+        "feature_replay": "feat.replay",
+        "lwf": "LwF",
+        "ewc": "EWC",
+        "agem": "AGEM"
+    }
+
+    set_mapping = {
+        "1": "gradual",
+        "2": "mixed",
+        "3": "abrupt"
+    }
+    
+    latex_table = generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
+        aggregated_results,
+        baseline_display_names,
+        set_mapping
+    )
+    
+    print(latex_table)
+
+def generate_mmd_vs_lsdd_overleaf_table(
+    aggregated_results, 
+    set_mapping,
+    baseline_key="feature_replay",
+    ae_column="AE_mean",
+    bwt_column="BWT_mean",
+    me_column="ME",
+    std_column="STD",
+    bhs_column="BHS_Grade"
+):
+    latex = []
+    latex.append(r"\begin{table*}")
+    latex.append(r"    \centering")
+    latex.append(r"    \caption{Drift-aware Personalization results (averaged over three seeds) on Vital DB for continuous SBP/DBP estimation from PPG. The baseline employed for personalization is feature replay with the drift detectors considered in this study: Online MMD and Online LSDD. The reported metrics are the same as those reported for the previous table and the number of skipped updates (rightmost column) per drift detector.}")
+    latex.append(r"    \begin{tabular}{l|l|l|p{0.15\textwidth}|p{0.16\textwidth}|l|l}")
+    latex.append(r"        \hline")
+    latex.append(r"        \textbf{Algorithm} & \textbf{AE}$\downarrow$ & \textbf{BWT}$\downarrow$ & \makecell[l]{\textbf{ME}$\downarrow$ \\ ($<$5 mmHg)} & \makecell[l]{\textbf{STD}$\downarrow$ \\ ($<$8 mmHg)} & \makecell[l]{\textbf{BHS}$\uparrow$ \\ (A)} & \makecell[l]{\textbf{Skipped} \\ \textbf{Fraction\%}$\uparrow$} \\")
+    latex.append(r"        \hline")
+
+    first_algo = True
+
+    for algo, shift_name in set_mapping.items():
+
+        # ---------------------------
+        # Retrieve aggregated metrics
+        # ---------------------------
+
+        clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
+        sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
+        dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
+        skipped_fraction = aggregated_results[baseline_key][f"{shift_name}_updates"]["mean_skipped_fraction"]
+        # -----------------------
+        # Assumes single-row CSVs
+        # -----------------------
+
+        ae_sbp = fmt(sbp_cl_df.iloc[0][ae_column])
+        ae_dbp = fmt(dbp_cl_df.iloc[0][ae_column])
+        
+        bwt_sbp = fmt(sbp_cl_df.iloc[0][bwt_column])
+        bwt_dbp = fmt(dbp_cl_df.iloc[0][bwt_column])
+
+        me_sbp = fmt(clinical_df.iloc[0][me_column])
+        me_dbp = fmt(clinical_df.iloc[1][me_column])
+        
+        std_sbp = fmt(clinical_df.iloc[0][std_column])
+        std_dbp = fmt(clinical_df.iloc[1][std_column])
+        
+        skipped_fraction = fmt(skipped_fraction * 100)
+
+        bhs_sbp = clinical_df.iloc[0][bhs_column]
+        bhs_dbp = clinical_df.iloc[1][bhs_column]
+
+        # ---------
+        # Build row
+        # ---------
+        
+        row = (
+            f"{algo} "
+            f"& {ae_sbp} / {ae_dbp} "
+            f"& {bwt_sbp} / {bwt_dbp} "
+            f"& {me_sbp} / {me_dbp} "
+            f"& {std_sbp} / {std_dbp} "
+            f"& {bhs_sbp} / {bhs_dbp} "
+            f"& {skipped_fraction} \\\\"
+        )
+    
+        latex.append(row)
+
+        latex.append(r"        \hline")
+
+    latex.append(r"    \end{tabular}")
+    latex.append(r"    \label{tab:table_2}")
+    latex.append(r"\end{table*}")
+
+    return "\n".join(latex)
+
+
+def analyze_mmd_vs_lsdd(baselines):
+    
+    baseline = 'feature_replay'
+    baseline_paths = baselines[baseline]
+    aggregated_results = {}
+
+    aggregated_results[baseline] = {}
+
+    # ---------------------------------
+    # Clinical Metrics (ME / STD / BHS)
+    # ---------------------------------
+           
+    for path_key in ["drift_aware_mmd", "drift_aware_lsdd"]:
+        dfs = [
+            pd.read_csv(os.path.join(
+                    baseline_paths[path_key],
+                    "aggregate_metrics",
+                    f"aggregate_{baseline}_metrics",
+                    "evaluation_metrics.csv"
+                ),
+                usecols=["Type", "ME", "STD", "BHS_Grade"]            
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_41"],
+                    "aggregate_metrics",
+                    f"aggregate_{baseline}_metrics",
+                    "evaluation_metrics.csv"
+                ),
+                usecols=["Type", "ME", "STD", "BHS_Grade"]  
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_40"],
+                    "aggregate_metrics",
+                    f"aggregate_{baseline}_metrics",
+                    "evaluation_metrics.csv"
+                ),
+                usecols=["Type", "ME", "STD", "BHS_Grade"]  
+            )
+        ]
+
+        aggregated_results[baseline][f"{path_key}_clinical"] = (
+            aggregate_seed_dataframes(
+                dfs,
+                bhs_columns=["BHS_Grade"]   # adapt if column name differs
+            )
         )
 
-    # Formatting
-    plt.xticks([])
-    #plt.xticks(rotation=90)
-    plt.xlabel("Subjects", fontsize=12)
-    plt.ylabel("Number of drift-aware updates", fontsize=12)
-    plt.title("Drift-aware Update Frequency per Subject", fontsize=14)
+    # -------------------------------------
+    # Continual Learning Metrics (AE / BWT)
+    # -------------------------------------
 
-    # Place legend to the side so it doesn't cover the bars
-    plt.legend(
-        title="Thresholds", 
-        bbox_to_anchor=(1.02, 1), 
-        loc='upper left', 
-        frameon=True,
-        fontsize=10
-    )
+    for path_key in ["drift_aware_mmd", "drift_aware_lsdd"]:
+        # ---------------------------
+        # SBP
+        # ---------------------------
+        sbp_dfs = [
+            pd.read_csv(os.path.join(
+                    baseline_paths[path_key],
+                    "aggregate_metrics",
+                    "sbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
 
-    plt.grid(axis='y', linestyle=':', alpha=0.4, zorder=-1)
-    plt.tight_layout()
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_41"],
+                    "aggregate_metrics",
+                    "sbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
 
-    # Save
-    plt.savefig(
-        os.path.join(OUT_FIG_ROOT, "drift_updates_overlapping.png"),
-        dpi=300,
-        bbox_inches='tight'
-    )
-    plt.close()
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_40"],
+                    "aggregate_metrics",
+                    "sbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            )
+        ]
+
+        # ---------------------------
+        # DBP
+        # ---------------------------
+        dbp_dfs = [
+            pd.read_csv(os.path.join(
+                    baseline_paths[path_key],
+                    "aggregate_metrics",
+                    "dbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_41"],
+                    "aggregate_metrics",
+                    "dbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_40"],
+                    "aggregate_metrics",
+                    "dbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            )
+        ]
+
+        aggregated_results[baseline][f"{path_key}_sbp_cl"] = (
+            aggregate_seed_dataframes(sbp_dfs)
+        )
+
+        aggregated_results[baseline][f"{path_key}_dbp_cl"] = (
+            aggregate_seed_dataframes(dbp_dfs)
+        )
     
-    # Plot tradeoff
-    df_tradeoff = pd.DataFrame(results)
+    # -----------------
+    # Number of updates 
+    # -----------------
+
+    path_keys = ["drift_aware_mmd", "drift_aware_lsdd"]
+
+    for path_key in path_keys:
+
+        # collect all seed-specific paths
+        seed_paths = [
+            baseline_paths[path_key],
+            baseline_paths[f"{path_key}_seed_41"],
+            baseline_paths[f"{path_key}_seed_40"],
+        ]
+
+        experiment_dir = Path(seed_paths[0])
+
+        subject_results = {}
+
+        # iterate subjects
+        for item in experiment_dir.iterdir():
+
+            if item.is_dir() and item.name.startswith("subject_"):
+
+                subject_folder = item.name
+
+                skipped_per_seed = []
+                performed_per_seed = []
+                total_per_seed = []
+
+                # loop over seeds
+                for seed_path in seed_paths:
+
+                    csv_path = os.path.join(
+                        seed_path,
+                        subject_folder,
+                        baseline,
+                        "param_update_log.csv"
+                    )
+
+                    df = pd.read_csv(
+                        csv_path,
+                        usecols=["n_updated_params"]
+                    )
+                    #print(df)
+
+                    n_total = len(df)
+                    n_skipped = (df["n_updated_params"] == 0).sum()
+                    n_performed = (df["n_updated_params"] > 0).sum()
+
+                    #print(n_total, n_skipped, n_performed)
+                    
+                    total_per_seed.append(n_total)
+                    skipped_per_seed.append(n_skipped)
+                    performed_per_seed.append(n_performed)
+
+                # averages over seeds
+                avg_total = np.mean(total_per_seed)
+                avg_skipped = np.mean(skipped_per_seed)
+                avg_performed = np.mean(performed_per_seed)
+
+                #print(avg_total, avg_skipped, avg_performed)
+                
+                # fraction of saved/skipped updates
+                skipped_fraction = avg_skipped / avg_total if avg_total > 0 else 0.0
+
+                subject_results[subject_folder] = {
+                    "avg_total_updates": avg_total,
+                    "avg_skipped_updates": avg_skipped,
+                    "avg_performed_updates": avg_performed,
+                    "skipped_fraction": skipped_fraction,
+                }
+
+                #print(
+                #    f"{path_key} | {subject_folder} | "
+                #    f"Skipped fraction: {skipped_fraction:.3f}"
+                #)
+
+
+        # aggregate across subjects
+        all_subject_fractions = [
+            v["skipped_fraction"]
+            for v in subject_results.values()
+        ]
+
+        aggregated_results[baseline][f"{path_key}_updates"] = {
+            "per_subject": subject_results,
+            "mean_skipped_fraction": np.mean(all_subject_fractions),
+            "std_skipped_fraction": np.std(all_subject_fractions),
+        }
+        
+    set_mapping = {
+        "Online MMD": "drift_aware_mmd",
+        "Online LSDD": "drift_aware_lsdd",
+    }
     
-    print("\nTradeoff summary:")
-    print(df_tradeoff)
-    
-    plt.figure(figsize=(12,10))
-
-    # Sort experiments for consistency
-    df_plot = df_tradeoff.copy()
-
-    x_plot = np.arange(len(df_plot))
-    labels = df_plot["experiment"]
-
-    # Pastel colors
-    color_sbp = "#f4a6a6"   # pastel coral
-    color_dbp = "#8fd3d1"   # pastel teal
-    color_macs = "#bdbdbd"  # soft gray
-
-    ax1 = plt.gca()
-
-    # ---- MAC savings (left axis) ----
-    ax1.plot(
-        x_plot,
-        df_plot["mac_savings_percent"],
-        marker="s",
-        linewidth=1,
-        markersize=6,
-        color=color_macs,
-        label="MACs saving"
-    )
-
-    ax1.set_ylabel("MACs saving (%)", fontsize=12)
-    ax1.set_ylim(bottom=0)
-
-    # ---- AA degradation (right axis) ----
-    ax2 = ax1.twinx()
-
-    ax2.plot(
-        x_plot,
-        df_plot["sbp_degradation_percent"],
-        marker="s",
-        linewidth=1,
-        markersize=6,
-        color=color_sbp,
-        label="SBP AE degradation"
-    )
-
-    ax2.plot(
-        x_plot,
-        df_plot["dbp_degradation_percent"],
-        marker="s",
-        linewidth=1,
-        markersize=6,
-        color=color_dbp,
-        label="DBP AE degradation"
-    )
-
-    ax2.set_ylabel("AE degradation (%)", fontsize=12)
-
-    # ---- X axis ----
-    ax1.set_xlabel("Thresholds", fontsize=12)
-    ax1.set_xticks(x_plot)
-    ax1.set_xticklabels(labels,fontsize=12)
-
-    # ---- Grid ----
-    ax1.grid(True, axis="y", alpha=0.3)
-
-    # ---- Combined legend ----
-    lines = ax1.get_lines() + ax2.get_lines()
-    labels = [l.get_label() for l in lines]
-
-    plt.legend(lines, labels, loc="upper left", fontsize=10)
-
-    plt.title("MACs Saving vs AE Degradation Trade-off", fontsize=14)
-
-    plt.tight_layout()
-
-    plt.savefig(
-        os.path.join(OUT_FIG_ROOT, "aa_vs_macs_tradeoff.png"),
-        dpi=300
+    latex_table = generate_mmd_vs_lsdd_overleaf_table(
+        aggregated_results,
+        set_mapping
     )
     
-    plt.close()
+    print(latex_table)
+    
+            
+def analyze_logs_and_plot():
+    
+    print(f"[Log Analysis] Analyzing logs ...")
+    
+    # Baselines and corresponding experiment folder
+    # Collect results on gradual shifts/mixed/shifts/abrupt shifts for each baseline
+    # -> experiment path is hardcoded, bad
+    baselines = {
+        'no_adapt': {
+            'gradual_shifts_path': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-18_31_51",
+            'gradual_shifts_path_seed_41': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-18_45_02",
+            'gradual_shifts_path_seed_40': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-18_44_55",
+            'mixed_shifts_path': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_mixed_shifts/personalization_no_adapt_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_17-18_36_29",
+            'mixed_shifts_path_seed_41': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_no_adapt_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_17-18_45_36",
+            'mixed_shifts_path_seed_40': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_no_adapt_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_17-18_45_29",
+            'abrupt_shifts_path': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_abrupt_shifts/personalization_no_adapt_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-18_34_54", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_no_adapt_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-18_46_04",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_no_adapt_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-18_45_57",
+        }, 
+        'first_batch_finetune': {
+            'gradual_shifts_path': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts/personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_18-09_59_24",
+            'gradual_shifts_path_seed_41': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_18-10_18_02",
+            'gradual_shifts_path_seed_40': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_first_batch_finetune_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_18-11_33_55",
+            'mixed_shifts_path': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_mixed_shifts/personalization_first_batch_finetune_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_18-09_59_11",
+            'mixed_shifts_path_seed_41': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_first_batch_finetune_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_18-10_36_06",
+            'mixed_shifts_path_seed_40': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_first_batch_finetune_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_18-11_34_19",
+            'abrupt_shifts_path': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_abrupt_shifts/personalization_first_batch_finetune_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_18-09_59_39", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_first_batch_finetune_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_18-10_22_57",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_first_batch_finetune_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_first_batch_finetune_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_18-10_43_39",
+        }, 
+        'online': { 
+            'gradual_shifts_path': "./logs/personalization_online_proto_ppg_calibration_size_1_gradual_shifts/personalization_online_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-19_07_08",
+            'gradual_shifts_path_seed_41': "./logs/personalization_online_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_online_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-19_32_27",
+            'gradual_shifts_path_seed_40': "./logs/personalization_online_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_online_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-19_32_27",
+            'mixed_shifts_path': "./logs/personalization_online_proto_ppg_calibration_size_1_mixed_shifts/personalization_online_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_17-20_04_21",
+            'mixed_shifts_path_seed_41': "./logs/personalization_online_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_online_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_17-20_19_48",
+            'mixed_shifts_path_seed_40': "./logs/personalization_online_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_online_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_17-20_19_48",
+            'abrupt_shifts_path': "./logs/personalization_online_proto_ppg_calibration_size_1_abrupt_shifts/personalization_online_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-19_28_05",
+            'abrupt_shifts_path_seed_41': "./logs/personalization_online_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_online_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-19_43_03",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_online_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_online_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-19_43_03",
+        }, 
+        'online_from_scratch': {
+            'gradual_shifts_path': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts/personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-19_54_16",
+            'gradual_shifts_path_seed_41': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-20_18_59",
+            'gradual_shifts_path_seed_40': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_online_from_scratch_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-20_18_52",
+            'mixed_shifts_path': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_mixed_shifts/personalization_online_from_scratch_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_17-21_42_06",
+            'mixed_shifts_path_seed_41': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_online_from_scratch_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_17-21_55_56",
+            'mixed_shifts_path_seed_40': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_online_from_scratch_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_17-21_56_06",
+            'abrupt_shifts_path': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-20_27_07", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-20_39_56",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-20_40_09",
+        }, 
+        'feature_replay': {
+            'gradual_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-20_41_18",
+            'gradual_shifts_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-21_05_45",
+            'gradual_shifts_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-21_05_24",
+            'mixed_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_17-23_19_51",
+            'mixed_shifts_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_17-23_31_04",
+            'mixed_shifts_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_17-23_31_47",
+            'abrupt_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-21_27_56", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-21_37_24",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-21_37_24",
+            "laptop_drift_aware_mmd": "./logs/laptop_deployment_feature_replay_drift_aware_mmd/laptop_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_19-17_36_17",
+            "laptop_drift_aware_lsdd": "./logs/laptop_deployment_feature_replay_drift_aware_lsdd/laptop_deployment_feature_replay_drift_aware_lsdd-Proto-2026_05_19-17_31_26",
+            "pi_drift_aware_mmd" : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_19-13_17_50",
+            "pi_drift_aware_lsdd" : "./logs/pi_deployment_feature_replay_drift_aware_lsdd/pi_deployment_feature_replay_drift_aware_lsdd-Proto-2026_05_19-15_52_49",
+            "pixel_drift_aware_mmd" : "./logs/pixel_deployment_feature_replay_drift_aware_mmd/pixel_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_19-13_25_41",
+            "pixel_drift_aware_lsdd" : "./logs/pixel_deployment_feature_replay_drift_aware_lsdd/pixel_deployment_feature_replay_drift_aware_lsdd-Proto-2026_05_19-17_21_19",
+            "ppg_ecg_gradual_shifts" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts-Proto-2026_05_18-15_38_22",
+            "ppg_ecg_gradual_shifts_seed_41" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_41/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_18-15_41_31",
+            "ppg_ecg_gradual_shifts_seed_40" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_40/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_18-15_41_24",
+        }, 
+        'lwf': {
+            'gradual_shifts_path': "./logs/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-21_34_18",
+            'gradual_shifts_path_seed_41': "./logs/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-21_56_26",
+            'gradual_shifts_path_seed_40': "./logs/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-21_56_28",
+            'mixed_shifts_path': "./logs/personalization_lwf_proto_ppg_calibration_size_1_mixed_shifts/personalization_lwf_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_18-00_51_12",
+            'mixed_shifts_path_seed_41': "./logs/personalization_lwf_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_lwf_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_18-00_57_39",
+            'mixed_shifts_path_seed_40': "./logs/personalization_lwf_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_lwf_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_18-00_57_54",
+            'abrupt_shifts_path': "./logs/personalization_lwf_proto_ppg_calibration_size_1_abrupt_shifts/personalization_lwf_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-22_32_36", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_lwf_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_lwf_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-22_38_38",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_lwf_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_lwf_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-22_38_36",
+        }, 
+        'ewc': {
+            'gradual_shifts_path': "./logs/personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts/personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-22_21_27",
+            'gradual_shifts_path_seed_41': "./logs/personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-22_43_05",
+            'gradual_shifts_path_seed_40': "./logs/personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_ewc_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-22_42_45",
+            'mixed_shifts_path': "./logs/personalization_ewc_proto_ppg_calibration_size_1_mixed_shifts/personalization_ewc_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_18-01_47_44",
+            'mixed_shifts_path_seed_41': "./logs/personalization_ewc_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_ewc_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_18-01_50_53",
+            'mixed_shifts_path_seed_40': "./logs/personalization_ewc_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_ewc_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_18-01_50_56",
+            'abrupt_shifts_path': "./logs/personalization_ewc_proto_ppg_calibration_size_1_abrupt_shifts/personalization_ewc_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-23_33_23", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_ewc_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_ewc_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-23_35_35",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_ewc_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_ewc_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-23_35_15",
+        }, 
+        'agem': {
+            'gradual_shifts_path': "./logs/personalization_agem_proto_ppg_calibration_size_1_gradual_shifts/personalization_agem_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-23_10_55",
+            'gradual_shifts_path_seed_41': "./logs/personalization_agem_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_agem_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_17-23_32_07",
+            'gradual_shifts_path_seed_40': "./logs/personalization_agem_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_agem_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_17-23_31_45",
+            'mixed_shifts_path': "./logs/personalization_agem_proto_ppg_calibration_size_1_mixed_shifts/personalization_agem_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_18-02_36_22",
+            'mixed_shifts_path_seed_41': "./logs/personalization_agem_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_agem_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_05_18-02_38_29",
+            'mixed_shifts_path_seed_40': "./logs/personalization_agem_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_agem_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_05_18-02_38_29",
+            'abrupt_shifts_path': "./logs/personalization_agem_proto_ppg_calibration_size_1_abrupt_shifts/personalization_agem_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_18-00_30_19", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_agem_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_agem_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_18-00_29_42",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_agem_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_agem_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_18-00_29_36",
+        },
+    }
+    
+    # -------------------------------------------------
+    # Performance Assessment with Clinical & CL Metrics
+    # -> all the baselines
+    # -------------------------------------------------
+    analyze_gradual_vs_mixed_vs_abrupt(baselines)
+    
+    # ---------------------------------------------------------
+    # Performance Assessment with Clinical & CL Metrics
+    # -> only for feature replay with Online MMD vs Online LSDD
+    # ---------------------------------------------------------
+    analyze_mmd_vs_lsdd(baselines)
+    
+    # --------------------------
+    # Resource Profiling
+    # -> only for feature replay
+    # --------------------------
+    
+    baseline = 'feature_replay'
+    
+    # Laptop Profiling
+    print("[Log Analysis] Laptop Resource Profiling")
+    resource_profiling(baseline=baseline, profiling_path=baselines[baseline]['deployment_laptop'], deployment_device='laptop')
 
+    # Pixel Profiling
+    print("[Log Analysis] Google Pixel Resource Profiling")
+    resource_profiling(baseline=baseline, profiling_path=baselines[baseline]['deployment_pixel'], deployment_device='pixel')
+    
+    
+    # Pi Profiling
+    print("[Log Analysis] Raspberry Pi Resource Profiling")
+    resource_profiling(baseline=baseline, profiling_path=baselines[baseline]['deployment_pi'], deployment_device='pi')
+    
     
 def parseargs():
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--log_file_path', default='', type=str, help='path to the log file to parse')
+    parser.add_argument('--logs_folder_path', default='', type=str, help='path to the logs folder with the experiment to analyze')
     parser.add_argument('--config_yaml_path', default='', type=str, help='path to the configuration YAML file for the experiments')
     parser.add_argument('--fig_root', default='', type=str, help='path to figure folder where to store the result analysis outputs')
     parser.add_argument('--exp_fig_root', default='', type=str, help='path to figure folder of each subject analyzed in an experiment (subfolder inside fig_root)')
@@ -1283,15 +1227,8 @@ def parseargs():
 if __name__ == "__main__":
     args = parseargs()
     
-    # Collect metrics from the experiment log file and organize them in CSVs
-    analyze_logs_and_plot(args.log_file_path, args.fig_root, args.exp_fig_root, args.exp_pi_deployment_drift_aware_fig_root)
-        
-    # Aggregates results over patients and correlates them to SBP variability
-    #aggregate_patient_level_target_statistics_and_plot(args.fig_root, args.exp_fig_root)
+    # Collect metrics from the log file folder
+    analyze_logs_and_plot()
     
-    #if len(args.exp_fig_root_drift_aware) > 0:
-        # Computational and storage resources of the Feature Replay algorithm
-        # -> NOTE: the resource cost of other baselines may be estimated with future expansion of the codebase
-        #resource_usage_profile(args.config_yaml_path, args.fig_root, args.exp_fig_root, args.exp_fig_root_drift_aware)
     
         

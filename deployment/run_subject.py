@@ -1,5 +1,8 @@
 import os
 import sys
+# Allow imports relative to the project root (adjust if needed
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import psutil
 import copy
 import json
 import pickle
@@ -11,70 +14,249 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn.functional as F
-from deployment.deployment_helpers import build_inner_optimizer
-from deployment.deployment_maml import MAML
-from deployment.deployment_component_factory import BPRegressor, ReservoirReplayBuffer, Model
-from deployment.Proto import Proto
-from deployment.DriftDetectors import MMDDriftOnline, LSDDDriftOnline
+from deployment_maml import MAML
+from deployment_component_factory import BPRegressor, ReservoirReplayBuffer, Model
+from Proto import Proto
+from DriftDetectors import MMDDriftOnline, LSDDDriftOnline
+
+
+def build_inner_optimizer(
+    adapted_encoder,
+    adapted_head,
+    base_lr,
+    mode,       
+    opt_type,
+    config
+):
+    r"""
+    Build inner optimizer for meta-learning algorithms evaluation and deployment (not pretraining, learn2learn library with autograd is employed for pretraining).
+    Behaviors:
+    - inner_adapt='all'  : adapt backbone + regressor
+    - inner_adapt='head' : freeze backbone, adapt only regressor
+    
+    Parameters
+    ------------
+        adapted_encoder (torch.nn.Module): 
+            The model encoder to be adapted.
+        adapted_head (torch.nn.Module): 
+            The model prediction head to be adapted.
+        base_lr (float): 
+            The base learning rate for the inner optimizer.
+        mode (str): 
+            Inner adaptation mode, 'all' or 'head'.
+        opt_type (str): 
+            Inner optimizer type, either 'sgd' or 'adam'.
+        config (dict): 
+            Configuration dictionary containing inner adaptation parameters.
+            
+    Returns
+    ------------
+        inner_opt (torch.optim.Optimizer): 
+            The constructed inner optimizer for meta-learning evaluation and deployment.    
+    """ 
+
+    # ----------------------------
+    # 1) Make everything trainable
+    # ----------------------------
+    # BIOT has longtensor parameters for index (positional embedding), when setting requires_grad for them an error is raised
+    if config['model_name'] == 'BIOT':
+        for p in adapted_encoder.parameters():
+            if p.dtype.is_floating_point or p.is_complex():
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+    else:
+        for p in adapted_encoder.parameters():
+            p.requires_grad = True
+    
+    for p in adapted_head.parameters():
+        p.requires_grad = True
+
+    # -------------------------------
+    # 2) Apply mode-specific freezing
+    # -------------------------------
+    if mode == "head":
+        # Freeze entire encoder
+        for p in adapted_encoder.parameters():
+            p.requires_grad = False
+
+    elif mode == "all":
+        # Nothing frozen
+        pass
+
+    else:
+        raise ValueError(f"Unknown adaptation mode: {mode}")
+
+    # -------------------------------
+    # 3) Collect trainable parameters
+    # -------------------------------
+    params = [
+        p for p in list(adapted_encoder.parameters()) + list(adapted_head.parameters())
+        if p.requires_grad
+    ]
+
+    if len(params) == 0:
+        raise RuntimeError("No trainable parameters selected for inner optimizer.")
+
+    # ------------------
+    # 4) Build optimizer
+    # ------------------
+    if opt_type == "sgd":
+        inner_opt = torch.optim.SGD(
+            params,
+            lr=base_lr,
+            momentum=float(config.get("sgd_momentum"))
+        )
+    else:
+        inner_opt = torch.optim.Adam(params, lr=base_lr)
+
+    return inner_opt
+
+# ------------------------
+#  MEMORY TRACKING HELPERS
+# ------------------------
+
+def _current_rss_mb() -> float:
+    """
+    Return the current Resident Set Size (RSS) of this process in MB.
+
+    RSS = physical RAM currently mapped to the process, including shared
+    library pages (PyTorch, libc, etc.).  Instantaneous — not a peak.
+
+    Used only for large aggregate snapshots (model load, TTA loop baseline,
+    per-step peak tracking) where changes are expected to be several MB.
+    Per-section RSS deltas are not tracked because PyTorch's caching allocator
+    reuses its internal pool without releasing OS pages, making those deltas
+    structurally zero for tensor-only sections.
+    """
+    proc = psutil.Process(os.getpid())
+    return proc.memory_info().rss / (1024.0 * 1024.0)
+
 
 def _peak_memory_mb() -> float:
-    """Return peak RSS memory in MB.
- 
-    On Linux (Raspberry Pi) resource.getrusage gives the true peak since
-    process start, including PyTorch tensor allocations.
-    On macOS ru_maxrss is in bytes; on Linux it is in kilobytes.
-    Falls back to tracemalloc (Python heap only) on Windows.
-    NOTE: if you run other processes along the main one, they will be recorded too by the resource.getresourceusage function
     """
-    if platform.system() in ("Linux", "Darwin"):
-        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if platform.system() == "Linux":
-            return usage / 1024.0          # KB → MB
-        else:
-            return usage / (1024.0 * 1024) # bytes → MB
+    Return the true peak RSS since process start, in MB.
+
+    On Linux (including Raspberry Pi): reads VmHWM from /proc/self/status —
+    the kernel-maintained high-water mark, with no kB/bytes unit ambiguity.
+    macOS: current RSS (no VmHWM equivalent available).
+    Windows: peak Working Set via psutil.
+
+    This is the process-wide peak including interpreter startup, imports,
+    and model loading — not just the TTA loop. Use _current_rss_mb()
+    snapshots to isolate specific phases.
+    """
+    if platform.system() == "Linux":
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / 1024.0   # kB → MB
+
+    proc = psutil.Process(os.getpid())
+    mi = proc.memory_info()
+    if platform.system() == "Darwin":
+        return mi.rss / (1024.0 * 1024.0)
     else:
-        # Windows / unknown – best-effort via tracemalloc
-        _, peak = tracemalloc.get_traced_memory()
-        return peak / (1024.0 * 1024)
+        return getattr(mi, "peak_wset", mi.rss) / (1024.0 * 1024.0)
+
+
+def _tm_current_kb() -> float:
+    """
+    Return the current Python-heap allocated memory in kB via tracemalloc.
+
+    Captures numpy arrays, Python objects, optimizer state dicts, and any
+    other CPython-heap allocation.  Does NOT capture PyTorch tensor memory
+    (managed by PyTorch's C++ allocator outside the CPython heap).
+
+    This is the complement to RSS: RSS is blind to PyTorch's pool reuse;
+    tracemalloc is blind to C++ allocations but faithfully tracks everything
+    on the Python heap, which is where optimizer state and numpy reference
+    arrays live.
+
+    tracemalloc.start() must be called before using this function.
+    """
+    current, _ = tracemalloc.get_traced_memory()
+    return current / 1024.0
+
+
+def _tm_peak_kb() -> float:
+    """
+    Return the peak Python-heap memory since tracemalloc.start(), in kB.
+    The peak is monotonically increasing and is not reset between steps.
+    Call this once at the end of the run to get the process-wide Python-heap
+    high-water mark.
+    """
+    _, peak = tracemalloc.get_traced_memory()
+    return peak / 1024.0
     
 
-def run_subject(data_path, model_path, config_path, verbose=False):
+def run_subject(data_path, model_path, config_path, device=None, verbose=False):
     
-    # Start memory tracking
-    if platform.system() not in ("Linux", "Darwin"):
-        tracemalloc.start()
+    # Start tracemalloc
+    # Tracks Python-heap allocations (numpy, optimizer state, detector internals).
+    # Started before model load so tm_peak_run_kb covers the full runtime.
+    tracemalloc.start()
+
+    # Baseline RSS before any model work
+    rss_before_model_load_mb = _current_rss_mb()
     
     # Initialize profiling data structure
     prof = {
-        # calibration phase (one-shot)
-        'calibration_time_s': 0.0,
- 
         # per TTA step (appended in loop)
         'per_step': {
-            'prediction_s':         [],   # pred(feats) latency
-            'feature_extraction_s': [],   # enc(signals) latency
-            'drift_detection_s':    [],   # drift_detector.predict() loop latency
-            'adaptation_s':         [],   # entire do_adapt block latency
-            'total_step_s':         [],   # wall time for the full TTA step
-            'did_adapt':            [],   # bool
-            'n_drift_detections':   [],   # int – how many samples triggered drift
+            # Latency (seconds)
+            'feature_extraction_s':     [],   # enc(signals) latency
+            'prediction_s':             [],   # pred(feats) latency
+            'drift_detection_s':        [],   # drift_detector.predict() loop latency
+            'adaptation_s':             [],   # entire do_adapt block latency
+            'head_adapt_s':             [],   # prediction head adapt latency
+            'drift_detector_reinit_s':  [],   # drift detector re-init latency
+            'total_step_s':             [],   # wall time for the full TTA step
+            'did_adapt':                [],   # bool
+            
+            # Tracemalloc per step (kB)
+            # tm_current_kb: absolute Python-heap usage at the end of each step.
+            # Plot over steps to detect monotonic growth (leak) vs plateau (healthy).
+            # tm_head_adapt_kb: delta during head adaptation.
+            #   Non-zero because optimizer state dict entries live on CPython heap.
+            # tm_detector_reinit_kb: delta during detector reinit.
+            #   Non-zero because reference_data = numpy.copy() is a CPython allocation.
+            # All other sections (feature extraction, prediction, drift detection)
+            # show ~0 even here because they only touch PyTorch tensors (C++ heap).
+            'tm_current_kb':                [],
+            'tm_head_adapt_kb':             [],
+            'tm_detector_reinit_kb':        [],
         },
- 
-        # filled at the end
-        'peak_memory_mb':                       0.0,
-        'n_steps':                              0,
-        'n_adaptations':                        0,
-        'adaptation_rate':                      0.0,
-        'total_tta_time_s':                     0.0,
-        'total_prediction_time_s':              0.0,
-        'total_feature_extraction_time_s':      0.0,
-        'total_drift_detection_time_s':         0.0,
-        'total_adaptation_time_s':              0.0,
-        'estimated_time_if_always_adapted_s':   0.0,
-        'time_saved_by_drift_detection_s':      0.0,
+
+        # Aggregate memory (filled at end of run_subject)
+
+        # RSS delta from before model construction to after load_state_dict.
+        # Fixed RAM cost of keeping the model in memory.
+        'model_memory_mb':                  0.0,
+
+        # Absolute RSS snapshot just before the TTA loop begins.
+        # Fixed cost that must fit in RAM regardless of the data stream.
+        'rss_before_tta_mb':                0.0,
+
+        # Highest RSS observed during the TTA loop (absolute, not incremental).
+        'peak_tta_rss_mb':                  0.0,
+
+        # peak_tta_rss_mb minus rss_before_tta_mb.
+        # Memory the TTA algorithm itself requires on top of the loaded model.
+        'peak_incremental_tta_mb':          0.0,
+
+        # Process-wide RSS high-water mark (interpreter + imports + model + TTA).
+        # Upper-bound RAM budget figure.
+        'peak_process_rss_mb':              0.0,
+
+        # Peak Python-heap usage over the entire run (kB).
+        # Monotonically increasing high-water mark from tracemalloc.
+        # Captures the worst-case CPython-heap pressure across all phases.
+        'tm_peak_run_kb':                   0.0,
     }
     
-    device = torch.device("cpu")
+    if device is None:
+        device = torch.device("cpu") 
     
     # Load data
     with open(data_path, "rb") as f:
@@ -110,6 +292,10 @@ def run_subject(data_path, model_path, config_path, verbose=False):
     pretrained_learner.eval()
     print(f"[Personalization] MAML Learner pre-trained ckpt loaded ✓")
 
+    # Snapshot RSS after model load
+    rss_after_model_load_mb = _current_rss_mb()
+    prof['model_memory_mb'] = rss_after_model_load_mb - rss_before_model_load_mb
+
     # To device
     enc, ph = pretrained_learner.encoder.to(device), pretrained_learner.prediction_head.to(device)
 
@@ -122,130 +308,27 @@ def run_subject(data_path, model_path, config_path, verbose=False):
     
     # Drift detector placeholders
     drift_detector = None
-    calibration_signals = []
-    calibration_targets = []
+    detector_initialized = False
     
     # Important for logging
     step_idx = 0
     
+    # Snapshot RSS immediately before TTA loop 
+    rss_before_tta_mb = _current_rss_mb()
+    prof['rss_before_tta_mb'] = rss_before_tta_mb
+    peak_tta_rss_mb = rss_before_tta_mb   # updated every step
+    
     # ---- PERSONALIZATION ----
     for block_idx in range(len(blocks_list)):
+        
+        # ONLINE TEST-TIME ADAPTATION EVALUATION 
+        
         block = blocks_list[block_idx]
         signals = torch.from_numpy(block["signals"]).float()
         targets = torch.from_numpy(block["targets"]).float()
         
-        # CALIBRATION PHASE 
-        if config['calibration_phase_size'] > 0 and step_idx < config['calibration_phase_size']:
-            
-            # Accumulate calibration batches
-            calibration_signals.append(signals)
-            calibration_targets.append(targets)
-            
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if config['calibration_phase_size'] > 0 and step_idx == config['calibration_phase_size']:
-            
-            # Calibration starts
-            t_cal_start = time.perf_counter()
-            
-            # Stack calibration data
-            calibration_signals = torch.cat(calibration_signals, dim=0).to(device)
-            calibration_targets = torch.cat(calibration_targets, dim=0).to(device)
-            
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            calibration_features = None
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            if config['setup_type'] == 'drift':
-                # Initialize drfit detector
-                # NOTE: only after calibration completion
-                reference_data = calibration_features.detach().clone()
-
-                if config['drift_detector_type'] == 'mmd':
-                    drift_detector = MMDDriftOnline(
-                        x_ref=reference_data.cpu().numpy(),
-                        ert=config['detector_ert'],
-                        window_size=config['detector_window_size'],
-                        n_bootstraps=config['detector_n_bootstraps'],
-                        backend='pytorch',
-                        verbose=False
-                    )
-                elif config['drift_detector_type'] == 'lsdd':
-                    drift_detector = LSDDDriftOnline(
-                        x_ref=reference_data.cpu().numpy(),
-                        ert=config['detector_ert'],
-                        window_size=config['detector_window_size'],
-                        n_bootstraps=config['detector_n_bootstraps'],
-                        backend='pytorch',
-                        verbose=False
-                    )
-                else:
-                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
-
-                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
-            
-            # Calibration end
-            prof['calibration_time_s'] = time.perf_counter() - t_cal_start
-               
-        # ONLINE TEST-TIME ADAPTATION EVALUATION 
         # TTA start
-        t_step_start = time.perf_counter() 
+        t_step_start = time.perf_counter()
         
         # ---------- Evaluate before adaptation ----------
         # -> ensure the system always produce an output given the stream of data
@@ -255,7 +338,7 @@ def run_subject(data_path, model_path, config_path, verbose=False):
         
         # Profile feats. extraction before updates
         t_feat_start = time.perf_counter()
-          
+                  
         # Extract features with the frozen encoder
         with torch.no_grad():
             features = enc(signals.to(device)) 
@@ -274,44 +357,53 @@ def run_subject(data_path, model_path, config_path, verbose=False):
         # Inference end
         t_pred_end = time.perf_counter()
         pred_latency = t_pred_end - t_pred_start
-
+        
         # Log targets/predictions: SBP/DBP are on the frist and second position of out/tgt
         baseline_outputs.append(outputs.detach().cpu().numpy()[:, [0,1]])
         baseline_targets.append(targets.detach().cpu().numpy()[:, [0,1]])
         
         # ---------- Decide adaptation ----------
         do_adapt = False
-        
         drift_latency = 0.0 # When we do not use the detector, this is 0
-        
-        if config['setup_type'] == 'drift':
-            # Detect data drifts with detector
             
-            # Drift detection start
-            t_drift_start = time.perf_counter()
-            for feat_idx in range(features.shape[0]):
-                # Add batch dimension before prediction
-                detection_report = drift_detector.predict(features[feat_idx].cpu().numpy())
-                drift_flag = detection_report["data"]["is_drift"]
-
-                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
-                if drift_detector.t >= config['detector_window_size']:
-                    if drift_flag == 1:
-                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts
-        
-            # Drift detection end
-            t_drift_end = time.perf_counter()
-            drift_latency = t_drift_end - t_drift_start 
-        
-        # If not drift setup: adapt by default (every block) for adaptive baselines
-        if config.get("setup_type") == "fixed":
+        if config['setup_type'] == 'fixed':
             do_adapt = True
 
-        # Adaptatin latency
-        adapt_latency = 0.0 # When we do not adapt this is 0
+        elif config['setup_type'] == 'drift':
+            # NOTE: Before the detector is initialized, always adapt.
+            if not detector_initialized:
+                do_adapt = True
+            else:
+                # Drift detection start
+                t_drift_start = time.perf_counter()
+                
+                # Use drift detector to decide
+                for i in range(features.shape[0]):
+                    detection_report = drift_detector.predict(features[i].cpu().numpy())
+                    drift_flag = detection_report["data"]["is_drift"]
+                    
+                    if drift_detector.t >= config['detector_window_size']:
+                        if drift_flag == 1:
+                            do_adapt = True
+                
+                # Drift detection end
+                t_drift_end = time.perf_counter()
+                
+                drift_latency = t_drift_end - t_drift_start
+                
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+        
+        # Adaptation latency
+        # When we do not adapt these are 0
+        adapt_latency = 0.0 
+        head_adapt_latency = 0.0
+        drift_detector_reinit_latency = 0.0
+        tm_head_adapt_delta_kb = 0.0
+        tm_detector_reinit_delta_kb = 0.0
         
         if do_adapt:
-            # ---------- Adaptation ----------
+            # ---------- Adaptation (head only) ----------
             
             # Adaptation starts
             t_adapt_start = time.perf_counter()
@@ -336,6 +428,10 @@ def run_subject(data_path, model_path, config_path, verbose=False):
                 if config["criterion"] == "SmoothL1Loss"
                 else F.mse_loss
             )
+            
+            # Start prediction head adaptation profiling
+            tm_before_head_adapt = _tm_current_kb()
+            t_head_adapt_start = time.perf_counter()
             
             # Training data/labels are already prepared for the current batch
             for step in range(config["personalization_steps"]):
@@ -367,19 +463,27 @@ def run_subject(data_path, model_path, config_path, verbose=False):
             # Set to eval mode after adaptation
             ph.eval()
             
-            # Update replay buffer 
-            with torch.no_grad():
-                replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
+            # End head adaptation profiling
+            t_head_adapt_end = time.perf_counter()
+            tm_after_head_adapt = _tm_current_kb()
             
-            # Detector re-init when buffer has enough samples for a new reference set
-            if config['setup_type'] == 'drift' and len(replay_buffer) > (config['personalization_batch_size'] * config['calibration_phase_size']):
+            head_adapt_latency = t_head_adapt_end - t_head_adapt_start            
+            tm_head_adapt_delta_kb = tm_after_head_adapt - tm_before_head_adapt
+            
+        # Update replay buffer 
+        with torch.no_grad():
+            replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
                 
-                drift_detector = None
+        # Detector init/re-init when buffer has enough samples for the reference set
+        if config['setup_type'] == 'drift':
+            if len(replay_buffer) >= config['replay_buffer_size'] and (not detector_initialized or do_adapt):
                 
-                # Re-initialize drfit detector
-                # NOTE: only after having updated the replay buffer
+                # Start drift reinit profiling
+                tm_before_reinit = _tm_current_kb()
+                drift_detector_reinit_start = time.perf_counter()
+                
                 reference_data = torch.stack(replay_buffer.features).numpy().copy()
-                
+
                 if config['drift_detector_type'] == 'mmd':
                     drift_detector = MMDDriftOnline(
                         x_ref=reference_data,
@@ -401,148 +505,58 @@ def run_subject(data_path, model_path, config_path, verbose=False):
                 else:
                     raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
 
-                print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples from the replay_buffer ✓")
-            
-            # Adaptation ends
-            t_adapt_end = time.perf_counter()
-            adapt_latency = t_adapt_end - t_adapt_start
-                                
+                if not detector_initialized:
+                    detector_initialized = True
+                    print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
+                else:
+                    print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples ✓")  
+        
+                # End drift reinit profiling
+                drift_detector_reinit_end = time.perf_counter()
+                tm_after_reinit =_tm_current_kb()
+                
+                drift_detector_reinit_latency = drift_detector_reinit_end - drift_detector_reinit_start
+                tm_detector_reinit_delta_kb = tm_after_reinit - tm_before_reinit
+
+                # Adaptation ends
+                # NOTE: we always enter both head adapt. and detector reinit.
+                # whenb do_adapt true, thereby it is correct to end the adaptation counter here
+                t_adapt_end = time.perf_counter()
+                adapt_latency = t_adapt_end - t_adapt_start
+                
+        # Step end: timing and memory                   
         t_step_end = time.perf_counter()
+        rss_step_end_mb = _current_rss_mb()
+        
         step_latency = t_step_end - t_step_start
+        peak_tta_rss_mb = max(peak_tta_rss_mb, rss_step_end_mb)
         
         # Record per-step profiling 
         prof['per_step']['prediction_s'].append(pred_latency)
         prof['per_step']['feature_extraction_s'].append(feat_latency)
         prof['per_step']['drift_detection_s'].append(drift_latency)
         prof['per_step']['adaptation_s'].append(adapt_latency)
+        prof['per_step']['head_adapt_s'].append(head_adapt_latency)
+        prof['per_step']['drift_detector_reinit_s'].append(drift_detector_reinit_latency)
         prof['per_step']['total_step_s'].append(step_latency)
+        
         prof['per_step']['did_adapt'].append(do_adapt)
+        
+        prof['per_step']['tm_current_kb'].append(_tm_current_kb())
+        prof['per_step']['tm_head_adapt_kb'].append(tm_head_adapt_delta_kb)
+        prof['per_step']['tm_detector_reinit_kb'].append(tm_detector_reinit_delta_kb)
         
         # Increment step idx for the next block
         step_idx += 1
     
-    # Aggregate profiling report
-    prof['peak_memory_mb'] = _peak_memory_mb()
+    # Aggregate memory results
+    prof['peak_tta_rss_mb'] = peak_tta_rss_mb
+    prof['peak_incremental_tta_mb'] = peak_tta_rss_mb - rss_before_tta_mb
+    prof['peak_process_rss_mb'] = _peak_memory_mb()
+    prof['tm_peak_run_kb'] = _tm_peak_kb()
  
-    n_steps = len(prof['per_step']['total_step_s'])
-    n_adaptations = sum(prof['per_step']['did_adapt'])
- 
-    total_pred = sum(prof['per_step']['prediction_s'])
-    total_feat = sum(prof['per_step']['feature_extraction_s'])
-    total_drift = sum(prof['per_step']['drift_detection_s'])
-    total_adapt = sum(prof['per_step']['adaptation_s'])
-    total_tta = sum(prof['per_step']['total_step_s'])
- 
-    prof['n_steps']                          = n_steps
-    prof['n_adaptations']                    = n_adaptations
-    prof['adaptation_rate']                  = n_adaptations / n_steps if n_steps else 0.0
-    prof['total_tta_time_s']                 = total_tta
-    prof['total_prediction_time_s']          = total_pred
-    prof['total_feature_extraction_time_s']  = total_feat
-    prof['total_drift_detection_time_s']     = total_drift
-    prof['total_adaptation_time_s']          = total_adapt
-    
-    # Counterfactual: how long would TTA have taken if we always adapted?
-    # Use mean observed adaptation time as the per-step cost estimate.
-    adapt_times_when_done = [
-        t for t, did in zip(
-            prof['per_step']['adaptation_s'],
-            prof['per_step']['did_adapt']
-        ) if did
-    ]
-    mean_adapt_time = (
-        float(np.mean(adapt_times_when_done)) if adapt_times_when_done else 0.0
-    )
-    skipped_steps = n_steps - n_adaptations
-    estimated_if_always = total_tta + skipped_steps * mean_adapt_time
- 
-    prof['estimated_time_if_always_adapted_s'] = estimated_if_always
-    prof['time_saved_by_drift_detection_s'] = estimated_if_always - total_tta
-    prof['adaptation_compute_fraction'] = (
-        total_adapt / total_tta
-        if total_tta > 0 else 0.0
-    )
-    prof['mean_step_latency_ms'] = (
-        np.mean(prof['per_step']['total_step_s']) * 1e3
-    )
-    
-    if verbose:
-        # ── summary print ──────────────────────────────────────────────────────
-        print("\n" + "=" * 72)
-        print("  PROFILING REPORT")
-        print("=" * 72)
-
-        print(f"  Calibration update          : {prof['calibration_time_s']*1e3:>8.1f} ms")
-        print(f"  TTA steps                   : {n_steps:>8d}")
-        print(f"  Adaptations triggered       : {n_adaptations:>8d}  "
-            f"({prof['adaptation_rate']*100:.1f}%)")
-
-        print(f"")
-
-        print(f"  ── Per-step mean latency ────────────────────────────")
-        print(f"  Prediction (before update)  : "
-            f"{np.mean(prof['per_step']['prediction_s'])*1e3:>8.2f} ms")
-
-        print(f"  Feature extraction          : "
-            f"{np.mean(prof['per_step']['feature_extraction_s'])*1e3:>8.2f} ms")
-
-        if config.get('setup_type') == 'drift':
-            print(f"  Drift detection             : "
-                f"{np.mean(prof['per_step']['drift_detection_s'])*1e3:>8.2f} ms")
-
-            print(
-                f"  Adaptation (when triggered) : "
-                f"{mean_adapt_time*1e3:>8.2f} ms"
-                if adapt_times_when_done else
-                "  Adaptation (when triggered) :      n/a"
-            )
-
-            print(f"  Full TTA step               : "
-                f"{np.mean(prof['per_step']['total_step_s'])*1e3:>8.2f} ms")
-
-            print(f"")
-
-            print(f"  ── Runtime Composition ──────────────────────────────")
-
-            print(f"  Adaptation compute fraction : "
-                f"{prof['adaptation_compute_fraction']*100:>8.2f} %")
-
-            print(f"  Mean online step latency    : "
-                f"{prof['mean_step_latency_ms']:>8.2f} ms")
-
-            print(f"")
-
-            print(f"  ── Totals ───────────────────────────────────────────")
-
-            print(f"  Total TTA time              : {total_tta:>8.3f} s")
-
-            print(f"  Total prediction time       : "
-                f"{total_pred:>8.3f} s")
-
-            print(f"  Total feature extraction    : "
-                f"{total_feat:>8.3f} s")
-
-            if config.get('setup_type') == 'drift':
-                print(f"  Total drift detection       : "
-                    f"{total_drift:>8.3f} s")
-
-            print(f"  Total adaptation time       : "
-                f"{total_adapt:>8.3f} s")
-
-            if config.get('setup_type') == 'drift':
-                print(f"  Est. time if always adapted : "
-                    f"{estimated_if_always:>8.3f} s")
-
-                print(f"  Time saved by drift detect  : "
-                    f"{prof['time_saved_by_drift_detection_s']:>8.3f} s")
-
-            print(f"  Peak memory (RSS)           : "
-                f"{prof['peak_memory_mb']:>8.1f} MB")
-
-            print("=" * 72 + "\n")
- 
-    if platform.system() not in ("Linux", "Darwin"):
-        tracemalloc.stop()
+    # Always stop tracemalloc — started unconditionally at the top
+    tracemalloc.stop()
         
     return (
         baseline_outputs,

@@ -21,7 +21,7 @@ from data.online_dataset import OnlineSubjectDataset
 from data.preprocessing_utils.data_visualization import plot_subject_annotation_blocks, plot_drift_calibration_summary, plot_param_updates
     
 
-def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, calibration_phase_size, ert, window_size, n_bootstraps, writer, device, config):
+def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, calibration_phase_size, ert, window_size, n_bootstraps, device, config):
     # ---- INITIALIZATION ----
     figs_baseline_path = os.path.join(figs_subj_dir, baseline)
     os.makedirs(figs_baseline_path, exist_ok=True)
@@ -78,7 +78,7 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
     past_batches = []
     
     # AE/BWT data structures
-    T = config['num_batches'] * config['num_blocks'] - calibration_phase_size
+    T = config['num_batches'] * config['num_blocks']
     sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
     baseline_block_sbp_mae = []
@@ -98,7 +98,7 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
     
     # Drift detector placeholders
     drift_detector = None
-    calibration_ids = []
+    detector_initialized = False
     n_steps = 0 # number of detector predictions after calibration
     n_detections = 0
     first_detection = None
@@ -109,146 +109,6 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
     
     # ---- PERSONALIZATION ----
     for batch_info in dataset.get_subject_blocks(**stream_kwargs):
-        
-        # CALIBRATION PHASE 
-        if calibration_phase_size > 0 and step_idx < calibration_phase_size:
-            
-            # Accumulate calibration batches
-            sample_ids = batch_info["sample_ids"]
-            calibration_ids.extend(sample_ids)
-            
-            sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
-            targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
-            
-            # Targets tracking for drift analysis (post hoc)
-            targets_log.append({
-                "step_idx": step_idx,
-                "sbp_values": targets[:, 0].detach().cpu().numpy().tolist(),
-                "dbp_values": targets[:, 1].detach().cpu().numpy().tolist(),
-            })
-            
-            # No parameters are updated
-            n_updated = 0
-
-            param_update_log.append({
-                "step_idx": step_idx,
-                "update_mode": config['inner_adapt'],
-                "n_updated_params": n_updated,
-                "total_params": total_params,
-                "fraction_updated": n_updated / total_params
-            })
-
-            # Increment step idx for the next block
-            step_idx += 1
-            continue
-        
-        if calibration_phase_size > 0 and step_idx == calibration_phase_size:
-    
-            # Stack calibration data
-            calibration_batch = [dataset.__getitem__(sid) for sid in calibration_ids]
-
-            calibration_signals = torch.stack([x for x, _, _ in calibration_batch]).to(device)
-            calibration_targets = torch.stack([y for _, y, _ in calibration_batch]).to(device)
-
-            # Model adaptation
-            opt = build_inner_optimizer(
-                adapted_encoder=enc, 
-                adapted_head=ph, 
-                base_lr=config['personalization_lr'], 
-                mode=config['inner_adapt'],
-                opt_type=config['inner_opt'].lower(), 
-                config=config
-            )
-
-            # Encoder params for logging
-            n_updated_calibration = sum(p.numel() for group in opt.param_groups for p in group['params'])
-            
-            criterion = (
-                F.smooth_l1_loss
-                if config["criterion"] == "SmoothL1Loss"
-                else F.mse_loss
-            )
-            
-            # During calibration, depending on the device resources, either all model parameters 
-            # or only the head parameters can be updated 
-            if config['inner_adapt'] == 'all':
-                
-                # Update also encoder: trian first with head for calibration and then predict feats for detector init
-                # -> train first with head for calibration
-                # -> then predict feats for detector init
-                enc.train(); ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(enc(calibration_signals))
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                enc.eval(); ph.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-            elif config['inner_adapt'] == 'head':
-                
-                # Frozen encoder: predict features for head calibration and detector init
-                enc.eval()
-                with torch.no_grad():
-                    calibration_features = enc(calibration_signals)
-                    
-                ph.train()
-                for step in range(config["personalization_steps"]):
-                    out = ph(calibration_features)
-                    loss = criterion(out, calibration_targets)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-                
-                ph.eval()
-                
-            else:
-                raise ValueError('Inexistent adaptation mode, allowed is all or head!')
-            
-            # Predict calibration data to get outputs for logging
-            previous_steps = 0
-            while previous_steps < step_idx:
-                with torch.no_grad():
-                    calibration_outputs = ph(calibration_features[config['personalization_batch_size'] * previous_steps: config['personalization_batch_size'] * (previous_steps + 1)])
-                    predictions_log.append({
-                        "step_idx": previous_steps,
-                        "sbp_values": calibration_outputs[:, 0].detach().cpu().numpy().tolist(),
-                        "dbp_values": calibration_outputs[:, 1].detach().cpu().numpy().tolist(),
-                    })
-                previous_steps += 1
-            
-            if config['setup_type'] == 'drift':
-                # Initialize drfit detector
-                # NOTE: only after calibration completion
-                reference_data = calibration_features.detach().clone()
-
-                if config['drift_detector_type'] == 'mmd':
-                    drift_detector = MMDDriftOnline(
-                        x_ref=reference_data.cpu().numpy(),
-                        ert=ert,
-                        window_size=window_size,
-                        n_bootstraps=n_bootstraps,
-                        backend='pytorch',
-                        verbose=False
-                    )
-                elif config['drift_detector_type'] == 'lsdd':
-                    drift_detector = LSDDDriftOnline(
-                        x_ref=reference_data.cpu().numpy(),
-                        ert=ert,
-                        window_size=window_size,
-                        n_bootstraps=n_bootstraps,
-                        backend='pytorch',
-                        verbose=False
-                    )
-                else:
-                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
-
-                print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
                 
         # ONLINE TEST-TIME ADAPTATION EVALUATION 
         
@@ -298,64 +158,37 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
         
         # ---------- Decide adaptation ----------
         do_adapt = False
-        
-        if config['setup_type'] == 'drift':
-            # Detect data drifts with detector
-            for i in range(features.shape[0]):
-                # Add batch dimension before prediction
-                detection_report = drift_detector.predict(features[i].cpu().numpy())
-                drift_flag = detection_report["data"]["is_drift"]
-                
-                # Increment n_steps here to count the detector predictions (also after the detector is reinit. after an update)
-                n_steps += 1    
-                
-                # Log only after the minimum number of test samples have been seen (i.e. after the first window is filled)
-                if drift_detector.t >= window_size:
-                    if drift_flag == 1:
-                        n_detections += 1
-                        if first_detection is None:
-                            first_detection = n_steps
-                            
-                        global_window_idx = step_idx * config['personalization_batch_size'] + i
-                        detection_timesteps.append(global_window_idx)
-                        do_adapt = True # Update when a single sample is considered out of distribution to react quickly to drifts 
-        
-        # If not drift setup: adapt by default (every block) for adaptive baselines
-        if config.get("setup_type") == "fixed":
+
+        if config['setup_type'] == 'fixed':
             do_adapt = True
-        elif config.get("setup_type") == "drift":
-            # Use detector for each adaptive baseline
-            if not do_adapt:
-                # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-                if step_idx == calibration_phase_size:
-                    # No parameters are updated exceet for the calibraiton ones
-                    n_updated = n_updated_calibration
 
-                    param_update_log.append({
-                        "step_idx": step_idx,
-                        "update_mode": config['inner_adapt'],
-                        "n_updated_params": n_updated,
-                        "total_params": total_params,
-                        "fraction_updated": n_updated / total_params
-                    })
-                elif step_idx > calibration_phase_size:
-                    # No parameters are updated
-                    n_updated = 0
+        elif config['setup_type'] == 'drift':
+            # NOTE: Before the detector is initialized, always adapt.
+            if not detector_initialized:
+                do_adapt = True
+            else:
+                # Use drift detector to decide
+                for i in range(features.shape[0]):
+                    detection_report = drift_detector.predict(features[i].cpu().numpy())
+                    drift_flag = detection_report["data"]["is_drift"]
 
-                    param_update_log.append({
-                        "step_idx": step_idx,
-                        "update_mode": 'head',
-                        "n_updated_params": n_updated,
-                        "total_params": total_params,
-                        "fraction_updated": n_updated / total_params
-                    })
-                else:
-                    raise ValueError("Step idx should not be less than calibration phase size at this point!")
+                    n_steps += 1
+
+                    if drift_detector.t >= window_size:
+                        if drift_flag == 1:
+                            n_detections += 1
+                            if first_detection is None:
+                                first_detection = n_steps
+
+                            global_window_idx = step_idx * config['personalization_batch_size'] + i
+                            detection_timesteps.append(global_window_idx)
+                            do_adapt = True
+
         else:
             raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
 
         if do_adapt:
-            # ---------- Adaptation ----------
+            # ---------- Adaptation (head only) ----------
             
             # Use features and targets for adaptation
             train_features = features
@@ -374,14 +207,10 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
             # Encoder params for logging
             n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
             total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
-
-            # We reach this part of code only when step_idx is equal to or greater than calibration phase size or 
-            if step_idx == calibration_phase_size:
-                n_updated += n_updated_calibration
                 
             param_update_log.append({
                 "step_idx": step_idx,
-                "update_mode": 'head' if step_idx > calibration_phase_size else config['inner_adapt'],
+                "update_mode": 'head',
                 "n_updated_params": n_updated,
                 "total_params": total_params,
                 "fraction_updated": n_updated / total_params
@@ -423,20 +252,27 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
                 
             # Set to eval mode after adaptation
             ph.eval()
+        
+        else:
+            # No adaptation this step
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head',
+                "n_updated_params": 0,
+                "total_params": total_params,
+                "fraction_updated": 0.0
+            })
+        
+        # Always update the replay buffer to maintain a diverse feature set
+        # -> otherwise the buffer will be filled up without features before the drift 
+        with torch.no_grad():
+            replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
             
-            # Update replay buffer 
-            with torch.no_grad():
-                replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
-                
-            # Detector re-init when buffer has enough samples for a new reference set
-            if config['setup_type'] == 'drift' and len(replay_buffer) > (config['personalization_batch_size'] * calibration_phase_size):
-                
-                drift_detector = None
-                
-                # Re-initialize drfit detector
-                # NOTE: only after having updated the replay buffer
+        # Detector init/re-init when buffer has enough samples for the reference set
+        if config['setup_type'] == 'drift':
+            if len(replay_buffer) >= calibration_phase_size and (not detector_initialized or do_adapt):
                 reference_data = torch.stack(replay_buffer.features).numpy().copy()
-                
+
                 if config['drift_detector_type'] == 'mmd':
                     drift_detector = MMDDriftOnline(
                         x_ref=reference_data,
@@ -458,8 +294,12 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
                 else:
                     raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
 
-                print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples from the replay_buffer ✓")
-        
+                if not detector_initialized:
+                    detector_initialized = True
+                    print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
+                else:
+                    print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples ✓")  
+                      
         # Add sample ids for AE/BWT
         past_batches.append(sample_ids)
         
@@ -473,8 +313,8 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
                     config
                 )
 
-            sbp_errors_matrix[step_idx - calibration_phase_size, i] = sbp_mae_i
-            dbp_errors_matrix[step_idx - calibration_phase_size, i] = dbp_mae_i
+            sbp_errors_matrix[step_idx, i] = sbp_mae_i
+            dbp_errors_matrix[step_idx, i] = dbp_mae_i
         
         # Increment step idx for the next block
         step_idx += 1
@@ -483,6 +323,9 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
     # Compute CL metrics (AE, BWT)
     sbp_baseline_metrics = compute_transfer_metrics_from_matrix(sbp_errors_matrix)
     dbp_baseline_metrics = compute_transfer_metrics_from_matrix(dbp_errors_matrix)
+    
+    sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+    dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
     
     # Save error matrices as CSV
     sbp_df_err = pd.DataFrame(sbp_errors_matrix)
@@ -493,47 +336,44 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
     print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
 
     # Prepare per-block stats
-    per_block_stats = {
-        'sbp_mae': baseline_block_sbp_mae, 'sbp_std': baseline_block_sbp_std,
-        'dbp_mae': baseline_block_dbp_mae, 'dbp_std': baseline_block_dbp_std,
-    }
+    #per_block_stats = {
+    #    'sbp_mae': baseline_block_sbp_mae, 'sbp_std': baseline_block_sbp_std,
+    #    'dbp_mae': baseline_block_dbp_mae, 'dbp_std': baseline_block_dbp_std,
+    #}
 
     # Prepare concatenated outputs/targets
-    outs_and_tgts = {}
-    if len(baseline_outputs) > 0:
-        outs_and_tgts = (
-            np.concatenate([o for o in baseline_outputs if o is not None], axis=0),
-            np.concatenate([t for t in baseline_targets if t is not None], axis=0)
-        )
-    else:
-        outs_and_tgts = (np.empty((0,)), np.empty((0,)))
+    #outs_and_tgts = {}
+    #if len(baseline_outputs) > 0:
+    #    outs_and_tgts = (
+    #        np.concatenate([o for o in baseline_outputs if o is not None], axis=0),
+    #        np.concatenate([t for t in baseline_targets if t is not None], axis=0)
+    #    )
+    #else:
+    #    outs_and_tgts = (np.empty((0,)), np.empty((0,)))
                 
     # Save update logs per baseline
-    df_updates = pd.DataFrame(param_update_log)
+    #df_updates = pd.DataFrame(param_update_log)
     
-    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
-    df_updates.to_csv(log_csv_path, index=False)
+    #log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
+    #df_updates.to_csv(log_csv_path, index=False)
     
-    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
-    plot_param_updates(df_updates, subject_id, plot_path)
+    #plot_path = os.path.join(figs_baseline_path, "param_updates.png")
+    #plot_param_updates(df_updates, subject_id, plot_path)
     
     # Save targets/predictions log per baseline
-    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
-    with open(log_json_path, "w") as f:
-        json.dump(targets_log, f)
-    
-    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
-    with open(log_json_path, "w") as f:
-        json.dump(predictions_log, f)
+    #log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
+    #with open(log_json_path, "w") as f:
+    #    json.dump(targets_log, f)
 
-    if config['setup_type'] == 'drift':    
+    #log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
+    #with open(log_json_path, "w") as f:
+    #    json.dump(predictions_log, f)
+
+    print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {step_idx * config['personalization_batch_size']} steps with drift detection after calibration ✓")
         
-        print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {(step_idx - config['calibration_phase_size']) * config['personalization_batch_size']} steps with drift detection after calibration ✓")
+    if config['setup_type'] == 'drift' and config['plot_personalization']:    
         
-        # Calibration summary plot
-        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
-        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
-        
+        # Calibration summary plot 
         plot_fname = f"ert{ert}_w{window_size}_detector_summary.png"
         plot_path  = os.path.join(figs_baseline_path, plot_fname)
     
@@ -620,10 +460,10 @@ def calibrate_drift_detector(config, device):
     
     # Parameters to tune
     param_grid = {
-        "window_size": [2, 3, 4, 5],
+        "window_size": [2, 4, 8],
         "ert": [16, 32, 64],
         "n_bootstraps": [500, 1000],
-        "calibration_phase_size": [config['calibration_phase_size']],
+        "calibration_phase_size": [config['replay_buffer_size'], config['replay_buffer_size'] // 2, config['replay_buffer_size'] // 4],
     }
     
     # Logging
@@ -639,6 +479,9 @@ def calibrate_drift_detector(config, device):
 
                     print(f"\n[Calibration] Testing config: W={window_size}, ERT={ert}, N_bootstraps={n_bootstraps}, Calibration Phase Size={calibration_phase_size}")
 
+                    # Create a config-specific string for the path
+                    config_str = f"calib_{calibration_phase_size}_W_{window_size}_ert_{ert}_boot_{n_bootstraps}"
+                    
                     total_detections = 0
                     total_steps = 0
                     first_detection_steps = []
@@ -650,10 +493,10 @@ def calibrate_drift_detector(config, device):
                     for subject_counter, subject_id in enumerate(test_subjects):
                         
                         try:
-                            figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
+                            figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}", config_str)
                             os.makedirs(figs_subj_dir, exist_ok=True)
                             
-                            logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}")
+                            logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}", config_str)
                             os.makedirs(logs_subj_dir, exist_ok=True)
                             
                             stats = subject_calibration_with_feature_replay(
@@ -667,8 +510,7 @@ def calibrate_drift_detector(config, device):
                                 window_size=window_size,
                                 n_bootstraps=n_bootstraps,
                                 device=device,
-                                config=config,
-                                writer=None
+                                config=config
                             )
                             print(stats, flush=True)
  
@@ -712,12 +554,77 @@ def calibrate_drift_detector(config, device):
     
     # Save results as CSV
     df = pd.DataFrame(results)
+    
+    # ERT calibration fidelity — kept as an informational column only,
+    # not used as a hard filter.
     df["ert_relative_error"] = (
         (df["empirical_ert"] - df["ert_target"]).abs() / df["ert_target"]
     )
 
-    df.sort_values("ert_relative_error", inplace=True, ascending=True)
-    save_path = os.path.join(config['detector_calibration_csv_path'], f"{config['drift_detector_type']}_calibration_results.csv")
-    df.to_csv(save_path, index=False)
+    # ═════════════════════════════════════════════════════════════════════════
+    # COMPOSITE SCORE
+    #
+    # Each metric is min-max normalised to [0, 1] so that metrics expressed
+    # in different units (mmHg, steps, %) are directly comparable.
+    # All four components are weighted equally (w = 1/4), which makes the
+    # score the simple arithmetic mean of the four normalised objectives.
+    # Lower is better for every component:
+    #
+    #   BP error (AE)      — avg MAE on the current batch at each TTA step
+    #   CL stability (BWT) — MAE-based: positive = forgetting, lower = better
+    #   Detection latency  — steps to first alarm; faster reaction = lower
+    #   Missed subjects    — % of subjects where the detector never fired
+    # ═════════════════════════════════════════════════════════════════════════
+    def minmax_norm(series: pd.Series) -> pd.Series:
+        lo, hi = series.min(), series.max()
+        return (series - lo) / (hi - lo) if hi > lo else pd.Series(0.0, index=series.index)
+
+    # Configs that never detected anything are penalised on both latency and
+    # coverage by assigning the worst observed first-detection value.
+    df["avg_first_detection_filled"] = df["avg_first_detection"].fillna(
+        df["avg_first_detection"].max()
+    )
+    # Coverage: higher pct_subjects_detected is better → invert before normalising
+    df["pct_subjects_missed"] = 100.0 - df["pct_subjects_detected"]
+
+    df["norm_ae"]      = minmax_norm((df["avg_sbp_ae"].fillna(df["avg_sbp_ae"].max())
+                                    + df["avg_dbp_ae"].fillna(df["avg_dbp_ae"].max())) / 2)
+    df["norm_bwt"]     = minmax_norm((df["avg_sbp_bwt"].fillna(df["avg_sbp_bwt"].max())
+                                    + df["avg_dbp_bwt"].fillna(df["avg_dbp_bwt"].max())) / 2)
+    df["norm_latency"] = minmax_norm(df["avg_first_detection_filled"])
+    df["norm_missed"]  = minmax_norm(df["pct_subjects_missed"])
+
+    # Equal weights: score = mean of the four normalised objectives
+    df["composite_score"] = (
+        df["norm_ae"] + df["norm_bwt"] + df["norm_latency"] + df["norm_missed"]
+    ) / 4
+
+    # Remove invalid config - e.g. with error suring computation like numerical instability
+    df.dropna(inplace=True)
     
-    print(f'[Drift Detection] Drift dector calibration completed! results saved at {save_path} ')
+    # 2. Define the sorting hierarchy (all ascending by default)
+    sort_columns = ["calibration_phase_size", "n_bootstraps", "ert_target", "window_size", "avg_sbp_ae"]
+
+    # 3. Sort the DataFrame
+    sorted_df = df.sort_values(by=sort_columns, ascending=True).reset_index(
+        drop=True
+    )
+
+    # Print
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.float_format", "{:.3f}".format)
+    pd.set_option("display.width", 200)
+
+    print("\n" + "═" * 100)
+    print("ALL CONFIGS — ranked by composite score (lower = better)")
+    print("Tiebroken by ERT calibration fidelity (lower relative error = better calibrated threshold)")
+    print("═" * 100)
+    print(sorted_df.to_string(index=False))
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    save_path = os.path.join(
+        config['detector_calibration_csv_path'],
+        f"{config['drift_detector_type']}_calibration_results_with_weighted_scores.csv"
+    )
+    sorted_df.to_csv(save_path, index=False)
+    print(f"[Drift Detection] Calibration complete. Results saved → {save_path}")

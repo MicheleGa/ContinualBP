@@ -1,0 +1,15 @@
+nohup: ignoring input
+mkdir: cannot create directory ‘logs/pi_deployment_feature_replay_drift_aware_mmd’: File exists
+Traceback (most recent call last):
+  File "/home/michele/Documents/ContinualBP/deployment_personalization.py", line 55, in <module>
+    personalization(config, device)
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 688, in personalization
+    baseline_outs_and_tgts, baseline_profiling_metrics = personalize_feature_replay(
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 438, in personalize_feature_replay
+    baseline_outputs, baseline_targets, profiling_report = run_subject_on_pi(
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 156, in run_subject_on_pi
+    _scp_pi(f"{target}:{results_remote}", results_local)
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 35, in _scp_pi
+    raise RuntimeError(
+RuntimeError: [Pi] scp failed (iris@toaster.local:~/Documents/ContinualBP/deployment/results_p005696.pkl -> ./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_05_19-15_04_26/subject_p005696/feature_replay/results_from_pi_p005696.pkl)
+  stderr: ./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_05_19-15_04_26/subject_p005696/feature_replay/results_from_pi_p005696.pkl: No such file or directory

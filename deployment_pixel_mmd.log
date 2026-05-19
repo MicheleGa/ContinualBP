@@ -1,0 +1,60 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "/home/michele/Documents/ContinualBP/deployment_personalization.py", line 55, in <module>
+    personalization(config, device)
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 688, in personalization
+    baseline_outs_and_tgts, baseline_profiling_metrics = personalize_feature_replay(
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 458, in personalize_feature_replay
+    baseline_outputs, baseline_targets, profiling_report = run_subject_on_pixel(
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 314, in run_subject_on_pixel
+    stdout = _ssh_pixel(pixel_user, pixel_host, remote_cmd)
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 229, in _ssh_pixel
+    raise RuntimeError(
+RuntimeError: [Pixel] SSH command failed:
+cmd: proot-distro login ubuntu -- bash -c 'cd ~/ContinualBP/deployment && source venv/bin/activate && python /data/data/com.termux/files/home/ContinualBP/deployment/run_subject_cli.py /data/data/com.termux/files/home/ContinualBP/deployment/p002694_blocks.pkl /data/data/com.termux/files/home/ContinualBP/deployment/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml /data/data/com.termux/files/home/ContinualBP/deployment/p002694_experiment_config.pkl /data/data/com.termux/files/home/ContinualBP/deployment/results_p002694.pkl'
+
+stderr:
+Warning: CPU doesn't support 32-bit instructions, some software may not work.
+proot warning: can't sanitize binding "/proc/self/fd/1": No such file or directory
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+No GPU detected, fall back on CPU.
+Connection to localhost closed by remote host.
+Traceback (most recent call last):
+  File "/home/michele/Documents/ContinualBP/deployment_personalization.py", line 55, in <module>
+    personalization(config, device)
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 688, in personalization
+    baseline_outs_and_tgts, baseline_profiling_metrics = personalize_feature_replay(
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 458, in personalize_feature_replay
+    baseline_outputs, baseline_targets, profiling_report = run_subject_on_pixel(
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 290, in run_subject_on_pixel
+    _scp_pixel(data_stream_path, f"{target}:{data_remote}")
+  File "/home/michele/Documents/ContinualBP/deployment/deployment_personalizer.py", line 204, in _scp_pixel
+    raise RuntimeError(
+RuntimeError: [Pixel] scp failed (./logs/pixel_deployment_feature_replay_drift_aware_mmd_seed_41/pixel_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_05_19-16_04_39/subject_p002694/feature_replay/p002694_blocks.pkl -> u0_a365@localhost:/data/data/com.termux/files/home/ContinualBP/deployment/p002694_blocks.pkl)
+stderr:
+ssh: connect to host localhost port 8022: Connection refused
+lost connection
