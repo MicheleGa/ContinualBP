@@ -476,7 +476,7 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
                 
         # Detector init/re-init when buffer has enough samples for the reference set
         if config['setup_type'] == 'drift':
-            if len(replay_buffer) >= config['replay_buffer_size'] and (not detector_initialized or do_adapt):
+            if len(replay_buffer) >= config['calibration_phase_size'] and (not detector_initialized or do_adapt):
                 
                 # Start drift reinit profiling
                 tm_before_reinit = _tm_current_kb()

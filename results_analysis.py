@@ -15,9 +15,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import spearmanr, pearsonr
 
-def resource_profiling(baseline, profiling_path, deployment_device):
+
+def resource_profiling(baseline, mmd_profiling_path, lsdd_profiling_path, deployment_device):
  
-    profiling_path = Path(profiling_path)
+    mmd_profiling_path = Path(mmd_profiling_path)
+    lsdd_profiling_path = Path(lsdd_profiling_path)
     
     # Containers 
     per_step_latency_keys = [
@@ -784,13 +786,11 @@ def generate_mmd_vs_lsdd_overleaf_table(
     latex = []
     latex.append(r"\begin{table*}")
     latex.append(r"    \centering")
-    latex.append(r"    \caption{Drift-aware Personalization results (averaged over three seeds) on Vital DB for continuous SBP/DBP estimation from PPG. The baseline employed for personalization is feature replay with the drift detectors considered in this study: Online MMD and Online LSDD. The reported metrics are the same as those reported for the previous table and the number of skipped updates (rightmost column) per drift detector.}")
+    latex.append(r"    \caption{Drift-aware Personalization results on Vital DB for continuous SBP/DBP estimation from PPG. The baseline employed for personalization is feature replay (reservoir buffer of 64 features) with the drift detectors considered in this study: MMD and LSDD. The reported metrics are the same as those of ~\ref{tab:table_1} plus the number of skipped updates (rightmost column) per drift detector.}")
     latex.append(r"    \begin{tabular}{l|l|l|p{0.15\textwidth}|p{0.16\textwidth}|l|l}")
     latex.append(r"        \hline")
     latex.append(r"        \textbf{Algorithm} & \textbf{AE}$\downarrow$ & \textbf{BWT}$\downarrow$ & \makecell[l]{\textbf{ME}$\downarrow$ \\ ($<$5 mmHg)} & \makecell[l]{\textbf{STD}$\downarrow$ \\ ($<$8 mmHg)} & \makecell[l]{\textbf{BHS}$\uparrow$ \\ (A)} & \makecell[l]{\textbf{Skipped} \\ \textbf{Fraction\%}$\uparrow$} \\")
     latex.append(r"        \hline")
-
-    first_algo = True
 
     for algo, shift_name in set_mapping.items():
 
@@ -802,6 +802,7 @@ def generate_mmd_vs_lsdd_overleaf_table(
         sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
         dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
         skipped_fraction = aggregated_results[baseline_key][f"{shift_name}_updates"]["mean_skipped_fraction"]
+
         # -----------------------
         # Assumes single-row CSVs
         # -----------------------
@@ -851,6 +852,8 @@ def generate_mmd_vs_lsdd_overleaf_table(
 def analyze_mmd_vs_lsdd(baselines):
     
     baseline = 'feature_replay'
+    path_keys = ["drift_aware_mmd", "drift_aware_lsdd"]
+    
     baseline_paths = baselines[baseline]
     aggregated_results = {}
 
@@ -858,9 +861,8 @@ def analyze_mmd_vs_lsdd(baselines):
 
     # ---------------------------------
     # Clinical Metrics (ME / STD / BHS)
-    # ---------------------------------
-           
-    for path_key in ["drift_aware_mmd", "drift_aware_lsdd"]:
+    # ---------------------------------           
+    for path_key in path_keys:
         dfs = [
             pd.read_csv(os.path.join(
                     baseline_paths[path_key],
@@ -870,24 +872,8 @@ def analyze_mmd_vs_lsdd(baselines):
                 ),
                 usecols=["Type", "ME", "STD", "BHS_Grade"]            
             ),
-
-            pd.read_csv(os.path.join(
-                    baseline_paths[f"{path_key}_seed_41"],
-                    "aggregate_metrics",
-                    f"aggregate_{baseline}_metrics",
-                    "evaluation_metrics.csv"
-                ),
-                usecols=["Type", "ME", "STD", "BHS_Grade"]  
-            ),
-
-            pd.read_csv(os.path.join(
-                    baseline_paths[f"{path_key}_seed_40"],
-                    "aggregate_metrics",
-                    f"aggregate_{baseline}_metrics",
-                    "evaluation_metrics.csv"
-                ),
-                usecols=["Type", "ME", "STD", "BHS_Grade"]  
-            )
+            
+            # TODO: could expand with seeds
         ]
 
         aggregated_results[baseline][f"{path_key}_clinical"] = (
@@ -900,8 +886,7 @@ def analyze_mmd_vs_lsdd(baselines):
     # -------------------------------------
     # Continual Learning Metrics (AE / BWT)
     # -------------------------------------
-
-    for path_key in ["drift_aware_mmd", "drift_aware_lsdd"]:
+    for path_key in path_keys:
         # ---------------------------
         # SBP
         # ---------------------------
@@ -922,13 +907,7 @@ def analyze_mmd_vs_lsdd(baselines):
                 usecols=["AE_mean", "BWT_mean"]  
             ),
 
-            pd.read_csv(os.path.join(
-                    baseline_paths[f"{path_key}_seed_40"],
-                    "aggregate_metrics",
-                    "sbp_aggregate_baseline_metrics.csv"
-                ),
-                usecols=["AE_mean", "BWT_mean"]  
-            )
+            # TODO: could expand with seeds
         ]
 
         # ---------------------------
@@ -951,13 +930,7 @@ def analyze_mmd_vs_lsdd(baselines):
                 usecols=["AE_mean", "BWT_mean"]  
             ),
 
-            pd.read_csv(os.path.join(
-                    baseline_paths[f"{path_key}_seed_40"],
-                    "aggregate_metrics",
-                    "dbp_aggregate_baseline_metrics.csv"
-                ),
-                usecols=["AE_mean", "BWT_mean"]  
-            )
+            # TODO: could expand with seeds
         ]
 
         aggregated_results[baseline][f"{path_key}_sbp_cl"] = (
@@ -971,16 +944,13 @@ def analyze_mmd_vs_lsdd(baselines):
     # -----------------
     # Number of updates 
     # -----------------
-
-    path_keys = ["drift_aware_mmd", "drift_aware_lsdd"]
-
     for path_key in path_keys:
 
         # collect all seed-specific paths
         seed_paths = [
             baseline_paths[path_key],
-            baseline_paths[f"{path_key}_seed_41"],
-            baseline_paths[f"{path_key}_seed_40"],
+            
+            # TODO: could expand with seeds
         ]
 
         experiment_dir = Path(seed_paths[0])
@@ -1060,8 +1030,8 @@ def analyze_mmd_vs_lsdd(baselines):
         }
         
     set_mapping = {
-        "Online MMD": "drift_aware_mmd",
-        "Online LSDD": "drift_aware_lsdd",
+        "MMD": "drift_aware_mmd",
+        "LSDD": "drift_aware_lsdd",
     }
     
     latex_table = generate_mmd_vs_lsdd_overleaf_table(
@@ -1134,6 +1104,8 @@ def analyze_logs_and_plot():
             'abrupt_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-21_27_56", 
             'abrupt_shifts_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_17-21_37_24",
             'abrupt_shifts_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_17-21_37_24",
+            "drift_aware_mmd": "",
+            "drift_aware_lsdd": "",
             "laptop_drift_aware_mmd": "./logs/laptop_deployment_feature_replay_drift_aware_mmd/laptop_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_19-17_36_17",
             "laptop_drift_aware_lsdd": "./logs/laptop_deployment_feature_replay_drift_aware_lsdd/laptop_deployment_feature_replay_drift_aware_lsdd-Proto-2026_05_19-17_31_26",
             "pi_drift_aware_mmd" : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_19-13_17_50",
@@ -1141,8 +1113,6 @@ def analyze_logs_and_plot():
             "pixel_drift_aware_mmd" : "./logs/pixel_deployment_feature_replay_drift_aware_mmd/pixel_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_19-13_25_41",
             "pixel_drift_aware_lsdd" : "./logs/pixel_deployment_feature_replay_drift_aware_lsdd/pixel_deployment_feature_replay_drift_aware_lsdd-Proto-2026_05_19-17_21_19",
             "ppg_ecg_gradual_shifts" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts-Proto-2026_05_18-15_38_22",
-            "ppg_ecg_gradual_shifts_seed_41" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_41/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_18-15_41_31",
-            "ppg_ecg_gradual_shifts_seed_40" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_40/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_18-15_41_24",
         }, 
         'lwf': {
             'gradual_shifts_path': "./logs/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-21_34_18",
@@ -1189,7 +1159,7 @@ def analyze_logs_and_plot():
     # Performance Assessment with Clinical & CL Metrics
     # -> only for feature replay with Online MMD vs Online LSDD
     # ---------------------------------------------------------
-    analyze_mmd_vs_lsdd(baselines)
+    #analyze_mmd_vs_lsdd(baselines)
     
     # --------------------------
     # Resource Profiling
@@ -1200,16 +1170,33 @@ def analyze_logs_and_plot():
     
     # Laptop Profiling
     print("[Log Analysis] Laptop Resource Profiling")
-    resource_profiling(baseline=baseline, profiling_path=baselines[baseline]['deployment_laptop'], deployment_device='laptop')
+    resource_profiling(
+        baseline=baseline, 
+        mmd_profiling_path=baselines[baseline]['laptop_drift_aware_mmd'], 
+        lsdd_profiling_path=baselines[baseline]['laptop_drift_aware_lsdd'],
+        deployment_device='laptop'
+    )
 
     # Pixel Profiling
     print("[Log Analysis] Google Pixel Resource Profiling")
-    resource_profiling(baseline=baseline, profiling_path=baselines[baseline]['deployment_pixel'], deployment_device='pixel')
+    resource_profiling(
+        baseline=baseline, 
+        mmd_profiling_path=baselines[baseline]['pixel_drift_aware_mmd'], 
+        lsdd_profiling_path=baselines[baseline]['pixel_drift_aware_lsdd'],
+        deployment_device='pixel'
+    )
     
     
     # Pi Profiling
     print("[Log Analysis] Raspberry Pi Resource Profiling")
-    resource_profiling(baseline=baseline, profiling_path=baselines[baseline]['deployment_pi'], deployment_device='pi')
+    resource_profiling(
+        baseline=baseline, 
+        mmd_profiling_path=baselines[baseline]['pi_drift_aware_mmd'], 
+        lsdd_profiling_path=baselines[baseline]['pi_drift_aware_lsdd'],
+        deployment_device='pixel'
+    )
+    
+    print("[Log Analysis] Results Analysis Completed ✓")
     
     
 def parseargs():
