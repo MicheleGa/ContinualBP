@@ -44,6 +44,6 @@
 #python online_dataset.py --name pulse_db_vital_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 16 --num_batches 3 --num_blocks 4
 #python online_dataset.py --name pulse_db_vital_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 8 --num_batches 1 --num_blocks 45
 #python online_dataset.py --name pulse_db_vital_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 4 --num_batches 77 --num_blocks 1
-python online_dataset.py --name pulse_db_vital_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 4 --num_batches 72 --num_blocks 1 --loader_worker 1
+#python online_dataset.py --name pulse_db_vital_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 4 --num_batches 72 --num_blocks 1 --loader_worker 1
 
-#python online_dataset_aurora.py --name aurora_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 4 --num_batches 1 --num_blocks 14
+python online_dataset_aurora.py --name aurora_db_percentile --input_seq_len_s 10 --fs 125 --plot --personalization_batch_size 4 --num_batches 1 --num_blocks 14

@@ -21,7 +21,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -55,7 +55,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -89,7 +89,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -123,7 +123,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -157,7 +157,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -191,7 +191,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -225,7 +225,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \
@@ -259,7 +259,7 @@ python personalization.py \
     --fs 125 \
     --input_seq_len_s 10 \
     --embed_dim 128 \
-    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4_seed_40/proto_ppg_percentile_group_layer_norm_kq_4_seed_40-Proto-2026_05_17-10_53_46/proto_ppg_percentile_group_layer_norm_kq_4_seed_40_best_maml \
+    --pretrained_model_ckpt_path ./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml \
     --criterion 'SmoothL1Loss' \
     --personalization_lr 0.005 \
     --personalization_steps 10 \

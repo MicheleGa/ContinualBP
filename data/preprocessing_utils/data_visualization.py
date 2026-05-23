@@ -1996,3 +1996,246 @@ def plot_drift_calibration_summary(
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+    
+
+def plot_drift_aware_updates_per_subject(subject_updates_drift, subject_total_update_opportunities, mean_frequency_saving, std_frequency_saving, deployment_device, detector_name, n_seeds=None):
+    
+    # Plot 1: Drift-aware updates per subject
+    subject_ids = list(subject_updates_drift.keys())
+ 
+    drift_updates = [
+        subject_updates_drift[sid]
+        for sid in subject_ids
+    ]
+ 
+    max_updates_per_subject = [
+        subject_total_update_opportunities[sid]
+        for sid in subject_ids
+    ]
+ 
+    x_ticks = np.arange(len(subject_ids))
+ 
+    plt.figure(figsize=(12, 8))
+ 
+    # Actual performed updates
+    plt.bar(
+        x_ticks,
+        drift_updates,
+        color="steelblue",
+        width=0.7,
+        label="Performed updates"
+    )
+ 
+    # Maximum possible updates
+    plt.plot(
+        x_ticks,
+        max_updates_per_subject,
+        color="darkred",
+        linestyle="--",
+        linewidth=2,
+        label="Maximum possible updates"
+    )
+ 
+    plt.xticks(x_ticks, [""] * len(x_ticks))
+ 
+    plt.gca().yaxis.set_major_locator(
+        plt.MaxNLocator(integer=True)
+    )
+ 
+    plt.xlabel("Subjects", fontsize=14)
+    plt.ylabel("Number of updates", fontsize=14)
+    plt.suptitle(
+        f"Drift-aware adaptation frequency per subject (avg. over {n_seeds} seeds)\n"
+        f"Average update reduction: "
+        f"{mean_frequency_saving:.1f}% ± "
+        f"{std_frequency_saving:.1f}%",
+        fontsize=16
+    )
+ 
+    plt.legend(fontsize=12)
+    plt.grid(axis="y", alpha=0.4)
+    plt.tight_layout()
+ 
+    save_path = (
+        f"./drift_updates_per_subject_on_"
+        f"{deployment_device}_{detector_name}.png"
+    )
+ 
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"[Log Analysis] Saved → {save_path}")
+
+
+def plot_latency_breakdown(per_step_per_subject_means, deployment_device, detector_name, n_seeds=None):
+    
+    # Two-panel figure: top = per-step latencies, bottom = calibration
+    # latencies. Horizontal grouped bars with mean ± std error bars.
+    # Per-step and calibration are kept separate because they differ by
+    # ~3 orders of magnitude and combining them would crush the per-step bars.
+    #
+    # Per-step labels and colors — ordered from cheapest to most expensive
+    # so the reader's eye naturally moves from background cost to peak cost.
+    per_step_display = {
+        'prediction_s':             ('Prediction  ph(feats)',           '#4393c3'),
+        'feature_extraction_s':     ('Feature extraction  enc(x)',      '#2166ac'),
+        'drift_detection_s':        ('Drift detection  detector loop',  '#92c5de'),
+        'head_adapt_s':             ('Head adaptation  train loop',     '#d6604d'),
+        'drift_detector_reinit_s':  ('Detector reinit  reference copy', '#f4a582'),
+        'adaptation_s':             ('Full adaptation block',           '#b2182b'),
+        'total_step_s':             ('Total TTA step  (wall time)',     '#333333'),
+    }
+ 
+    fig, ax = plt.subplots(figsize=(12, 8))
+ 
+    # Panel A: per-step latencies
+    step_keys   = list(per_step_display.keys())
+    step_labels = [per_step_display[k][0] for k in step_keys]
+    step_colors = [per_step_display[k][1] for k in step_keys]
+ 
+    step_means = np.array([
+        np.array(per_step_per_subject_means[k]).mean() * 1e3   # → ms
+        for k in step_keys
+    ])
+    step_stds = np.array([
+        np.array(per_step_per_subject_means[k]).std() * 1e3
+        for k in step_keys
+    ])
+ 
+    y_pos = np.arange(len(step_keys))
+    bars  = ax.barh(
+        y_pos, step_means,
+        xerr=step_stds,
+        color=step_colors,
+        edgecolor='white',
+        height=0.6,
+        capsize=4,
+        error_kw=dict(elinewidth=1.2, ecolor='#555555')
+    )
+    # Annotate each bar with its value
+    for bar, mean, std in zip(bars, step_means, step_stds):
+        ax.text(
+            bar.get_width() + std + 0.3,
+            bar.get_y() + bar.get_height() / 2,
+            f"{mean:.1f} ± {std:.1f} ms",
+            va='center', ha='left', fontsize=9, color='#333333'
+        )
+ 
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(step_labels, fontsize=11)
+    ax.set_xlabel("Latency (ms)", fontsize=12)
+    ax.grid(axis='x', alpha=0.35)
+    ax.spines[['top', 'right']].set_visible(False)
+    # Add extra x-axis margin so annotations don't clip
+    ax.set_xlim(right=ax.get_xlim()[1] * 1.35)
+ 
+    fig.suptitle(f"Per-step latencies  (mean ± std across subjects) on {deployment_device}  [{detector_name}]", fontsize=15, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    save_path = f"./latency_profile_on_{deployment_device}_{detector_name}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[Log Analysis] Saved → {save_path}")
+    
+    
+def plot_memory_breakdown(aggregate_memory_per_subject, subject_updates_drift, per_step_memory_peak_per_subject, deployment_device, detector_name, n_seeds=None):
+    
+    model_arr       = np.array(aggregate_memory_per_subject['model_memory_mb'])
+    incremental_arr = np.array(aggregate_memory_per_subject['peak_incremental_tta_mb'])
+    rss_before_arr  = np.array(aggregate_memory_per_subject['rss_before_tta_mb'])
+    
+    runtime_arr     = rss_before_arr - model_arr
+ 
+    subject_ids = list(subject_updates_drift.keys())
+    n_subjects  = len(subject_ids)
+    x = np.arange(n_subjects)
+ 
+    per_step_mem_display = {
+        'tm_current_kb':            ('Abs. Python-heap usage (step end)',  '#d6604d'),
+        'tm_head_adapt_kb':         ('Delta during head adaptation',       '#4393c3'),
+        'tm_detector_reinit_kb':    ('Delta during detector reinit',       "#5ca708"),
+    }
+ 
+    fig, (ax_stack, ax_step_mem) = plt.subplots(
+        2, 1,
+        figsize=(14, 11),
+        gridspec_kw={'height_ratios': [3, len(per_step_mem_display)]}
+    )
+ 
+    # Panel A: stacked RSS per subject
+    ax_stack.bar(x, runtime_arr,     label="Library / runtime baseline", color='lightgrey',  width=0.6)
+    ax_stack.bar(x, model_arr,       label="Model footprint",             color='steelblue',  width=0.6,
+                 bottom=runtime_arr)
+    ax_stack.bar(x, incremental_arr, label="TTA incremental memory  [headline]",
+                 color='darkorange', width=0.6,
+                 bottom=runtime_arr + model_arr)
+ 
+    # Mean reference lines
+    ax_stack.axhline(
+        (runtime_arr + model_arr).mean(),
+        color='steelblue', linewidth=1.2, linestyle='--', alpha=0.7,
+        label=f"Mean fixed cost  {(runtime_arr + model_arr).mean():.1f} MB"
+    )
+    ax_stack.axhline(
+        (runtime_arr + model_arr + incremental_arr).mean(),
+        color='darkorange', linewidth=1.2, linestyle='--', alpha=0.7,
+        label=f"Mean total peak  {(runtime_arr + model_arr + incremental_arr).mean():.1f} MB"
+    )
+ 
+    ax_stack.set_xticks(x)
+    ax_stack.set_xticklabels([""] * n_subjects)
+    ax_stack.set_xlabel("Subjects", fontsize=12)
+    ax_stack.set_ylabel("RSS Memory (MB)", fontsize=12)
+    ax_stack.set_title("Absolute RSS breakdown per subject", fontsize=13)
+    ax_stack.legend(fontsize=10, loc='upper left')
+    ax_stack.grid(axis='y', alpha=0.35)
+    ax_stack.spines[['top', 'right']].set_visible(False)
+ 
+    # Panel B: per-step worst-case allocation spikes
+    mem_keys   = list(per_step_mem_display.keys())
+    mem_labels = [per_step_mem_display[k][0] for k in mem_keys]
+    mem_colors = [per_step_mem_display[k][1] for k in mem_keys]
+ 
+    mem_means = np.array([
+        np.array(per_step_memory_peak_per_subject.get(k, [0])).mean()
+        for k in mem_keys
+    ])
+    mem_stds = np.array([
+        np.array(per_step_memory_peak_per_subject.get(k, [0])).std()
+        for k in mem_keys
+    ])
+ 
+    y_pos_m = np.arange(len(mem_keys))
+    bars_m  = ax_step_mem.barh(
+        y_pos_m, mem_means,
+        xerr=mem_stds,
+        color=mem_colors,
+        edgecolor='white',
+        height=0.6,
+        capsize=4,
+        error_kw=dict(elinewidth=1.2, ecolor='#555555')
+    )
+    for bar, mean, std in zip(bars_m, mem_means, mem_stds):
+        ax_step_mem.text(
+            bar.get_width() + std + 0.05,
+            bar.get_y() + bar.get_height() / 2,
+            f"{mean:.2f} ± {std:.2f} MB",
+            va='center', ha='left', fontsize=9, color='#333333'
+        )
+ 
+    ax_step_mem.set_yticks(y_pos_m)
+    ax_step_mem.set_yticklabels(mem_labels, fontsize=11)
+    ax_step_mem.set_xlabel("Memory delta (MB)", fontsize=12)
+    ax_step_mem.set_title(
+        "Per-step worst-case allocation spike  (max across steps, mean ± std across subjects)\n"
+        "Note: values near zero reflect allocator caching, not true zero cost",
+        fontsize=11
+    )
+    ax_step_mem.grid(axis='x', alpha=0.35)
+    ax_step_mem.spines[['top', 'right']].set_visible(False)
+    ax_step_mem.set_xlim(right=ax_step_mem.get_xlim()[1] * 1.4)
+ 
+    fig.suptitle(f"Memory profile on {deployment_device}  [{detector_name}]", fontsize=15, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    save_path = f"./memory_profile_on_{deployment_device}_{detector_name}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[Log Analysis] Saved → {save_path}") 
