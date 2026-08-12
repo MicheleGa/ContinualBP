@@ -2,24 +2,24 @@
 import os
 from pathlib import Path
 import sys
-folders_to_add = ['data']
+folders_to_add = ['data', 'models']
 for folder in folders_to_add:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
 import json
+import yaml
 import argparse
 from collections import Counter
 import numpy as np
 import pandas as pd
+import torch
+from thop import profile
+from models.Proto import Proto
+from models.component_factory import BPRegressor, DeeperBPRegressor
 from data.preprocessing_utils.data_visualization import plot_drift_aware_updates_per_subject, plot_latency_breakdown, plot_memory_breakdown
 
-
-# -------------------
-# Metrics Aggregation
-# -------------------
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared key / label definitions
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------
+# Constants
+# ---------
 
 _PER_STEP_LATENCY_KEYS = [
     'feature_extraction_s',     # enc(signals) latency
@@ -29,6 +29,10 @@ _PER_STEP_LATENCY_KEYS = [
     'head_adapt_s',             # prediction head adapt latency
     'drift_detector_reinit_s',  # drift detector re-init latency
     'total_step_s',             # wall time for the full TTA step
+]
+
+_AGGREGATE_LATENCY_KEYS = [
+    'cumulative_latency_s',     # total wall time for the entire TTA loop
 ]
 
 _AGGREGATE_MEMORY_KEYS = [
@@ -61,10 +65,312 @@ _PER_STEP_MEMORY_LABELS = {
     'tm_detector_reinit_kb':    'Delta during detector reinit',
 }
 
+_PER_STEP_ANNOTATED_SAMPLES_NUMBER = 4
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------
+# MACs/Communication Costs Estimation
+# -----------------------------------
+
+def estimate_communication_costs(setting, config_file_path):
+    def fmt(value, decimals=1):
+        return rf"${value:.{decimals}f}$"
+    
+    # Get encoder/head parameters
+    with open(config_file_path, "r") as f:
+        setup = yaml.safe_load(f)
+
+    adapt_bs = 4
+    number_of_updates = 72
+    input_data_length_s = int(setup.get('input_seq_len_s'))
+    input_data_freq = setup.get('fs')
+    input_channels = 2 if setup.get('ecg') else 1
+    feature_embed_dim = int(setup.get('embed_dim'))
+    
+    # ---- Resource Usage Estimation for the Model ----
+    print("[Resource Usage Profile] Instantiating the encoder and the head ...")
+
+    # Instantiate encoder
+    encoder = Proto(setup.get('ecg'), input_data_freq, input_data_length_s, feature_embed_dim)
+    x = torch.rand(adapt_bs, input_data_length_s * input_data_freq, input_channels) # N.B. batch size 1 for profiling
+    _, encoder_params = profile(encoder, inputs=(x,))
+    
+    # Instantiate head
+    head = BPRegressor(setup.get('embed_dim'), 3) if not setup.get('ecg') else DeeperBPRegressor(2 * setup.get('embed_dim'), 3)
+    y = torch.rand((adapt_bs, setup.get('embed_dim') if not setup.get('ecg') else 2 * setup.get('embed_dim'))) # N.B. batch size 1 for profiling    
+    _, head_params = profile(head, inputs=(y,))
+
+    # One sample memory
+    sample_memory = input_data_length_s * input_data_freq * input_channels
+    
+    batch_memory = sample_memory * adapt_bs
+  
+    memory_transmitted_for_all_updates = batch_memory * number_of_updates
+    
+    # FP 32 precision
+    feature_extractor_fp_params = int(encoder_params)
+    prediction_head_fp_params = int(head_params)
+    
+    # --- Calculation Logic ---
+    # Total parameters in the model
+    total_params = feature_extractor_fp_params + prediction_head_fp_params
+    
+    # 1 FP32 value = 4 bytes. 
+    # Convert total bytes to kilobytes (kB) using 1 kB = 1,024 bytes
+    model_memory_bytes = total_params * 4
+    model_memory_kb = model_memory_bytes / (1024)
+    
+    # Input data values are typically integers or floats. Assuming standard 4-byte (FP32) float 
+    # values for the transmitted sensor/input data:
+    data_memory_bytes = memory_transmitted_for_all_updates * 4
+    data_memory_kb = data_memory_bytes / (1024)
+    
+    if setting == "A":
+        # Return the MB of the model (feat.ext. + head)
+        return fmt(model_memory_kb, decimals=1)
+    elif setting == 'B':  # Added missing colon
+        # Return the MB of the model (feat.ext. + head) + memory transmitted for all updates 
+        return fmt((model_memory_kb + data_memory_kb)/1024, decimals=1)
+    else:
+        raise ValueError("Incorrect setting was passed as input argument")
+    
+    
+# ---------------------
+# MACs/Bytes Estimation
+# ---------------------
+
+def bytes_from_params(n_params, precision_bits):
+    return int(n_params * (precision_bits // 8))
+
+
+def calculate_activation_memory(model, dummy_input):
+    r"""
+    Calculate total activation memory during forward pass.
+    Source: https://huggingface.co/blog/train_memory
+    """
+    activation_sizes = []
+
+    def forward_hook(model, input, output):
+        """
+        Hook to calculate activation size for each module.
+        The .element_size() method returns the size in bytes of each element in the tensor.
+        """
+        if isinstance(output, torch.Tensor):
+            activation_sizes.append(output.numel() * output.element_size())
+        elif isinstance(output, (tuple, list)):
+            for tensor in output:
+                if isinstance(tensor, torch.Tensor):
+                    activation_sizes.append(tensor.numel() * tensor.element_size())
+        
+    # Register hooks for each submodule
+    hooks = []
+    for submodule in model.modules():
+        hooks.append(submodule.register_forward_hook(forward_hook))
+
+    # Perform a forward pass with a dummy input
+    model.eval()  # No gradients needed for memory measurement
+    with torch.no_grad():
+        model(dummy_input)
+
+    # Clean up hooks
+    for hook in hooks:
+        hook.remove()
+        
+    return sum(activation_sizes)
+
+
+def resource_usage_profile_estimation(config_file_path):
+        
+    # Get configuration parameters
+    with open(config_file_path, "r") as f:
+        setup = yaml.safe_load(f)
+
+    # Setup Configuration
+    precision_bits = int(setup.get('precision_bits', 32)) # Deafult to float32 if not specified
+    # Hardcoded because the YAML for pretraining is nt configured with personalization settings
+    adapt_bs = 4
+    test_bs = 4
+    
+    # NOTE: during an update the best model is selected helding out 0.25 of the personalization batch as validation, 
+    # therefore the personliazaiton batch size and the replayed samples are personalization_bs * 0.75
+    # -> overestimation with the full adapt_bs
+    num_replay_samples_per_update = adapt_bs
+    
+    input_seq_len_s = int(setup.get('input_seq_len_s'))
+    sampling_frequency = setup.get('fs')
+    input_channels = 2 if setup.get('ecg') else 1
+    feature_embed_dim = setup.get('embed_dim') if not setup.get('ecg') else 2 * setup.get('embed_dim')
+    replay_buffer_size = 16
+    
+    steps_per_update = 10
+    alpha_backward = 2 # fwd+bwd MACs as 2 times the fwd MACs
+    
+    # ---- Resource Usage Estimation for the Model ----
+    print("[Resource Usage Profile] Instantiating the encoder and the head ...")
+
+    # Instantiate encoder
+    encoder = Proto(setup.get('ecg'), sampling_frequency, input_seq_len_s, setup.get('embed_dim'))
+    x = torch.rand(adapt_bs, input_seq_len_s * sampling_frequency, input_channels) # N.B. batch size 1 for profiling
+    
+    encoder_forward_macs_sample, encoder_params = profile(encoder, inputs=(x,))
+    encoder_forward_m_macs_sample = (encoder_forward_macs_sample) / 1e6
+    encoder_params_mb = bytes_from_params(encoder_params, precision_bits=precision_bits) / (1024**2)
+    
+    encoder_act_bytes = calculate_activation_memory(encoder, x)
+    encoder_act_bytes_mb = encoder_act_bytes / (1024**2)
+        
+    print(f'[Resource Usage Profile] Proto Encoder has:') 
+    print(f'\t- {encoder_params} params ({encoder_params_mb:.2f} MB)')
+    print(f'\t- {encoder_forward_m_macs_sample:.2f} M MACs per {adapt_bs}-sample batch size')
+    print(f'\t- {encoder_act_bytes_mb:.2f} MB forward peak activation bytes')
+    
+    # Instantiate head
+    head = BPRegressor(setup.get('embed_dim'), 3) if not setup.get('ecg') else DeeperBPRegressor(2 * setup.get('embed_dim'), 3)
+    y = torch.rand((adapt_bs, setup.get('embed_dim') if not setup.get('ecg') else 2 * setup.get('embed_dim'))) # N.B. batch size 1 for profiling    
+        
+    head_forward_macs_sample, head_params = profile(head, inputs=(y,))
+    head_forward_k_macs_sample = (head_forward_macs_sample) / 1e3
+    head_params_kb = bytes_from_params(head_params, precision_bits=precision_bits) / 1024
+    
+    head_act_bytes = calculate_activation_memory(head, y)
+    head_act_bytes_kb = head_act_bytes / 1024
+
+    print(f'[Resource Usage Profile] Proto Head has:') 
+    print(f'\t- {head_params} params ({head_params_kb:.2f} kB)')
+    print(f'\t- {head_forward_k_macs_sample:.2f} k MACs per {adapt_bs}-sample batch size')
+    print(f'\t- {head_act_bytes_kb:.2f} kB forward peak activation bytes')
+    
+    # ---- Resource Usage Estimation for the Feature Replay Algorithm ----
+    
+    # NOTE: On update, the head has also the feature replay buffer batch
+    # NOTE: Assume that personalization, evaluation, and replayed feature batch sizes are equal
+    # NOTE: Keep in mind to check the batch size used in thop, it should be 1
+    # NOTE: An update is w/ frozen encoder and head-only updates
+    # NOTE: Excluding the replay buffer update operations (e.g. reservoir operations for buffer update)
+    
+    # ---- MACs for adaptation ----    
+    
+    # The CL algorithm always predicts the training batch + validation batch to ensure a prediction for all samples (necessary in a real system)
+    total_adapt_prediction_macs = (encoder_forward_macs_sample + head_forward_macs_sample) * adapt_bs
+    
+    # MACs for head when encoder is frozen and there are the replay buffer features
+    macs_head_forward_per_update_step = head_forward_macs_sample * (adapt_bs + num_replay_samples_per_update)
+    macs_head_forward_backward_per_update_step = alpha_backward * macs_head_forward_per_update_step
+    
+    # Multiply by steps to get the MACs related to the updated head when updating only the head
+    macs_head_total =  steps_per_update * macs_head_forward_backward_per_update_step
+    
+    # Encoder MACs per update are simply the encoder batch forward by the number of steps
+    macs_encoder_total = encoder_forward_macs_sample * adapt_bs
+    
+    # Total MACs per update with frozen encoder (input = one personalization batch)
+    total_adapt_macs = macs_encoder_total + macs_head_total 
+     
+    # Optimizer operations, assuming Adam formula is the following:
+    # Adam Optimizer - Operation Count Per Parameter
+    # ================================================
+    # Formula:
+    #   m_t = β₁ · m_{t-1} + (1 - β₁) · g_t
+    #   v_t = β₂ · v_{t-1} + (1 - β₂) · g_t²
+    #   m̂_t = m_t / (1 - β₁^t)
+    #   v̂_t = v_t / (1 - β₂^t)
+    #   θ_t = θ_{t-1} - α · m̂_t / (√v̂_t + ε)
+    #
+    # Operation Count:
+    # ┌─────────────────┬───────┬──────────────────────────────────────────┐
+    # │ Operation Type  │ Count │ Where Used                               │
+    # ├─────────────────┼───────┼──────────────────────────────────────────┤
+    # │ Multiplication  │   5   │ β₁·m_{t-1}, (1-β₁)·g_t, β₂·v_{t-1},    │
+    # │                 │       │ (1-β₂)·g_t², α·[...]                    │
+    # │ Addition        │   3   │ m_t sum, v_t sum, √v̂_t + ε              │
+    # │ Subtraction     │   1   │ θ_{t-1} - [...]                         │
+    # │ Division        │   3   │ m_t/(1-β₁^t), v_t/(1-β₂^t), m̂_t/[...] │
+    # │ Square          │   1   │ g_t²                                     │
+    # │ Square Root     │   1   │ √v̂_t                                     │
+    # ├─────────────────┼───────┼──────────────────────────────────────────┤
+    # │ TOTAL           │  14   │                                          │
+    # └─────────────────┴───────┴──────────────────────────────────────────┘
+    #optimizer_ops = 14
+    # For N updated parameters: 14N operations per optimizer step
+    # -> these are FLOPs and not MACs
+    #optimizer_ops_per_update = steps_per_update * head_params * optimizer_ops
+    #
+    # NOTE: also reservoir sampling requires ops that are neglected here
+    
+    # ---- MACs for testing ----
+    # Encoder forward + head forward (input = one validation batch)
+    # with a single step since this is inference and without replay buffer, buffer is only for training
+    total_test_macs = (encoder_forward_macs_sample + head_forward_macs_sample) * test_bs
+    
+    
+    # ---- CL algorithm occupation in memory as number of bytes ----
+    model_params = bytes_from_params(encoder_params + head_params, precision_bits)
+    
+    # Input size
+    # During adaptation the fact that we have also validation inference and also the prediction inferece on the training data (necessary in a real system) 
+    # does not matter from a storage point of view as adaptation costs dominate the memory usage
+    # -> we use adapt_bs instead of splitting into adapt and val sizes
+    adapt_input_batch_bytes = bytes_from_params(adapt_bs * input_seq_len_s * sampling_frequency * input_channels, precision_bits)
+    adapt_feature_batch_size = bytes_from_params((adapt_bs + num_replay_samples_per_update) * feature_embed_dim, precision_bits)
+    
+    test_input_batch_bytes = bytes_from_params(test_bs * input_seq_len_s * sampling_frequency * input_channels, precision_bits)
+    test_feature_batch_size = bytes_from_params(test_bs * feature_embed_dim, precision_bits)
+    
+    # Feature replay memory occupation
+    replay_buffer_total_bytes = bytes_from_params(replay_buffer_size * feature_embed_dim, precision_bits)
+    
+    # Gradients bytes
+    adapt_gradients_bytes = bytes_from_params(head_params, precision_bits)
+    
+    # Optimizer states in bytes
+    # -> we use Adam, that stores and update momentum and variance, hence two values for each update parameters
+    optimizer_states_bytes = bytes_from_params(2 * head_params, precision_bits)
+    
+    # Activation memory during adaptation (defined as any intermediate output of the encoder/head layers)
+    # -> total memory for activations (upper bound)
+    head_forward_backward_activations_bytes = head_act_bytes * alpha_backward
+    adapt_activation_forward_backward_bytes = encoder_act_bytes * adapt_bs # personalization + val batch size 
+    adapt_activation_forward_backward_bytes += head_forward_backward_activations_bytes * (adapt_bs + num_replay_samples_per_update) # adapt batch size
+    
+    # Total algorithm occupation in memory during update
+    # -> encoder is never updated, so it never does a backward pass
+    total_adapt_memory = adapt_input_batch_bytes + adapt_feature_batch_size + model_params + adapt_activation_forward_backward_bytes + adapt_gradients_bytes + optimizer_states_bytes + replay_buffer_total_bytes
+    
+    # Activation memory during testing (defined as any intermediate output of the encoder/head layers)
+    # -> total memory for activations (upper bound)
+    test_activation_forward_bytes = (encoder_act_bytes + head_act_bytes) * test_bs
+    
+    # Total algorithm occupation in memory during inference 
+    # replay buffer is in memory even if it is not used during inference, gradients/optimziers may even be deallocated
+    total_test_memory = test_input_batch_bytes + test_feature_batch_size + model_params + test_activation_forward_bytes + replay_buffer_total_bytes  
+    
+    print(f"[Resource Usage Profile] Feature Replay Algorithm Resource Usage:")
+    print(f"\t- Total model params (encoder + head): {model_params / (1024**2):.2f} MB")
+    print(f"\t- Total adaptation MACs per update: {total_adapt_macs / 1e6:.2f} M MACs")
+    print(f"\t- Total adaptation prediction MACs per update: {total_adapt_prediction_macs / 1e6:.2f} M MACs")
+    print(f"\t- Total testing MACs per inference: {total_test_macs / 1e6:.2f} M MACs")
+    print(f"\t- Sample memory: {bytes_from_params(input_seq_len_s * sampling_frequency * input_channels, precision_bits) / 1024:.2f} kB")
+    print(f"\t- Total replay buffer memory: {replay_buffer_total_bytes / 1024:.2f} kB")
+    print(f"\t- Total adaptation feature memory: {adapt_feature_batch_size / 1024:.2f} kB")
+    print(f"\t- Total adaptation memory: {total_adapt_memory / (1024**2):.2f} MB")
+    print(f"\t- Total adaptation forward/backward bytes: {adapt_activation_forward_backward_bytes / (1024**2):.2f} MB")
+    print(f"\t- Total adaptation head forward/backward bytes: {(head_forward_backward_activations_bytes * (adapt_bs + num_replay_samples_per_update)) / 1024:.2f} kB")
+    print(f"\t- Total adaptation gradient bytes: {adapt_gradients_bytes / 1024:.2f} kB")
+    print(f"\t- Total adaptation optimizer state bytes: {optimizer_states_bytes / 1024:.2f} kB")
+    print(f"\t- Total replay buffer memory: {replay_buffer_total_bytes / 1024:.2f} kB")
+    print(f"\t- Total testing batch memory: {test_input_batch_bytes / 1024:.2f} kB")
+    print(f"\t- Total testing activation memory: {test_activation_forward_bytes / (1024**2):.2f} MB")
+    print(f"\t- Total testing encoder memory: {(encoder_act_bytes * test_bs) / (1024**2):.2f} MB")
+    print(f"\t- Total testing feature memory: {test_feature_batch_size / 1024:.2f} kB")
+    print(f"\t- Total testing prediction head activation memory: {(head_act_bytes * test_bs) / 1024:.2f} kB")
+    print(f"\t- Total testing memory: {total_test_memory / (1024**2):.2f} MB")
+    print(f"\t- Total forward MACs encoder batch: {(encoder_forward_macs_sample * test_bs) / 1e6:.2f} M MACs")
+    print(f"\t- Total forward MACs head batch: {(head_forward_macs_sample * test_bs) / 1e3:.2f} k MACs")
+    print(f"\t- Total forward/backward MACs head batch: {macs_head_total / 1e6:.2f} M MACs")
+
+
+# -------------------
+# Metrics Aggregation
+# -------------------
 
 def resource_profiling(baseline, baselines, deployment_device):
     """
@@ -83,9 +389,47 @@ def resource_profiling(baseline, baselines, deployment_device):
     # Add or remove entries here as new detectors / seeds are introduced.
     profiling_paths = {
         "MMD": {
-            "default": Path(baseline_paths[f"{deployment_device}_drift_aware_mmd_path"]),
-            "seed_40": Path(baseline_paths[f"{deployment_device}_drift_aware_mmd_path_seed_40"]),
+            "seed_42": Path(baseline_paths[f"{deployment_device}_drift_aware_mmd_path"]),
             "seed_41": Path(baseline_paths[f"{deployment_device}_drift_aware_mmd_path_seed_41"]),
+            "seed_40": Path(baseline_paths[f"{deployment_device}_drift_aware_mmd_path_seed_40"])
+        },
+        "Always-on": {
+            "seed_42": Path(baseline_paths[f"{deployment_device}_always_on_path"]),
+            "seed_41": Path(baseline_paths[f"{deployment_device}_always_on_path_seed_41"]),
+            "seed_40": Path(baseline_paths[f"{deployment_device}_always_on_path_seed_40"])
+        }
+    }
+    
+    results = {}
+    for detector_name, seed_paths in profiling_paths.items():
+        results[detector_name] = _run_profiling_report(
+            baseline, seed_paths, detector_name, deployment_device
+        )
+
+    return results
+
+
+def resource_profiling_ppg_ecg(baseline, baselines, deployment_device):
+    """
+    Collect and report profiling results for each detector, averaging
+    quantities across random seeds.
+
+    Returns
+    -------
+    dict[str, dict]
+        {detector_name: profiling_results} where each results dict is the
+        value returned by _run_profiling_report.
+    """
+    baseline_paths = baselines[f'{baseline}_ppg_ecg']
+
+    # Each detector maps to an ordered dict of {seed_label: Path}.
+    # Add or remove entries here as new detectors / seeds are introduced.
+    profiling_paths = {
+        "MMD": {
+            "seed_42": Path(baseline_paths[f"{deployment_device}_drift_aware_mmd_path"]),
+        },
+        "Always-on": {
+            "seed_42": Path(baseline_paths[f"{deployment_device}_always_on_path"]),
         }
     }
 
@@ -97,10 +441,6 @@ def resource_profiling(baseline, baselines, deployment_device):
 
     return results
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-seed data collection
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _collect_seed_data(baseline, profiling_path, detector_name):
     """
@@ -123,15 +463,18 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
             clinical_metrics   : pd.DataFrame
     """
     if not profiling_path.exists():
-        print(f"[{detector_name}] Warning: path {profiling_path} does not exist — skipping.")
-        return None
+        raise ValueError(f"[{detector_name}] Error: path {profiling_path} does not exist — skipping.")
 
-    per_step_per_subject_means       = {k: [] for k in _PER_STEP_LATENCY_KEYS}
-    aggregate_memory_per_subject     = {k: [] for k in _AGGREGATE_MEMORY_KEYS}
+    per_step_per_subject_means = {k: [] for k in _PER_STEP_LATENCY_KEYS}
+    aggregate_latency_per_subject = {k: [] for k in _AGGREGATE_LATENCY_KEYS}
+    aggregate_memory_per_subject = {k: [] for k in _AGGREGATE_MEMORY_KEYS}
     per_step_memory_peak_per_subject = {k: [] for k in _PER_STEP_MEMORY_KEYS}
-    subject_frequency_savings        = []
-    subject_updates_drift            = {}
+    subject_frequency_savings = []
+    subject_annotation_savings = []
+    subject_updates_drift = {}
+    subject_annotations_drift = {}
     subject_total_update_opportunities = {}
+    subject_total_annotations = {}
 
     for subject_dir in profiling_path.iterdir():
         if not (subject_dir.is_dir() and subject_dir.name.startswith("subject_")):
@@ -144,22 +487,36 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
             prof = json.load(f)
 
         # ── Update frequency reduction ────────────────────────────
-        did_adapt         = prof['per_step']['did_adapt']
-        total_possible    = len(did_adapt)
-        actual_updates    = did_adapt.count(True)
-        saved             = total_possible - actual_updates
+        did_adapt = prof['per_step']['did_adapt']
+        total_possible = len(did_adapt)
+        actual_updates = did_adapt.count(True)
+        saved = total_possible - actual_updates
+        
+        total_annotations = total_possible * _PER_STEP_ANNOTATED_SAMPLES_NUMBER
+        actual_annotations = actual_updates * _PER_STEP_ANNOTATED_SAMPLES_NUMBER
+        saved_annotations = total_annotations - actual_annotations
+        
         subject_frequency_savings.append(
             saved / total_possible if total_possible > 0 else 0.0
         )
-        subject_updates_drift[subject_id]             = actual_updates
+        subject_annotation_savings.append(
+            saved_annotations / total_annotations if total_annotations > 0 else 0.0
+        )
+        subject_updates_drift[subject_id] = actual_updates
+        subject_annotations_drift[subject_id] = actual_annotations
         subject_total_update_opportunities[subject_id] = total_possible
+        subject_total_annotations[subject_id] = total_annotations
 
         # ── Latency (mean per subject) ────────────────────────────
         for key in _PER_STEP_LATENCY_KEYS:
             values = prof['per_step'][key]
             if values:
                 per_step_per_subject_means[key].append(np.mean(values))
-
+        
+        # ── Latency (total per subject) ────────────────────────────
+        for key in _AGGREGATE_LATENCY_KEYS:
+            aggregate_latency_per_subject[key].append(prof[key])
+            
         # ── Scalar memory (one value per subject) ─────────────────
         for key in _AGGREGATE_MEMORY_KEYS:
             aggregate_memory_per_subject[key].append(prof[key])
@@ -184,18 +541,18 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
 
     return {
         "per_step_latency":    per_step_per_subject_means,
+        "aggregate_latency":   aggregate_latency_per_subject,
         "aggregate_memory":    aggregate_memory_per_subject,
         "per_step_memory":     per_step_memory_peak_per_subject,
         "frequency_savings":   subject_frequency_savings,
+        "annotation_savings":  subject_annotation_savings,
         "updates_drift":       subject_updates_drift,
+        "annotations_drift":   subject_annotations_drift,
         "total_opportunities": subject_total_update_opportunities,
+        "total_annnotations":  subject_total_annotations,
         "clinical_metrics":    clinical_metrics_csv,
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cross-seed averaging
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _average_seed_results(seed_data_list):
     """
@@ -237,16 +594,21 @@ def _average_seed_results(seed_data_list):
 
         return {k: np.array(v) for k, v in out.items()}
 
-    latency_pooled   = _pool_subjects(seed_data_list, "per_step_latency", _PER_STEP_LATENCY_KEYS)
-    agg_mem_pooled   = _pool_subjects(seed_data_list, "aggregate_memory",  _AGGREGATE_MEMORY_KEYS)
-    step_mem_pooled  = _pool_subjects(seed_data_list, "per_step_memory",   _PER_STEP_MEMORY_KEYS)
+    latency_pooled = _pool_subjects(seed_data_list, "per_step_latency", _PER_STEP_LATENCY_KEYS)
+    agg_latency_pooled = _pool_subjects(seed_data_list, "aggregate_latency", _AGGREGATE_LATENCY_KEYS)
+    agg_mem_pooled = _pool_subjects(seed_data_list, "aggregate_memory",  _AGGREGATE_MEMORY_KEYS)
+    step_mem_pooled = _pool_subjects(seed_data_list, "per_step_memory",   _PER_STEP_MEMORY_KEYS)
 
     # ── Frequency savings: pool raw per-subject values across seeds ──────────
-    # FIX 1: was np.mean per seed → (n_seeds,); now all values → (n_seeds * n_subjects,)
     freq_pooled = np.array([
         v for d in seed_data_list for v in d["frequency_savings"]
     ])
-
+    
+    # ── Annotation savings: pool raw per-subject values across seeds ──────────
+    ann_pooled = np.array([
+        v for d in seed_data_list for v in d["annotation_savings"]
+    ])
+    
     # ── Per-subject update counts: average across seeds (subject-keyed) ──────
     # NOTE: kept as seed-average intentionally — these are counts tied to a
     # specific subject identity, not a performance metric to pool over rows.
@@ -257,13 +619,23 @@ def _average_seed_results(seed_data_list):
         sid: float(np.mean([d["updates_drift"].get(sid, np.nan) for d in seed_data_list]))
         for sid in all_subject_ids
     }
-
+    
+    # ── Per-subject annotation counts: average across seeds (subject-keyed) ──────
+    all_subject_ids = sorted(
+            set().union(*[d["annotations_drift"].keys() for d in seed_data_list])
+    )
+    avg_annotations_drift = {
+        sid: float(np.mean([d["annotations_drift"].get(sid, np.nan) for d in seed_data_list]))
+        for sid in all_subject_ids
+    }
+       
     # total_opportunities is determined by the data stream, not the seed
     avg_total_opportunities = seed_data_list[0]["total_opportunities"]
+    
+    # total_annotations is determined by the data stream, not the seed
+    avg_total_annotations = seed_data_list[0]["total_annnotations"]
 
     # ── Clinical metrics: concatenate all subjects across seeds ──────────────
-    # FIX 2: was element-wise mean → 88 averaged rows (Approach B);
-    # now row-concatenation → 264 real subject observations (Approach A)
     pooled_clinical = pd.concat(
         [d["clinical_metrics"] for d in seed_data_list],
         ignore_index=True,
@@ -271,19 +643,19 @@ def _average_seed_results(seed_data_list):
 
     return {
         "latency_pooled":          latency_pooled,
+        "agg_latency_pooled":      agg_latency_pooled,
         "agg_mem_pooled":          agg_mem_pooled,
         "step_mem_pooled":         step_mem_pooled,
         "freq_pooled":             freq_pooled,
+        "ann_pooled":              ann_pooled,
         "avg_updates_drift":       avg_updates_drift,
+        "avg_annotations_drift":   avg_annotations_drift,
         "avg_total_opportunities": avg_total_opportunities,
+        "avg_total_annotations":   avg_total_annotations,
         "pooled_clinical_metrics": pooled_clinical,
         "n_seeds":                 len(seed_data_list),
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Report orchestrator
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device):
     """
@@ -305,6 +677,7 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
             frequency_saving_mean   : float   (%)
             frequency_saving_std    : float   (%)
             latency_ms              : {key: (mean_ms, std_ms)}
+            aggregate_latency_ms     : {key: (mean_s, std_s)}
             aggregate_memory_mb     : {key: (mean_mb, std_mb)}
             step_memory_kb          : {key: (mean_kb, std_kb)}
             avg_updates_drift       : {subject_id: float}
@@ -329,7 +702,7 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
         return {}
 
     # ── Average across seeds ──────────────────────────────────────
-    avg     = _average_seed_results(seed_data_list)
+    avg = _average_seed_results(seed_data_list)
     n_seeds = avg["n_seeds"]
     # Suffix updated: pooled population is the unit, not seeds
     suffix  = f"(mean ± std over subjects, {n_seeds} seed(s) pooled)"
@@ -337,11 +710,17 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
     # ── Clinical metrics ──────────────────────────────────────────
     # Pooled DataFrame has n_seeds * n_subjects rows — summarise column-wise
     pooled_clinical = avg["pooled_clinical_metrics"]
-    numeric_cols    = pooled_clinical.select_dtypes(include=[np.number]).columns
-    clinical_summary = pooled_clinical[numeric_cols].agg(["mean", "std"])
+    
+    # Select numeric columns along with the 'Type' column for grouping
+    numeric_cols = pooled_clinical.select_dtypes(include=[np.number]).columns
+    grouped_clinical = pooled_clinical[["Type"] + list(numeric_cols)]
+
+    # Group by SBP/DBP and compute mean and std
+    clinical_summary = grouped_clinical.groupby("Type").agg(["mean", "std"])
+
     print(f"\n[{detector_name}] Deployment ~ Clinical Metrics {suffix}:")
     print(clinical_summary)
-
+    
     # ── Update frequency reduction ────────────────────────────────
     freq_arr  = avg["freq_pooled"] * 100          # pooled over all subjects
     mean_freq = float(freq_arr.mean())
@@ -349,6 +728,38 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
     print(
         f"\n[{detector_name}] Deployment ~ Update Frequency Reduction {suffix}:"
         f" {mean_freq:.1f}% ± {std_freq:.1f}%"
+    )
+    
+    # ── Annotation requirement reduction ────────────────────────────────
+    ann_arr = avg["ann_pooled"] * 100
+    mean_ann = float(ann_arr.mean())
+    std_ann  = float(ann_arr.std())
+    print(
+        f"\n[{detector_name}] Deployment ~ Annotation Frequency Reduction {suffix}:"
+        f" {mean_ann:.1f}% ± {std_ann:.1f}%"
+    )
+    
+    # ── Required annotated samples (mean ± std OVER SUBJECTS) ─────
+    # avg["avg_annotations_drift"] is {subject_id: seed-averaged annotation
+    # count}. Seeds were already averaged per-subject inside
+    # _average_seed_results, which is the correct first stage (seeds are
+    # repeated noisy measurements of the SAME subject, not independent
+    # units). Here we take the second stage: mean/std across the 88
+    # independent subjects. This gives a whole-number "samples" unit,
+    # not a fraction/percentage.
+    subject_ids_sorted = sorted(avg["avg_annotations_drift"].keys())
+    annotations_per_subject = np.array(
+        [avg["avg_annotations_drift"][sid] for sid in subject_ids_sorted]
+    )
+    n_subjects = annotations_per_subject.size
+ 
+    mean_annotations = float(annotations_per_subject.mean())
+    std_annotations = float(annotations_per_subject.std())
+ 
+    print(
+        f"\n[{detector_name}] Deployment ~ Required Annotated Samples "
+        f"(mean ± std over {n_subjects} subjects, {n_seeds} seed(s) "
+        f"averaged per subject): {mean_annotations:.1f} ± {std_annotations:.1f} samples"
     )
 
     # ── Per-step latency ──────────────────────────────────────────
@@ -360,6 +771,31 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
         latency_stats[key] = (m, s)
         print(f"  {key:45s}  {m:7.2f} ± {s:6.2f} ms")
 
+    # ── Aggregate latency ──────────────────────────────────────────
+    print(f"\n[{detector_name}] Latency Summary — Aggregate (seconds for processing all subjects, over {n_seeds} seed(s) pooled):")
+    agg_latency_stats = {}
+    for key in _AGGREGATE_LATENCY_KEYS:
+        # arr contains the total latency for processing one subject
+        # more precisely it contains the latency collected for each seed for a subject, 
+        # therby it is num subject by num seeds elements
+        arr = np.array(avg["agg_latency_pooled"][key])
+        
+        # Reshape array to (3 seeds, 88 subjects) and sum per seed (in seconds)
+        totals_per_seed = arr.reshape(n_seeds, len(arr) // n_seeds).sum(axis=1)
+        
+        # Seconds
+        m_sec, s_sec = float(totals_per_seed.mean()), float(totals_per_seed.std())
+        
+        # Minutes
+        m_min, s_min = m_sec / 60.0, s_sec / 60.0
+        
+        agg_latency_stats[key] = {
+            "sec": (m_sec, s_sec),
+            "min": (m_min, s_min)
+        }
+        
+        print(f"  {key:45s}  {m_sec:7.2f} ± {s_sec:5.2f} s  ({m_min:5.2f} ± {s_min:4.2f} min) / run")
+        
     # ── Aggregate memory ──────────────────────────────────────────
     print(f"\n[{detector_name}] Memory Summary — Aggregate {suffix}:")
     agg_mem_stats = {}
@@ -384,31 +820,26 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
             print(f"  {_PER_STEP_MEMORY_LABELS[key]:45s}  {m:7.2f} ± {s:5.2f} kB")
 
     # ── Plots ─────────────────────────────────────────────────────
-    plot_drift_aware_updates_per_subject(
-        subject_updates_drift=avg["avg_updates_drift"],
-        subject_total_update_opportunities=avg["avg_total_opportunities"],
-        mean_frequency_saving=mean_freq,
-        std_frequency_saving=std_freq,
-        deployment_device=deployment_device,
-        detector_name=detector_name,
-        n_seeds=n_seeds,
-    )
-
-    plot_latency_breakdown(
-        per_step_per_subject_means=avg["latency_pooled"],  # key rename only
-        deployment_device=deployment_device,
-        detector_name=detector_name,
-        n_seeds=n_seeds,
-    )
+    #plot_drift_aware_updates_per_subject(
+    #    subject_updates_drift=avg["avg_updates_drift"],
+    #    subject_total_update_opportunities=avg["avg_total_opportunities"],
+    #    mean_frequency_saving=mean_freq,
+    #    std_frequency_saving=std_freq,
+    #    deployment_device=deployment_device,
+    #    detector_name=detector_name,
+    #    n_seeds=n_seeds,
+    #)
     
     # ── Return results ────────────────────────────────────────────
     return {
-        #"clinical_metrics":        clinical_summary,        # column-wise summary
-        "frequency_saving_mean":   mean_freq,
-        "frequency_saving_std":    std_freq,
-        "latency_ms":              latency_stats,
-        "aggregate_memory_mb":     agg_mem_stats,
-        "update_freq_reduction":   (mean_freq, std_freq),
+        "clinical_metrics":             clinical_summary,        # column-wise summary
+        "frequency_saving_mean":        mean_freq,
+        "frequency_saving_std":         std_freq,
+        "latency_ms":                   latency_stats,
+        "aggregate_latency_ms":         agg_latency_stats,
+        "aggregate_memory_mb":          agg_mem_stats,
+        "update_freq_reduction":        (mean_freq, std_freq),
+        "annotation_samples_reduction": (mean_annotations, std_annotations),
         "n_seeds":                 n_seeds,
     }
     
@@ -471,10 +902,293 @@ def aggregate_seed_dataframes(dataframes, bhs_columns=None):
     return agg_df
 
 
-def analyze_mmd_vs_lsdd(baselines):
+def analyze_gradual_vs_mixed_vs_abrupt(baselines):
+    
+    aggregated_results = {}
+
+    for baseline, baseline_paths in baselines.items():
+
+        aggregated_results[baseline] = {}
+
+        # ---------------------------------
+        # Clinical Metrics (ME / STD / BHS)
+        # ---------------------------------
+
+        for shift_name, path_key in {
+            "gradual": "gradual_shifts_path",
+            "mixed": "mixed_shifts_path",
+            "abrupt": "abrupt_shifts_path"
+        }.items():
+
+            dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        f"aggregate_{baseline}_metrics",
+                        "evaluation_metrics.csv"
+                    ),
+                    usecols=["Type", "ME", "STD", "BHS_Grade"]            
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_41"],
+                        "aggregate_metrics",
+                        f"aggregate_{baseline}_metrics",
+                        "evaluation_metrics.csv"
+                    ),
+                    usecols=["Type", "ME", "STD", "BHS_Grade"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_40"],
+                        "aggregate_metrics",
+                        f"aggregate_{baseline}_metrics",
+                        "evaluation_metrics.csv"
+                    ),
+                    usecols=["Type", "ME", "STD", "BHS_Grade"]  
+                )
+            ]
+
+            aggregated_results[baseline][f"{shift_name}_clinical"] = (
+                aggregate_seed_dataframes(
+                    dfs,
+                    bhs_columns=["BHS_Grade"]   
+                )
+            )
+
+        # -------------------------------------
+        # Continual Learning Metrics (AE / BWT)
+        # -------------------------------------
+
+        for shift_name, path_key in {
+            "gradual": "gradual_shifts_path",
+            "mixed": "mixed_shifts_path",
+            "abrupt": "abrupt_shifts_path"
+        }.items():
+
+            # ---------------------------
+            # SBP
+            # ---------------------------
+            sbp_dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_41"],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_40"],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                )
+            ]
+
+            # ---------------------------
+            # DBP
+            # ---------------------------
+            dbp_dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_41"],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+
+                pd.read_csv(os.path.join(
+                        baseline_paths[f"{path_key}_seed_40"],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                )
+            ]
+
+            aggregated_results[baseline][f"{shift_name}_sbp_cl"] = (
+                aggregate_seed_dataframes(sbp_dfs)
+            )
+
+            aggregated_results[baseline][f"{shift_name}_dbp_cl"] = (
+                aggregate_seed_dataframes(dbp_dfs)
+            )
+
+    
+    baseline_display_names = {
+        "running_mean": "cumulative-mean",
+        "no_adapt": "no-adapt",
+        "first_batch_finetune": "first-batch",
+        "online": "online",
+        "online_from_scratch": "online*",
+        "feature_replay": "feat.replay",
+        "lwf": "LwF",
+        "ewc": "EWC",
+        "agem": "AGEM"
+    }
+
+    set_mapping = {
+        "1": "gradual",
+        "2": "mixed",
+        "3": "abrupt"
+    }
+    
+    latex_table = generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
+        aggregated_results,
+        baseline_display_names,
+        set_mapping
+    )
+    
+    print()
+    print(latex_table)
+    print()
+
+
+def analyze_gradual_vs_mixed_vs_abrupt_ppg_ecg(baselines):
+    
+    aggregated_results = {}
+
+    for baseline, baseline_paths in baselines.items():
+
+        aggregated_results[baseline] = {}
+
+        # ---------------------------------
+        # Clinical Metrics (ME / STD / BHS)
+        # ---------------------------------
+
+        for shift_name, path_key in {
+            "gradual": "gradual_shifts_path",
+            "mixed": "mixed_shifts_path",
+            "abrupt": "abrupt_shifts_path"
+        }.items():
+            
+            if baseline == 'feature_replay_ppg' or baseline == 'feature_replay_ppg_ecg':
+                # Note that baseline_paths[path_key] will differ for PPG or PPG/ECG cases 
+                dfs = [
+                        pd.read_csv(os.path.join(
+                                baseline_paths[path_key],
+                                "aggregate_metrics",
+                                "aggregate_feature_replay_metrics",
+                                "evaluation_metrics.csv"
+                            ),
+                            usecols=["Type", "ME", "STD", "BHS_Grade"]            
+                        ),
+                    ]
+            else:    
+                dfs = [
+                    pd.read_csv(os.path.join(
+                            baseline_paths[path_key],
+                            "aggregate_metrics",
+                            f"aggregate_{baseline}_metrics",
+                            "evaluation_metrics.csv"
+                        ),
+                        usecols=["Type", "ME", "STD", "BHS_Grade"]            
+                    ),
+                ]
+
+            # Use PPG/ECG suffix to distinguish results
+            aggregated_results[baseline][f"{shift_name}_clinical"] = (
+                aggregate_seed_dataframes(
+                    dfs,
+                    bhs_columns=["BHS_Grade"]   
+                )
+            )
+
+        # -------------------------------------
+        # Continual Learning Metrics (AE / BWT)
+        # -------------------------------------
+
+        for shift_name, path_key in {
+            "gradual": "gradual_shifts_path",
+            "mixed": "mixed_shifts_path",
+            "abrupt": "abrupt_shifts_path"
+        }.items():
+
+            # ---------------------------
+            # SBP
+            # ---------------------------
+            sbp_dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        "sbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+            ]
+
+            # ---------------------------
+            # DBP
+            # ---------------------------
+            dbp_dfs = [
+                pd.read_csv(os.path.join(
+                        baseline_paths[path_key],
+                        "aggregate_metrics",
+                        "dbp_aggregate_baseline_metrics.csv"
+                    ),
+                    usecols=["AE_mean", "BWT_mean"]  
+                ),
+            ]
+
+            aggregated_results[baseline][f"{shift_name}_sbp_cl"] = (
+                aggregate_seed_dataframes(sbp_dfs)
+            )
+
+            aggregated_results[baseline][f"{shift_name}_dbp_cl"] = (
+                aggregate_seed_dataframes(dbp_dfs)
+            )
+
+    
+    baseline_display_names = {
+        "running_mean": "cumulative-mean",
+        "feature_replay_ppg": "feat.replay (PPG)",
+        "feature_replay_ppg_ecg": "feat.replay (PPG+ECG)",
+    }
+
+    set_mapping = {
+        "1": "gradual",
+        "2": "mixed",
+        "3": "abrupt"
+    }
+    
+    latex_table = generate_gradual_vs_mixed_vs_abrupt_ppg_ecg_overleaf_table(
+        aggregated_results,
+        baseline_display_names,
+        set_mapping
+    )
+    
+    print()
+    print(latex_table)
+    print()
+    
+
+def analyze_drift_detection_methods(baselines):
     
     baseline = 'feature_replay'
-    path_keys = ["drift_aware_mmd_path", "drift_aware_lsdd_path"]
+    path_keys = [
+        "always_on_path", 
+        "drift_aware_mmd_path",
+        "random_path",
+        "drift_aware_lsdd_path", 
+    ]
     
     baseline_paths = baselines[baseline]
     aggregated_results = {}
@@ -680,11 +1394,13 @@ def analyze_mmd_vs_lsdd(baselines):
         }
         
     set_mapping = {
+        "Always": "always_on_path",
         "MMD": "drift_aware_mmd_path",
+        "Random": "random_path",
         "LSDD": "drift_aware_lsdd_path",
     }
     
-    latex_table = generate_mmd_vs_lsdd_overleaf_table(
+    latex_table = generate_drift_detection_methods_overleaf_table(
         aggregated_results,
         set_mapping
     )
@@ -693,173 +1409,20 @@ def analyze_mmd_vs_lsdd(baselines):
     print(latex_table)
     print()
     
-
-
-def analyze_gradual_vs_mixed_vs_abrupt(baselines):
     
-    aggregated_results = {}
-
-    for baseline, baseline_paths in baselines.items():
-
-        aggregated_results[baseline] = {}
-
-        # ---------------------------------
-        # Clinical Metrics (ME / STD / BHS)
-        # ---------------------------------
-
-        for shift_name, path_key in {
-            "gradual": "gradual_shifts_path",
-            "mixed": "mixed_shifts_path",
-            "abrupt": "abrupt_shifts_path"
-        }.items():
-
-            dfs = [
-                pd.read_csv(os.path.join(
-                        baseline_paths[path_key],
-                        "aggregate_metrics",
-                        f"aggregate_{baseline}_metrics",
-                        "evaluation_metrics.csv"
-                    ),
-                    usecols=["Type", "ME", "STD", "BHS_Grade"]            
-                ),
-
-                pd.read_csv(os.path.join(
-                        baseline_paths[f"{path_key}_seed_41"],
-                        "aggregate_metrics",
-                        f"aggregate_{baseline}_metrics",
-                        "evaluation_metrics.csv"
-                    ),
-                    usecols=["Type", "ME", "STD", "BHS_Grade"]  
-                ),
-
-                pd.read_csv(os.path.join(
-                        baseline_paths[f"{path_key}_seed_40"],
-                        "aggregate_metrics",
-                        f"aggregate_{baseline}_metrics",
-                        "evaluation_metrics.csv"
-                    ),
-                    usecols=["Type", "ME", "STD", "BHS_Grade"]  
-                )
-            ]
-
-            aggregated_results[baseline][f"{shift_name}_clinical"] = (
-                aggregate_seed_dataframes(
-                    dfs,
-                    bhs_columns=["BHS_Grade"]   
-                )
-            )
-
-        # -------------------------------------
-        # Continual Learning Metrics (AE / BWT)
-        # -------------------------------------
-
-        for shift_name, path_key in {
-            "gradual": "gradual_shifts_path",
-            "mixed": "mixed_shifts_path",
-            "abrupt": "abrupt_shifts_path"
-        }.items():
-
-            # ---------------------------
-            # SBP
-            # ---------------------------
-            sbp_dfs = [
-                pd.read_csv(os.path.join(
-                        baseline_paths[path_key],
-                        "aggregate_metrics",
-                        "sbp_aggregate_baseline_metrics.csv"
-                    ),
-                    usecols=["AE_mean", "BWT_mean"]  
-                ),
-
-                pd.read_csv(os.path.join(
-                        baseline_paths[f"{path_key}_seed_41"],
-                        "aggregate_metrics",
-                        "sbp_aggregate_baseline_metrics.csv"
-                    ),
-                    usecols=["AE_mean", "BWT_mean"]  
-                ),
-
-                pd.read_csv(os.path.join(
-                        baseline_paths[f"{path_key}_seed_40"],
-                        "aggregate_metrics",
-                        "sbp_aggregate_baseline_metrics.csv"
-                    ),
-                    usecols=["AE_mean", "BWT_mean"]  
-                )
-            ]
-
-            # ---------------------------
-            # DBP
-            # ---------------------------
-            dbp_dfs = [
-                pd.read_csv(os.path.join(
-                        baseline_paths[path_key],
-                        "aggregate_metrics",
-                        "dbp_aggregate_baseline_metrics.csv"
-                    ),
-                    usecols=["AE_mean", "BWT_mean"]  
-                ),
-
-                pd.read_csv(os.path.join(
-                        baseline_paths[f"{path_key}_seed_41"],
-                        "aggregate_metrics",
-                        "dbp_aggregate_baseline_metrics.csv"
-                    ),
-                    usecols=["AE_mean", "BWT_mean"]  
-                ),
-
-                pd.read_csv(os.path.join(
-                        baseline_paths[f"{path_key}_seed_40"],
-                        "aggregate_metrics",
-                        "dbp_aggregate_baseline_metrics.csv"
-                    ),
-                    usecols=["AE_mean", "BWT_mean"]  
-                )
-            ]
-
-            aggregated_results[baseline][f"{shift_name}_sbp_cl"] = (
-                aggregate_seed_dataframes(sbp_dfs)
-            )
-
-            aggregated_results[baseline][f"{shift_name}_dbp_cl"] = (
-                aggregate_seed_dataframes(dbp_dfs)
-            )
-
-    
-    baseline_display_names = {
-        "no_adapt": "no adapt",
-        "first_batch_finetune": "first-batch",
-        "online": "online",
-        "online_from_scratch": "online*",
-        "feature_replay": "feat.replay",
-        "lwf": "LwF",
-        "ewc": "EWC",
-        "agem": "AGEM"
-    }
-
-    set_mapping = {
-        "1": "gradual",
-        "2": "mixed",
-        "3": "abrupt"
-    }
-    
-    latex_table = generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
-        aggregated_results,
-        baseline_display_names,
-        set_mapping
-    )
-    
-    print()
-    print(latex_table)
-    print()
-    
-    
-
-
-def analyze_ppg_vs_ppg_ecg(baselines):
-    
+def analyze_mmd_embeddings_and_buffer_sizes(baselines):
     baseline = 'feature_replay'
-    path_keys = ["gradual_shifts_path", "ppg_ecg_gradual_shifts_path"]
+    path_keys = [ 
+        "embed_dim_128_buffer_size_64_path",
+        "embed_dim_128_buffer_size_32_path",
+        "embed_dim_128_buffer_size_16_path",
+        "embed_dim_32_buffer_size_64_path",
+        "embed_dim_32_buffer_size_32_path",
+        "embed_dim_32_buffer_size_16_path",
+        "embed_dim_16_buffer_size_64_path",
+        "embed_dim_16_buffer_size_32_path",
+        "embed_dim_16_buffer_size_16_path"
+    ]
     
     baseline_paths = baselines[baseline]
     aggregated_results = {}
@@ -879,8 +1442,24 @@ def analyze_ppg_vs_ppg_ecg(baselines):
                 ),
                 usecols=["Type", "ME", "STD", "BHS_Grade"]            
             ),
-            
-            # TODO: could expand with seeds
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_41"],
+                    "aggregate_metrics",
+                    f"aggregate_{baseline}_metrics",
+                    "evaluation_metrics.csv"
+                ),
+                usecols=["Type", "ME", "STD", "BHS_Grade"]  
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_40"],
+                    "aggregate_metrics",
+                    f"aggregate_{baseline}_metrics",
+                    "evaluation_metrics.csv"
+                ),
+                usecols=["Type", "ME", "STD", "BHS_Grade"]  
+            )
         ]
 
         aggregated_results[baseline][f"{path_key}_clinical"] = (
@@ -894,9 +1473,6 @@ def analyze_ppg_vs_ppg_ecg(baselines):
     # Continual Learning Metrics (AE / BWT)
     # -------------------------------------
     for path_key in path_keys:
-        # ---------------------------
-        # SBP
-        # ---------------------------
         sbp_dfs = [
             pd.read_csv(os.path.join(
                     baseline_paths[path_key],
@@ -906,7 +1482,21 @@ def analyze_ppg_vs_ppg_ecg(baselines):
                 usecols=["AE_mean", "BWT_mean"]  
             ),
 
-            # TODO: could expand with seeds
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_41"],
+                    "aggregate_metrics",
+                    "sbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_40"],
+                    "aggregate_metrics",
+                    "sbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            )
         ]
 
         # ---------------------------
@@ -921,7 +1511,21 @@ def analyze_ppg_vs_ppg_ecg(baselines):
                 usecols=["AE_mean", "BWT_mean"]  
             ),
 
-            # TODO: could expand with seeds
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_41"],
+                    "aggregate_metrics",
+                    "dbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
+
+            pd.read_csv(os.path.join(
+                    baseline_paths[f"{path_key}_seed_40"],
+                    "aggregate_metrics",
+                    "dbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            )
         ]
 
         aggregated_results[baseline][f"{path_key}_sbp_cl"] = (
@@ -931,69 +1535,302 @@ def analyze_ppg_vs_ppg_ecg(baselines):
         aggregated_results[baseline][f"{path_key}_dbp_cl"] = (
             aggregate_seed_dataframes(dbp_dfs)
         )
+    
+    # -----------------
+    # Number of updates 
+    # -----------------
+    for path_key in path_keys:
+
+        # collect all seed-specific paths
+        seed_paths = [
+            baseline_paths[path_key],
+            baseline_paths[f"{path_key}_seed_41"],
+            baseline_paths[f"{path_key}_seed_40"],
+        ]
+
+        experiment_dir = Path(seed_paths[0])
+
+        subject_results = {}
+
+        # iterate subjects
+        for item in experiment_dir.iterdir():
+
+            if item.is_dir() and item.name.startswith("subject_"):
+
+                subject_folder = item.name
+
+                skipped_per_seed = []
+                performed_per_seed = []
+                total_per_seed = []
+
+                # loop over seeds
+                for seed_path in seed_paths:
+
+                    csv_path = os.path.join(
+                        seed_path,
+                        subject_folder,
+                        baseline,
+                        "param_update_log.csv"
+                    )
+
+                    df = pd.read_csv(
+                        csv_path,
+                        usecols=["n_updated_params"]
+                    )
+                    #print(df)
+
+                    n_total = len(df)
+                    n_skipped = (df["n_updated_params"] == 0).sum()
+                    n_performed = (df["n_updated_params"] > 0).sum()
+
+                    #print(n_total, n_skipped, n_performed)
+                    
+                    total_per_seed.append(n_total)
+                    skipped_per_seed.append(n_skipped)
+                    performed_per_seed.append(n_performed)
+
+                # averages over seeds
+                avg_total = np.mean(total_per_seed)
+                avg_skipped = np.mean(skipped_per_seed)
+                avg_performed = np.mean(performed_per_seed)
+
+                #print(avg_total, avg_skipped, avg_performed)
+                
+                # fraction of saved/skipped updates
+                skipped_fraction = avg_skipped / avg_total if avg_total > 0 else 0.0
+
+                subject_results[subject_folder] = {
+                    "avg_total_updates": avg_total,
+                    "avg_skipped_updates": avg_skipped,
+                    "avg_performed_updates": avg_performed,
+                    "skipped_fraction": skipped_fraction,
+                }
+
+                #print(
+                #    f"{path_key} | {subject_folder} | "
+                #    f"Skipped fraction: {skipped_fraction:.3f}"
+                #)
+
+
+        # aggregate across subjects
+        all_subject_fractions = [
+            v["skipped_fraction"]
+            for v in subject_results.values()
+        ]
+
+        aggregated_results[baseline][f"{path_key}_updates"] = {
+            "per_subject": subject_results,
+            "mean_skipped_fraction": np.mean(all_subject_fractions),
+            "std_skipped_fraction": np.std(all_subject_fractions),
+        }
         
     set_mapping = {
-        "PPG": "gradual_shifts_path",
-        "PPG+ECG": "ppg_ecg_gradual_shifts_path",
+        "128": ["embed_dim_128_buffer_size_64_path", "embed_dim_128_buffer_size_32_path", "embed_dim_128_buffer_size_16_path"],
+        "32": ["embed_dim_32_buffer_size_64_path", "embed_dim_32_buffer_size_32_path", "embed_dim_32_buffer_size_16_path"],
+        "16": ["embed_dim_16_buffer_size_64_path", "embed_dim_16_buffer_size_32_path", "embed_dim_16_buffer_size_16_path"]
     }
     
-    latex_table = generate_ppg_vs_ppg_ecg_overleaf_table(
+    latex_table = generate_mmd_embeddings_and_buffer_sizes_overleaf_table(
         aggregated_results,
         set_mapping
     )
     
+    print()
     print(latex_table)
+    print()
+
+def analyze_mmd_embeddings_and_buffer_sizes_ppg_ecg(baselines):
+    baseline = 'feature_replay'
+    path_keys = [ 
+        "embed_dim_128_buffer_size_64_path",
+        "embed_dim_128_buffer_size_32_path",
+        "embed_dim_128_buffer_size_16_path",
+        "embed_dim_32_buffer_size_64_path",
+        "embed_dim_32_buffer_size_32_path",
+        "embed_dim_32_buffer_size_16_path",
+        "embed_dim_16_buffer_size_64_path",
+        "embed_dim_16_buffer_size_32_path",
+        "embed_dim_16_buffer_size_16_path"
+    ]
     
-def estimate_communication_costs(setting):
-    def fmt(value, decimals=1):
-        return rf"${value:.{decimals}f}$"
+    baseline_paths = baselines[f'{baseline}_ppg_ecg']
+    aggregated_results = {}
+
+    aggregated_results[baseline] = {}
+
+    # ---------------------------------
+    # Clinical Metrics (ME / STD / BHS)
+    # ---------------------------------           
+    for path_key in path_keys:
+        dfs = [
+            pd.read_csv(os.path.join(
+                    baseline_paths[path_key],
+                    "aggregate_metrics",
+                    f"aggregate_{baseline}_metrics",
+                    "evaluation_metrics.csv"
+                ),
+                usecols=["Type", "ME", "STD", "BHS_Grade"]            
+            ),
+        ]
+
+        aggregated_results[baseline][f"{path_key}_clinical"] = (
+            aggregate_seed_dataframes(
+                dfs,
+                bhs_columns=["BHS_Grade"]   # adapt if column name differs
+            )
+        )
+
+    # -------------------------------------
+    # Continual Learning Metrics (AE / BWT)
+    # -------------------------------------
+    for path_key in path_keys:
+        sbp_dfs = [
+            pd.read_csv(os.path.join(
+                    baseline_paths[path_key],
+                    "aggregate_metrics",
+                    "sbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
+        ]
+
+        # ---------------------------
+        # DBP
+        # ---------------------------
+        dbp_dfs = [
+            pd.read_csv(os.path.join(
+                    baseline_paths[path_key],
+                    "aggregate_metrics",
+                    "dbp_aggregate_baseline_metrics.csv"
+                ),
+                usecols=["AE_mean", "BWT_mean"]  
+            ),
+        ]
+
+        aggregated_results[baseline][f"{path_key}_sbp_cl"] = (
+            aggregate_seed_dataframes(sbp_dfs)
+        )
+
+        aggregated_results[baseline][f"{path_key}_dbp_cl"] = (
+            aggregate_seed_dataframes(dbp_dfs)
+        )
     
-    # One sample memory
-    input_data_length_s = 10
-    input_data_freq = 125
-    sample_memory = input_data_length_s * input_data_freq
-    
-    input_data_batch = 4
-    batch_memory = sample_memory * input_data_batch
-    
-    number_of_updates = 72
-    memory_transmitted_for_all_updates = batch_memory * number_of_updates
-    
-    # FP 32 precision
-    feature_extractor_fp_params = 193384
-    prediction_head_fp_params = 8451
-    
-    # --- Calculation Logic ---
-    # Total parameters in the model
-    total_params = feature_extractor_fp_params + prediction_head_fp_params
-    
-    # 1 FP32 value = 4 bytes. 
-    # Convert total bytes to Megabytes (MB) using 1 MB = 1,024 * 1,024 bytes
-    model_memory_bytes = total_params * 4
-    model_memory_mb = model_memory_bytes / (1024 * 1024)
-    
-    # Input data values are typically integers or floats. Assuming standard 4-byte (FP32) float 
-    # values for the transmitted sensor/input data:
-    data_memory_bytes = memory_transmitted_for_all_updates * 4
-    data_memory_mb = data_memory_bytes / (1024 * 1024)
-    
-    if setting == "A":
-        # Return the MB of the model (feat.ext. + head)
-        return fmt(model_memory_mb)
-    elif setting == 'B':  # Added missing colon
-        # Return the MB of the model (feat.ext. + head) + memory transmitted for all updates 
-        return fmt(model_memory_mb + data_memory_mb)
-    else:
-        raise ValueError("Incorrect setting was passed as input argument")
-    
+    # -----------------
+    # Number of updates 
+    # -----------------
+    for path_key in path_keys:
+
+        # collect all seed-specific paths
+        seed_paths = [
+            baseline_paths[path_key],
+        ]
+
+        experiment_dir = Path(seed_paths[0])
+
+        subject_results = {}
+
+        # iterate subjects
+        for item in experiment_dir.iterdir():
+
+            if item.is_dir() and item.name.startswith("subject_"):
+
+                subject_folder = item.name
+
+                skipped_per_seed = []
+                performed_per_seed = []
+                total_per_seed = []
+
+                # loop over seeds
+                for seed_path in seed_paths:
+
+                    csv_path = os.path.join(
+                        seed_path,
+                        subject_folder,
+                        f'{baseline}',
+                        "param_update_log.csv"
+                    )
+
+                    df = pd.read_csv(
+                        csv_path,
+                        usecols=["n_updated_params"]
+                    )
+                    #print(df)
+
+                    n_total = len(df)
+                    n_skipped = (df["n_updated_params"] == 0).sum()
+                    n_performed = (df["n_updated_params"] > 0).sum()
+
+                    #print(n_total, n_skipped, n_performed)
+                    
+                    total_per_seed.append(n_total)
+                    skipped_per_seed.append(n_skipped)
+                    performed_per_seed.append(n_performed)
+
+                # averages over seeds
+                avg_total = np.mean(total_per_seed)
+                avg_skipped = np.mean(skipped_per_seed)
+                avg_performed = np.mean(performed_per_seed)
+
+                #print(avg_total, avg_skipped, avg_performed)
+                
+                # fraction of saved/skipped updates
+                skipped_fraction = avg_skipped / avg_total if avg_total > 0 else 0.0
+
+                subject_results[subject_folder] = {
+                    "avg_total_updates": avg_total,
+                    "avg_skipped_updates": avg_skipped,
+                    "avg_performed_updates": avg_performed,
+                    "skipped_fraction": skipped_fraction,
+                }
+
+                #print(
+                #    f"{path_key} | {subject_folder} | "
+                #    f"Skipped fraction: {skipped_fraction:.3f}"
+                #)
+
+
+        # aggregate across subjects
+        all_subject_fractions = [
+            v["skipped_fraction"]
+            for v in subject_results.values()
+        ]
+
+        aggregated_results[baseline][f"{path_key}_updates"] = {
+            "per_subject": subject_results,
+            "mean_skipped_fraction": np.mean(all_subject_fractions),
+            "std_skipped_fraction": np.std(all_subject_fractions),
+        }
         
+    set_mapping = {
+        "256": ["embed_dim_128_buffer_size_64_path", "embed_dim_128_buffer_size_32_path", "embed_dim_128_buffer_size_16_path"],
+        "64": ["embed_dim_32_buffer_size_64_path", "embed_dim_32_buffer_size_32_path", "embed_dim_32_buffer_size_16_path"],
+        "32": ["embed_dim_16_buffer_size_64_path", "embed_dim_16_buffer_size_32_path", "embed_dim_16_buffer_size_16_path"]
+    }
     
+    latex_table = generate_mmd_embeddings_and_buffer_sizes_ppg_ecg_overleaf_table(
+        aggregated_results,
+        set_mapping
+    )
+    
+    print()
+    print(latex_table)
+    print()
+    
+
 # ---------------------
 # LaTeX Table Generator
 # ---------------------
-def generate_resource_profile_table(pi_profile, pixel_profile):
+def generate_resource_profile_table(pi_profile, pixel_profile, config_file_path):
 
+    baseline = 'Always-on'
     method = 'MMD'
+    
+    with open(config_file_path, "r") as f:
+        setup = yaml.safe_load(f)
+    embed_dim = int(setup.get('embed_dim'))
+    
+    pi_baseline = pi_profile[baseline]
+    px_baseline = pixel_profile[baseline] 
     pi  = pi_profile[method]
     px  = pixel_profile[method]
 
@@ -1006,20 +1843,21 @@ def generate_resource_profile_table(pi_profile, pixel_profile):
         (r'feat. extraction',                           'feature_extraction_s',       1),
         (r'BP prediction',                              'prediction_s',               1),
         (r'drift detection',                            'drift_detection_s',          1),
-        (r'adaptation (head adapt. + detector reint.)', 'adaptation_s',               1),
-        (r'head adapt.',                                'head_adapt_s',               2),  # ← sub-component
-        (r'detector reinit.',                           'drift_detector_reinit_s',    2),  # ← sub-component
-        (r'total',                                      'total_step_s',               1),
+        (r'head adapt.',                                'head_adapt_s',               1),  
+        (r'detector reinit.',                           'drift_detector_reinit_s',    1),  
     ]
-
+    
+    # cumulative latency over patients
+    mmd_aggregate_latency_labels = {
+        "MMD": "cumulative_latency_s",
+    }
+    always_on_aggregate_latency_labels = {
+        "Always-on ": "cumulative_latency_s",
+    }
+    
     # ── Memory labels & keys ───────────────────────────────────────────────
-    memory_labels = {
-        #r'model\_memory\_mb':          'model_memory_mb',
-        #r'rss\_before\_tta\_mb':       'rss_before_tta_mb',
-        #r'peak\_tta\_rss\_mb':         'peak_tta_rss_mb',
-        #r'peak\_incremental\_tta\_mb': 'peak_incremental_tta_mb',
-        r'peak process memory':         'peak_process_rss_mb',
-        #r'tm\_peak\_run\_kb':          'tm_peak_run_kb',
+    aggregate_memory_labels = {
+        "peak process memory": "peak_process_rss_mb",
     }
 
     INDENT = {1: r'\quad', 2: r'\qquad'}
@@ -1032,36 +1870,60 @@ def generate_resource_profile_table(pi_profile, pixel_profile):
     rows.append(r"        \hline")
 
     # ── Communication block ──────────────────────────────────────────────────────
-    rows.append(r"        \multicolumn{3}{l}{\textit{Estimated Communication Requirements (MB)}} \\")
+    rows.append(r"        \multicolumn{3}{l}{\textit{Estimated Communication Requirements}} \\")
     rows.append(r"        \hline")
     rows.append(
-        rf"        {INDENT[1]} Setting A & {estimate_communication_costs('A')} & {estimate_communication_costs('A')} \\"
+        rf"        {INDENT[1]} Setting A & {estimate_communication_costs('A', config_file_path)} kB & {estimate_communication_costs('A', config_file_path)} kB \\"
     )
     rows.append(
-        rf"        {INDENT[1]} Setting B & {estimate_communication_costs('B')} & {estimate_communication_costs('B')} \\"
+        rf"        {INDENT[1]} Setting B & {estimate_communication_costs('B', config_file_path)} MB & {estimate_communication_costs('B', config_file_path)} MB \\"
     )
     rows.append(r"        \hline")
     
     # ── Latency block ──────────────────────────────────────────────────────
-    rows.append(r"        \multicolumn{3}{l}{\textit{Profiled Computational Requirements $\sim$ Avg. Latency (ms)}} \\")
+    rows.append(r"        \multicolumn{3}{l}{\textit{Profiled Comput. Requirements $\sim$ Update Latency Breakdown (ms)}} \\")
     rows.append(r"        \hline")
+    
     for label, key, level in latency_rows:
         pi_m, pi_s = pi['latency_ms'][key]
         px_m, px_s = px['latency_ms'][key]
+        
         indent = INDENT[level]
         rows.append(
             rf"        {indent} {label} & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
         )
     rows.append(r"        \hline")
+    
+    rows.append(r"        \multicolumn{3}{l}{\textit{Cumulative Latency for 88 subj. (min)}} \\")
+    rows.append(r"        \hline")
+    
+    # MMD cumulative latency 
+    for label, key in mmd_aggregate_latency_labels.items():
+        pi_m, pi_s = pi['aggregate_latency_ms'][key]['min']
+        px_m, px_s = px['aggregate_latency_ms'][key]['min']
+        
+        rows.append(
+            rf"        \quad {label} & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+        )
 
+    # Always-on cumulative latency 
+    for label, key in always_on_aggregate_latency_labels.items():
+        pi_m, pi_s = pi_baseline['aggregate_latency_ms'][key]['min']
+        px_m, px_s = px_baseline['aggregate_latency_ms'][key]['min']
+        
+        rows.append(
+            rf"        \quad {label} & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+        )
+    rows.append(r"        \hline")
+    
     # ── Memory block ───────────────────────────────────────────────────────
     rows.append(r"        \multicolumn{3}{l}{\textit{Profiled Memory Requirements $\sim$ Avg. Memory (MB)}} \\")
     rows.append(r"        \hline")
-    for label, key in memory_labels.items():
+    for label, key in aggregate_memory_labels.items():
         pi_m, pi_s = pi['aggregate_memory_mb'][key]
         px_m, px_s = px['aggregate_memory_mb'][key]
         rows.append(
-            rf"        \quad {label} & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+            rf"        \quad & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
         )
     rows.append(r"        \hline")
 
@@ -1071,20 +1933,35 @@ def generate_resource_profile_table(pi_profile, pixel_profile):
     pi_m, pi_s = pi['update_freq_reduction']
     px_m, px_s = px['update_freq_reduction']
     rows.append(
-        rf"        \quad freq.\ reduction & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+        rf"        \quad & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+    )
+    rows.append(r"        \hline")
+
+    # ── Sample-annotation-reduction row ─────────────────────────────────────
+    rows.append(r"        \multicolumn{3}{l}{\textit{Profiled Avg.\ Annotations required for one subj. (\# samples)}} \\")
+    rows.append(r"        \hline")
+    pi_m, pi_s = pi['annotation_samples_reduction']
+    px_m, px_s = px['annotation_samples_reduction']
+    pi_baseline_m, pi_baseline_s = pi_baseline['annotation_samples_reduction']
+    px_baseline_m, px_baseline_s = px_baseline['annotation_samples_reduction']
+    rows.append(
+        rf"        \quad MMD & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+    )
+    rows.append(
+        rf"        \quad Always-on & {fmt(pi_baseline_m, pi_baseline_s)} & {fmt(px_baseline_m, px_baseline_s)} \\"
     )
     rows.append(r"        \hline")
 
     # ── Assemble full table ────────────────────────────────────────────────
     table = "\n".join([
-        r"\begin{table*}",
+        r"\begin{table}",
         r"    \centering",
-        r"    \caption{Resource profile comparison across different edge devices (\( \mu \) $\pm$ \( \sigma \)) of the feature replay CL algorithm with MMD drift detector adapting to gradual shifts (72 time steps).}",
+        r"    \caption{Resource profiling (over three seeds) of feature replay with MMD, emebedding size " + f"{embed_dim}" + " and buffer size 16.}",
         r"    \begin{tabular}{l|c|c}",
         "\n".join(rows),
         r"    \end{tabular}",
-        r"    \label{tab:table_3}",
-        r"\end{table*}",
+        r"    \label{tab:table_4}",
+        r"\end{table}",
     ])
 
     print(table)
@@ -1111,7 +1988,7 @@ def generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
     latex = []
     latex.append(r"\begin{table*}")
     latex.append(r"    \centering")
-    latex.append(r"    \caption{Personalization results (averaged over three seeds) on Vital DB with deployment on the laptop GPU for continuous SBP/DBP estimation from PPG, divided into the three subject sets 1/2/3. Parentheses indicate the target thresholds for the clinical standards for both SBP/DBP. CL algorithms are in light gray.}")
+    latex.append(r"    \caption{Personalization results (over three seeds) on Vital DB for continuous SBP/DBP estimation from PPG, divided into the three subject sets 1/2/3. Parentheses indicate the target thresholds for the clinical standards for both SBP/DBP. CL algorithms are in light gray.}")
     latex.append(r"    \begin{tabular}{l|l|l|l|p{0.15\textwidth}|p{0.16\textwidth}|l}")
     latex.append(r"        \hline")
     latex.append(r"        \textbf{Set} & \textbf{Algorithm} & \textbf{AE}$\downarrow$ & \textbf{BWT}$\downarrow$ & \makecell[l]{\textbf{ME}$\downarrow$ \\ ($<$5 mmHg)} & \makecell[l]{\textbf{STD}$\downarrow$ \\ ($<$8 mmHg)} & \makecell[l]{\textbf{BHS}$\uparrow$ \\ (A)} \\")
@@ -1173,63 +2050,33 @@ def generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
             if display_name == 'feat.replay':
                 row += r"& \cellcolor{lightgray!30}\textbf{feat.replay} "
                 row += (
-                    r"& \textbf{" + f"{ae_sbp_mean} / {ae_dbp_mean}" + "} "
-                    r"& \textbf{" + f"{bwt_sbp_mean} / {bwt_dbp_mean}" + "} "
-                    r"& \textbf{" + f"{me_sbp_mean} / {me_dbp_mean}" + "} "
-                    r"& \textbf{" + f"{std_sbp_mean} / {std_dbp_mean}" + "} "
+                    r"& \textbf{" + f"{ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f" / {ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "}" + "} "
+                    r"& \textbf{" + f"{bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f" / {bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "}" + "} "
+                    r"& \textbf{" + f"{me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f" / {me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "}" + "} "
+                    r"& \textbf{" + f"{std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f" / {std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "}" + "} "
                     r"& \textbf{" + f"{bhs_sbp} / {bhs_dbp}" + "} \\\\"
                 )
             elif display_name in {'LwF', 'EWC', 'AGEM'}:
                 row += r"& \cellcolor{lightgray!30}" + f"{display_name} "
                 row += (
-                    f"& {ae_sbp_mean} / {ae_dbp_mean} "
-                    f"& {bwt_sbp_mean} / {bwt_dbp_mean} "
-                    f"& {me_sbp_mean} / {me_dbp_mean} "
-                    f"& {std_sbp_mean} / {std_dbp_mean} "
+                    f"& {ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f" / {ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "} "
+                    f"& {bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f" / {bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "} "
+                    f"& {me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f" / {me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "} "
+                    f"& {std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f" / {std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "} "
                     f"& {bhs_sbp} / {bhs_dbp} \\\\"
                 )
             else:
                 row += (
                     f"& {display_name} "
-                    f"& {ae_sbp_mean} / {ae_dbp_mean} "
-                    f"& {bwt_sbp_mean} / {bwt_dbp_mean} "
-                    f"& {me_sbp_mean} / {me_dbp_mean} "
-                    f"& {std_sbp_mean} / {std_dbp_mean} "
+                    f"& {ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f" / {ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "} "
+                    f"& {bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f" / {bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "} "
+                    f"& {me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f" / {me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "} "
+                    f"& {std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f" / {std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "} "
                     f"& {bhs_sbp} / {bhs_dbp} \\\\"
                 )
             
-                if display_name == 'online*':
+                if display_name == 'online*' or display_name == 'cumulative-mean':
                     row += r"\cline{2-7}"
-                    
-            """
-            if display_name == 'feat.replay':
-                row += r"& \cellcolor{lightgray!30}\textbf{feat.replay} "
-                row += (
-                    r"& \textbf{" + f"{ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f"/{ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "}" + "} "
-                    r"& \textbf{" + f"{bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f"/{bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "}" + "} "
-                    r"& \textbf{" + f"{me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f"/{me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "}" + "} "
-                    r"& \textbf{" + f"{std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f"/{std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "}" + "} "
-                    r"& \textbf{" + f"{bhs_sbp}/{bhs_dbp}" + "} \\\\"
-                )
-            elif display_name in {'LwF', 'EWC', 'AGEM'}:
-                row += r"& \cellcolor{lightgray!30}" + f"{display_name} "
-                row += (
-                    f"& {ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f"/{ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "} "
-                    f"& {bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f"/{bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "} "
-                    f"& {me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f"/{me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "} "
-                    f"& {std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f"/{std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "} "
-                    f"& {bhs_sbp}/{bhs_dbp} \\\\"
-                )
-            else:
-                row += (
-                    f"& {display_name} "
-                    f"& {ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f"/{ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "} "
-                    f"& {bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f"/{bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "} "
-                    f"& {me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f"/{me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "} "
-                    f"& {std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f"/{std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "} "
-                    f"& {bhs_sbp}/{bhs_dbp} \\\\"
-                )
-            """
                
             latex.append(row)
 
@@ -1242,7 +2089,120 @@ def generate_gradual_vs_mixed_vs_abrupt_overleaf_table(
     return "\n".join(latex)
 
 
-def generate_mmd_vs_lsdd_overleaf_table(
+def generate_gradual_vs_mixed_vs_abrupt_ppg_ecg_overleaf_table(
+    aggregated_results,
+    baseline_display_names,
+    set_mapping,
+    ae_column="AE_mean",
+    bwt_column="BWT_mean",
+    me_column="ME",
+    std_column="STD",
+    bhs_column="BHS_Grade"
+):
+    def fmt(x):
+        """
+        Round numeric values to 1 decimals.
+        """
+        if isinstance(x, (int, float, np.floating)):
+            return f"{x:.1f}"
+        return str(x)
+
+    latex = []
+    latex.append(r"\begin{table*}")
+    latex.append(r"    \centering")
+    latex.append(r"    \caption{Feature replay personalization results (seed 42) on Vital DB for continuous SBP/DBP estimation from PPG and PPG+ECG, divided into the three subject sets 1/2/3. Parentheses indicate the target thresholds for the clinical standards for both SBP/DBP.}")
+    latex.append(r"    \begin{tabular}{l|l|l|l|p{0.15\textwidth}|p{0.16\textwidth}|l}")
+    latex.append(r"        \hline")
+    latex.append(r"        \textbf{Set} & \textbf{Algorithm} & \textbf{AE}$\downarrow$ & \textbf{BWT}$\downarrow$ & \makecell[l]{\textbf{ME}$\downarrow$ \\ ($<$5 mmHg)} & \makecell[l]{\textbf{STD}$\downarrow$ \\ ($<$8 mmHg)} & \makecell[l]{\textbf{BHS}$\uparrow$ \\ (A)} \\")
+    latex.append(r"        \hline")
+
+    first_set = True
+
+    for set_id, shift_name in set_mapping.items():
+
+        first_algo = True
+
+        for baseline_key, display_name in baseline_display_names.items():
+
+            # ---------------------------
+            # Retrieve aggregated metrics
+            # ---------------------------
+
+            clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
+            sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
+            dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
+
+            # -----------------------
+            # Assumes single-row CSVs
+            # -----------------------
+
+            me_sbp_mean = fmt(clinical_df.iloc[0][f"{me_column}_mean"])
+            me_sbp_std = fmt(clinical_df.iloc[0][f"{me_column}_std"])
+            me_dbp_mean = fmt(clinical_df.iloc[1][f"{me_column}_mean"])
+            me_dbp_std = fmt(clinical_df.iloc[1][f"{me_column}_std"])
+            
+            std_sbp_mean = fmt(clinical_df.iloc[0][f"{std_column}_mean"])
+            std_sbp_std = fmt(clinical_df.iloc[0][f"{std_column}_std"])
+            std_dbp_mean = fmt(clinical_df.iloc[1][f"{std_column}_mean"])
+            std_dbp_std = fmt(clinical_df.iloc[1][f"{std_column}_std"])
+
+            bhs_sbp = clinical_df.iloc[0][bhs_column]
+            bhs_dbp = clinical_df.iloc[1][bhs_column]
+
+            ae_sbp_mean = fmt(sbp_cl_df.iloc[0][f"{ae_column}_mean"])
+            ae_sbp_std = fmt(sbp_cl_df.iloc[0][f"{ae_column}_std"])
+            ae_dbp_mean = fmt(dbp_cl_df.iloc[0][f"{ae_column}_mean"])
+            ae_dbp_std = fmt(dbp_cl_df.iloc[0][f"{ae_column}_std"])
+            
+            bwt_sbp_mean = fmt(sbp_cl_df.iloc[0][f"{bwt_column}_mean"])
+            bwt_sbp_std = fmt(sbp_cl_df.iloc[0][f"{bwt_column}_std"])
+            bwt_dbp_mean = fmt(dbp_cl_df.iloc[0][f"{bwt_column}_mean"])
+            bwt_dbp_std = fmt(dbp_cl_df.iloc[0][f"{bwt_column}_std"])
+            
+            # ---------
+            # Build row
+            # ---------
+
+            if first_algo:
+                row = f"        {set_id} "
+                first_algo = False
+            else:
+                row = "        "
+
+            if display_name == 'feat.replay (PPG+ECG)':
+                row += r"& \textbf{feat.replay (PPG+ECG)} "
+                row += (
+                    r"& \textbf{" + f"{ae_sbp_mean}" + f" / {ae_dbp_mean}" + "} "
+                    r"& \textbf{" + f"{bwt_sbp_mean}" + f" / {bwt_dbp_mean}" + "} "
+                    r"& \textbf{" + f"{me_sbp_mean}" + f" / {me_dbp_mean}" + "} "
+                    r"& \textbf{" + f"{std_sbp_mean}" + f" / {std_dbp_mean}" + "} "
+                    r"& \textbf{" + f"{bhs_sbp} / {bhs_dbp}" + "} \\\\"
+                )
+            else:
+                row += (
+                    f"& {display_name} "
+                    f"& {ae_sbp_mean}" f" / {ae_dbp_mean}"
+                    f"& {bwt_sbp_mean}" + f" / {bwt_dbp_mean}"
+                    f"& {me_sbp_mean}" + f" / {me_dbp_mean}"
+                    f"& {std_sbp_mean}" + f" / {std_dbp_mean}"
+                    f"& {bhs_sbp} / {bhs_dbp} \\\\"
+                )
+            
+                if display_name == 'online*' or display_name == 'cumulative-mean':
+                    row += r"\cline{2-7}"
+               
+            latex.append(row)
+
+        latex.append(r"        \hline")
+
+    latex.append(r"    \end{tabular}")
+    latex.append(r"    \label{tab:table_1}")
+    latex.append(r"\end{table*}")
+
+    return "\n".join(latex)
+
+
+def generate_drift_detection_methods_overleaf_table(
     aggregated_results, 
     set_mapping,
     baseline_key="feature_replay",
@@ -1261,77 +2221,353 @@ def generate_mmd_vs_lsdd_overleaf_table(
         return str(x)
 
     latex = []
-    latex.append(r"\begin{table*}")
+    latex.append(r"\begin{table}")
     latex.append(r"    \centering")
-    latex.append(r"    \caption{Drift-aware Personalization results (averaged over three seeds) on Vital DB with deployment on the laptop CPU for continuous SBP/DBP estimation from PPG. The baseline employed for personalization is feature replay, adapting to gradual shifts with the MMD/LSDD drift detectors. The reported metrics are the same as those of Table ~\ref{tab:table_1} plus the number of skipped updates (rightmost column) per drift detector, relatively to the number of updates without drift detection (72).}")
-    latex.append(r"    \begin{tabular}{l|l|l|p{0.15\textwidth}|p{0.16\textwidth}|l|l}")
+    latex.append(r"    \caption{Drift-aware personalization results (over three seeds) for continuous SBP estimation from PPG (DBP omitted for conciseness). We report the fraction of skipped updates relatively to the always-on baseline.}")
+    latex.append(r"    \begin{tabular}{p{1cm}|c|c|c|c}")
     latex.append(r"        \hline")
-    latex.append(r"        \textbf{Algorithm} & \textbf{AE}$\downarrow$ & \textbf{BWT}$\downarrow$ & \makecell[l]{\textbf{ME}$\downarrow$ \\ ($<$5 mmHg)} & \makecell[l]{\textbf{STD}$\downarrow$ \\ ($<$8 mmHg)} & \makecell[l]{\textbf{BHS}$\uparrow$ \\ (A)} & \makecell[l]{\textbf{Skipped} \\ \textbf{Fraction\%}$\uparrow$} \\")
+    latex.append(r"        \textbf{Metric} & \textbf{Always} & \textbf{MMD} & \textbf{Random} & \textbf{LSDD} \\")
     latex.append(r"        \hline")
-
-    for algo, shift_name in set_mapping.items():
-
-        # ---------------------------
-        # Retrieve aggregated metrics
-        # ---------------------------
-
-        clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
-        sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
-        dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
-        skipped_fraction = aggregated_results[baseline_key][f"{shift_name}_updates"]["mean_skipped_fraction"]
-
-        # -----------------------
-        # Assumes single-row CSVs
-        # -----------------------
-
-        ae_sbp = fmt(sbp_cl_df.iloc[0][ae_column])
-        ae_dbp = fmt(dbp_cl_df.iloc[0][ae_column])
-        
-        bwt_sbp = fmt(sbp_cl_df.iloc[0][bwt_column])
-        bwt_dbp = fmt(dbp_cl_df.iloc[0][bwt_column])
-
-        me_sbp = fmt(clinical_df.iloc[0][me_column])
-        me_dbp = fmt(clinical_df.iloc[1][me_column])
-        
-        std_sbp = fmt(clinical_df.iloc[0][std_column])
-        std_dbp = fmt(clinical_df.iloc[1][std_column])
-        
-        skipped_fraction = fmt(skipped_fraction * 100)
-
-        bhs_sbp = clinical_df.iloc[0][bhs_column]
-        bhs_dbp = clinical_df.iloc[1][bhs_column]
-
-        # ---------
-        # Build row
-        # ---------
-        if algo == "MMD":
-            row = (
-                r"\textbf{MMD} "
-                r"& \textbf{" + f"{ae_sbp} / {ae_dbp}" + "} "
-                r"& \textbf{" + f"{bwt_sbp} / {bwt_dbp}" + "} "
-                r"& \textbf{" + f"{me_sbp} / {me_dbp}" + "} "
-                r"& \textbf{" + f"{std_sbp} / {std_dbp}" + "} "
-                r"& \textbf{" + f"{bhs_sbp} / {bhs_dbp}" + "}"
-                r"& \textbf{" + f"{skipped_fraction}" + "} \\\\"
-            )
-        else:
-            row = (
-                f"{algo} "
-                f"& {ae_sbp} / {ae_dbp} "
-                f"& {bwt_sbp} / {bwt_dbp} "
-                f"& {me_sbp} / {me_dbp} "
-                f"& {std_sbp} / {std_dbp} "
-                f"& {bhs_sbp} / {bhs_dbp} "
-                f"& {skipped_fraction} \\\\"
-            )
     
-        latex.append(row)
+    for metric in ["AE", "BWT", "ME", "STD", "BHS", r"Skip\%"]:
+        if metric == "AE":
+            row = rf"       {metric}$\downarrow$"
+        elif metric == "BWT":
+            row = rf"       {metric}$\downarrow$"
+        elif metric == "ME":
+            row = rf"       {metric}$\downarrow$"
+        elif metric == "STD":
+            row = rf"       {metric}$\downarrow$"
+        elif metric == "BHS":
+            row = rf"       {metric}$\uparrow$"
+        else:
+            row = rf"       {metric}$\uparrow$"
+        
+        for algo, shift_name in set_mapping.items():
+            if metric == "AE":
+                sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
+                dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
+                
+                ae_sbp_mean = fmt(sbp_cl_df.iloc[0][f"{ae_column}_mean"])
+                ae_sbp_std = fmt(sbp_cl_df.iloc[0][f"{ae_column}_std"])
+                ae_dbp_mean = fmt(dbp_cl_df.iloc[0][f"{ae_column}_mean"])
+                ae_dbp_std = fmt(dbp_cl_df.iloc[0][f"{ae_column}_std"])
+                
+                #if shift_name == "drift_aware_mmd_path":
+                #    row += r"& \textbf{" + f"{ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f" / {ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "}" + "} "
+                #else:
+                #    row += f"& {ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + f" / {ae_dbp_mean}" + r"{\tiny $\pm$" + f"{ae_dbp_std}" + "} "
+                if shift_name == "drift_aware_mmd_path":
+                    row += r"& \textbf{" + f"{ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}" + "} "
+                else:
+                    row += f"& {ae_sbp_mean}" + r"{\tiny $\pm$" + f"{ae_sbp_std}" + "}"
+                    
+            elif metric == "BWT":
+                sbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_sbp_cl"]
+                dbp_cl_df = aggregated_results[baseline_key][f"{shift_name}_dbp_cl"]
+                
+                bwt_sbp_mean = fmt(sbp_cl_df.iloc[0][f"{bwt_column}_mean"])
+                bwt_sbp_std = fmt(sbp_cl_df.iloc[0][f"{bwt_column}_std"])
+                bwt_dbp_mean = fmt(dbp_cl_df.iloc[0][f"{bwt_column}_mean"])
+                bwt_dbp_std = fmt(dbp_cl_df.iloc[0][f"{bwt_column}_std"])
+                
+                #if shift_name == "drift_aware_mmd_path":
+                #    row += r"& \textbf{" + f"{bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f" / {bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "}" + "} "
+                #else:
+                #    row += f"& {bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + f" / {bwt_dbp_mean}" + r"{\tiny $\pm$" + f"{bwt_dbp_std}" + "} "
+                if shift_name == "drift_aware_mmd_path":
+                    row += r"& \textbf{" + f"{bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" + "} "
+                else:
+                    row += f"& {bwt_sbp_mean}" + r"{\tiny $\pm$" + f"{bwt_sbp_std}" + "}" 
+                    
+            elif metric == "ME":
+                clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
+                
+                me_sbp_mean = fmt(clinical_df.iloc[0][f"{me_column}_mean"])
+                me_sbp_std = fmt(clinical_df.iloc[0][f"{me_column}_std"])
+                me_dbp_mean = fmt(clinical_df.iloc[1][f"{me_column}_mean"])
+                me_dbp_std = fmt(clinical_df.iloc[1][f"{me_column}_std"])
+                
+                #if shift_name == "drift_aware_mmd_path":
+                #   row += r"& \textbf{" + f"{me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f" / {me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "}" + "} "
+                #else:
+                #    row += f"& {me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + f" / {me_dbp_mean}" + r"{\tiny $\pm$" + f"{me_dbp_std}" + "} "
+                
+                if shift_name == "drift_aware_mmd_path":
+                    row += r"& \textbf{" + f"{me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}" + "} "
+                else:
+                    row += f"& {me_sbp_mean}" + r"{\tiny $\pm$" + f"{me_sbp_std}" + "}"
+                                       
+            elif metric == "STD":
+                clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
+                
+                std_sbp_mean = fmt(clinical_df.iloc[0][f"{std_column}_mean"])
+                std_sbp_std = fmt(clinical_df.iloc[0][f"{std_column}_std"])
+                std_dbp_mean = fmt(clinical_df.iloc[1][f"{std_column}_mean"])
+                std_dbp_std = fmt(clinical_df.iloc[1][f"{std_column}_std"])
+    
+                #if shift_name == "drift_aware_mmd_path":
+                #   row += r"& \textbf{" + f"{std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f" / {std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "}" + "} "
+                #lse:
+                #    row += f"& {std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + f" / {std_dbp_mean}" + r"{\tiny $\pm$" + f"{std_dbp_std}" + "} "
+                
+                if shift_name == "drift_aware_mmd_path":
+                    row += r"& \textbf{" + f"{std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}" + "} "
+                else:
+                    row += f"& {std_sbp_mean}" + r"{\tiny $\pm$" + f"{std_sbp_std}" + "}"
+                       
+            elif metric == "BHS":
+                clinical_df = aggregated_results[baseline_key][f"{shift_name}_clinical"]
+                
+                bhs_sbp = clinical_df.iloc[0][bhs_column]
+                bhs_dbp = clinical_df.iloc[1][bhs_column]
+                
+                if shift_name == "drift_aware_mmd_path":
+                    row += r"& \textbf{" + f"{bhs_sbp}" + "} "
+                else:
+                    row += f"& {bhs_sbp}"
+            else:
+                mean_skipped_fraction = aggregated_results[baseline_key][f"{shift_name}_updates"]["mean_skipped_fraction"]
+                mean_skipped_fraction = fmt(mean_skipped_fraction * 100)
+                std_skipped_fraction = aggregated_results[baseline_key][f"{shift_name}_updates"]["std_skipped_fraction"]
+                std_skipped_fraction = fmt(std_skipped_fraction * 100)
+                
+                if shift_name == "drift_aware_mmd_path":
+                    row += r"& \textbf{" + f"{mean_skipped_fraction}" + r"{\tiny $\pm$" + f"{std_skipped_fraction}" + "}" + r"} "
+                else:
+                    row += f"& {mean_skipped_fraction}" + r"{\tiny $\pm$" + f"{std_skipped_fraction}" + "}"
+                    
+        latex.append(row + r" \\")
 
-        latex.append(r"        \hline")
+    latex.append(r"        \hline")
 
     latex.append(r"    \end{tabular}")
     latex.append(r"    \label{tab:table_2}")
-    latex.append(r"\end{table*}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
+
+
+def generate_mmd_embeddings_and_buffer_sizes_overleaf_table(
+    aggregated_results, 
+    set_mapping,
+    baseline_key="feature_replay",
+    ae_column="AE_mean",
+    bwt_column="BWT_mean",
+    me_column="ME",
+    std_column="STD",
+    bhs_column="BHS_Grade"
+):
+    def fmt(x):
+        """
+        Round numeric values to 1 decimals.
+        """
+        if isinstance(x, (int, float, np.floating)):
+            return f"{x:.1f}"
+        return str(x)
+
+    latex = []
+    latex.append(r"\begin{table}")
+    latex.append(r"    \centering")
+    latex.append(r"    \caption{Ablation study on MMD, over smaller embedding (128/32/16) and buffer (64/32/16) sizes. For conciseness, we report the SBP results averaged over three seeds but w/o variance. For embedding size 8, MMD was numerically unstable.}")
+    latex.append(r"    \begin{tabular}{p{0.5cm}|p{1.5cm}|p{1.5cm}|p{1.2cm}|p{2cm}}")
+    latex.append(r"        \hline")
+    latex.append(r"        \textbf{Emb.} &  \textbf{ME$\downarrow$} & \textbf{STD$\downarrow$} & \textbf{BHS$\uparrow$} & \textbf{Skip\%$\uparrow$} \\")
+    latex.append(r"        \hline")
+    
+    
+    for embedding_size, path_keys in set_mapping.items():
+        if int(embedding_size) == 16:
+            row = f"        " + r"\textbf{" + f"{embedding_size}" + "} & "
+        else:
+            row = f"        {embedding_size} & "
+        
+        ## Average Error (ME) for SBP
+        #for path in path_keys:
+        #    sbp_cl_df = aggregated_results[baseline_key][f"{path}_sbp_cl"]
+        #    ae_sbp_mean = fmt(sbp_cl_df.iloc[0][f"{ae_column}_mean"])
+        #    
+        #    if int(path.split('_')[-2]) == 16:
+        #        row += f"{ae_sbp_mean}"
+        #    else:
+        #        row += f"{ae_sbp_mean} / "
+        #row += " & "
+        
+        # Average Mean Error (ME) for SBP
+        for path in path_keys:
+            clinical_df = aggregated_results[baseline_key][f"{path}_clinical"]
+            me_sbp_mean = fmt(clinical_df.iloc[0][f"{me_column}_mean"])
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 16:
+                    row += r"\textbf{" + f"{me_sbp_mean}" + "}"
+                else:
+                    row += f"{me_sbp_mean}"
+            else:
+                row += f"{me_sbp_mean} / "
+        row += " & "
+        
+        # Average Mean Error Std (ME) for SBP
+        for path in path_keys:
+            clinical_df = aggregated_results[baseline_key][f"{path}_clinical"]
+            std_sbp_mean = fmt(clinical_df.iloc[0][f"{std_column}_mean"])
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 16:
+                    row += r"\textbf{" + f"{std_sbp_mean}" + "}"
+                else:
+                    row += f"{std_sbp_mean}"
+            else:
+                row += f"{std_sbp_mean} / "
+        row += " & "
+                
+        # BHS Grade for SBP
+        for path in path_keys:
+            clinical_df = aggregated_results[baseline_key][f"{path}_clinical"]
+            bhs_sbp = clinical_df.iloc[0][bhs_column]            
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 16:
+                    row += r"\textbf{" + f"{bhs_sbp}" + "}"
+                else:
+                    row += f"{bhs_sbp}"
+            else:
+                row += f"{bhs_sbp} / "
+        
+        row += " & "
+        
+        # Skipped Updates Fraction      
+        for path in path_keys:
+            mean_skipped_fraction = aggregated_results[baseline_key][f"{path}_updates"]["mean_skipped_fraction"]
+            mean_skipped_fraction = fmt(mean_skipped_fraction * 100)
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 16:
+                    row += r"\textbf{" + f"{mean_skipped_fraction}" + "}"
+                else:
+                    row += f"{mean_skipped_fraction}"
+            else:
+                row += f"{mean_skipped_fraction} / "
+                    
+        latex.append(row + r" \\")
+    
+    latex.append(r"        \hline")
+
+    latex.append(r"    \end{tabular}")
+    latex.append(r"    \label{tab:table_3}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
+
+
+def generate_mmd_embeddings_and_buffer_sizes_ppg_ecg_overleaf_table(
+    aggregated_results, 
+    set_mapping,
+    baseline_key="feature_replay",
+    ae_column="AE_mean",
+    bwt_column="BWT_mean",
+    me_column="ME",
+    std_column="STD",
+    bhs_column="BHS_Grade"
+):
+    def fmt(x):
+        """
+        Round numeric values to 1 decimals.
+        """
+        if isinstance(x, (int, float, np.floating)):
+            return f"{x:.1f}"
+        return str(x)
+
+    latex = []
+    latex.append(r"\begin{table}")
+    latex.append(r"    \centering")
+    latex.append(r"    \caption{Ablation study on MMD, over smaller embedding (256/64/32) and buffer (64/32/16) sizes. For conciseness, we report only the SBP results.}")
+    latex.append(r"    \begin{tabular}{p{0.5cm}|p{1.5cm}|p{1.5cm}|p{1.2cm}|p{2cm}}")
+    latex.append(r"        \hline")
+    latex.append(r"        \textbf{Emb.} &  \textbf{ME$\downarrow$} & \textbf{STD$\downarrow$} & \textbf{BHS$\uparrow$} & \textbf{Skip\%$\uparrow$} \\")
+    latex.append(r"        \hline")
+    
+    
+    for embedding_size, path_keys in set_mapping.items():
+        if int(embedding_size) == 64:
+            row = f"        " + r"\textbf{" + f"{embedding_size}" + "} & "
+        else:
+            row = f"        {embedding_size} & "
+        
+        ## Average Error (ME) for SBP
+        #for path in path_keys:
+        #    sbp_cl_df = aggregated_results[baseline_key][f"{path}_sbp_cl"]
+        #    ae_sbp_mean = fmt(sbp_cl_df.iloc[0][f"{ae_column}_mean"])
+        #    
+        #    if int(path.split('_')[-2]) == 16:
+        #        row += f"{ae_sbp_mean}"
+        #    else:
+        #        row += f"{ae_sbp_mean} / "
+        #row += " & "
+        
+        # Average Mean Error (ME) for SBP
+        for path in path_keys:
+            clinical_df = aggregated_results[baseline_key][f"{path}_clinical"]
+            me_sbp_mean = fmt(clinical_df.iloc[0][f"{me_column}_mean"])
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 64:
+                    row += r"\textbf{" + f"{me_sbp_mean}" + "}"
+                else:
+                    row += f"{me_sbp_mean}"
+            else:
+                row += f"{me_sbp_mean} / "
+        row += " & "
+        
+        # Average Mean Error Std (ME) for SBP
+        for path in path_keys:
+            clinical_df = aggregated_results[baseline_key][f"{path}_clinical"]
+            std_sbp_mean = fmt(clinical_df.iloc[0][f"{std_column}_mean"])
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 64:
+                    row += r"\textbf{" + f"{std_sbp_mean}" + "}"
+                else:
+                    row += f"{std_sbp_mean}"
+            else:
+                row += f"{std_sbp_mean} / "
+        row += " & "
+                
+        # BHS Grade for SBP
+        for path in path_keys:
+            clinical_df = aggregated_results[baseline_key][f"{path}_clinical"]
+            bhs_sbp = clinical_df.iloc[0][bhs_column]            
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 64:
+                    row += r"\textbf{" + f"{bhs_sbp}" + "}"
+                else:
+                    row += f"{bhs_sbp}"
+            else:
+                row += f"{bhs_sbp} / "
+        
+        row += " & "
+        
+        # Skipped Updates Fraction      
+        for path in path_keys:
+            mean_skipped_fraction = aggregated_results[baseline_key][f"{path}_updates"]["mean_skipped_fraction"]
+            mean_skipped_fraction = fmt(mean_skipped_fraction * 100)
+            
+            if int(path.split('_')[-2]) == 16:
+                if int(embedding_size) == 64:
+                    row += r"\textbf{" + f"{mean_skipped_fraction}" + "}"
+                else:
+                    row += f"{mean_skipped_fraction}"
+            else:
+                row += f"{mean_skipped_fraction} / "
+                    
+        latex.append(row + r" \\")
+    
+    latex.append(r"        \hline")
+
+    latex.append(r"    \end{tabular}")
+    latex.append(r"    \label{tab:table_3}")
+    latex.append(r"\end{table}")
 
     return "\n".join(latex)
 
@@ -1425,14 +2661,25 @@ def generate_ppg_vs_ppg_ecg_overleaf_table(
     return "\n".join(latex)
 
 
-def analyze_logs_and_plot():
+def analyze_logs_and_plot(args):
     
     print(f"[Log Analysis] Analyzing logs ...")
     
     # Baselines and corresponding experiment folder
     # Collect results on gradual shifts/mixed/shifts/abrupt shifts for each baseline
     # -> experiment path is hardcoded, bad
-    baselines = {
+    baselines_ppg = {
+        'running_mean': {
+            'gradual_shifts_path': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_gradual_shifts/personalization_running_mean_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_08_03-11_38_11",
+            'gradual_shifts_path_seed_41': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_running_mean_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_08_03-11_41_44",
+            'gradual_shifts_path_seed_40': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_running_mean_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_08_03-11_41_07",
+            'mixed_shifts_path': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_mixed_shifts/personalization_running_mean_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_08_03-12_23_55",
+            'mixed_shifts_path_seed_41': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_mixed_shifts_seed_41/personalization_running_mean_proto_ppg_calibration_size_1_mixed_shifts_seed_41-Proto-2026_08_03-12_26_12",
+            'mixed_shifts_path_seed_40': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_mixed_shifts_seed_40/personalization_running_mean_proto_ppg_calibration_size_1_mixed_shifts_seed_40-Proto-2026_08_03-12_26_05",
+            'abrupt_shifts_path': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_abrupt_shifts/personalization_running_mean_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_08_03-12_03_06", 
+            'abrupt_shifts_path_seed_41': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_running_mean_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_08_03-12_05_58",
+            'abrupt_shifts_path_seed_40': "./logs/personalization_running_mean_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_running_mean_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_08_03-12_06_25",
+        },
         'no_adapt': {
             'gradual_shifts_path': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-18_31_51",
             'gradual_shifts_path_seed_41': "./logs/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_no_adapt_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_21-10_18_43",
@@ -1478,6 +2725,7 @@ def analyze_logs_and_plot():
             'abrupt_shifts_path_seed_40': "./logs/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_online_from_scratch_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_21-12_11_18",
         }, 
         'feature_replay': {
+            # Experiments over different shift types
             'gradual_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-20_41_18",
             'gradual_shifts_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_41/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_41-Proto-2026_05_21-12_24_09",
             'gradual_shifts_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_40/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts_seed_40-Proto-2026_05_21-12_24_13",
@@ -1487,19 +2735,61 @@ def analyze_logs_and_plot():
             'abrupt_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-21_27_56", 
             'abrupt_shifts_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_41/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_41-Proto-2026_05_21-12_48_51",
             'abrupt_shifts_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_40/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts_seed_40-Proto-2026_05_21-12_48_51",
-            "drift_aware_mmd_path": "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd/personalization_feature_replay_proto_ppg_drift_aware_mmd-Proto-2026_05_20-10_35_46",
-            "drift_aware_mmd_path_seed_41": "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41-Proto-2026_05_21-13_40_45",
-            "drift_aware_mmd_path_seed_40": "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40-Proto-2026_05_21-12_38_45",
-            "drift_aware_lsdd_path": "./logs/personalization_feature_replay_proto_ppg_drift_aware_lsdd/personalization_feature_replay_proto_ppg_drift_aware_lsdd-Proto-2026_05_20-10_35_50",
-            "drift_aware_lsdd_path_seed_41": "./logs/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_41/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_41-Proto-2026_05_21-15_28_56",
-            "drift_aware_lsdd_path_seed_40": "./logs/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_40/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_40-Proto-2026_05_21-14_42_54",
-            "pi_drift_aware_mmd_path" : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_20-10_41_16",
-            "pi_drift_aware_mmd_path_seed_41" : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_05_21-11_15_08",
-            "pi_drift_aware_mmd_path_seed_40" : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_40/pi_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_05_21-10_16_06",
-            "pixel_drift_aware_mmd_path" : "./logs/pixel_deployment_feature_replay_drift_aware_mmd/pixel_deployment_feature_replay_drift_aware_mmd-Proto-2026_05_20-10_41_36",
-            "pixel_drift_aware_mmd_path_seed_41" : "./logs/pixel_deployment_feature_replay_drift_aware_mmd_seed_41/pixel_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_05_21-13_26_30",
-            "pixel_drift_aware_mmd_path_seed_40" : "./logs/pixel_deployment_feature_replay_drift_aware_mmd_seed_40/pixel_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_05_21-10_16_37",
-            "ppg_ecg_gradual_shifts_path" : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts-Proto-2026_05_18-15_38_22",
+            # Experiments over different drift detection mechanisms
+            'drift_aware_mmd_path': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd/personalization_feature_replay_proto_ppg_drift_aware_mmd-Proto-2026_08_06-10_15_20",
+            'drift_aware_mmd_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41-Proto-2026_08_06-10_16_01",
+            'drift_aware_mmd_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40-Proto-2026_08_06-10_15_44",
+            'drift_aware_lsdd_path': "./logs/personalization_feature_replay_proto_ppg_drift_aware_lsdd/personalization_feature_replay_proto_ppg_drift_aware_lsdd-Proto-2026_08_06-10_16_19",
+            'drift_aware_lsdd_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_41/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_41-Proto-2026_08_06-10_17_09",
+            'drift_aware_lsdd_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_40/personalization_feature_replay_proto_ppg_drift_aware_lsdd_seed_40-Proto-2026_08_06-10_17_03",
+            'random_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_random/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_random-Proto-2026_08_07-15_31_15",
+            'random_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_random_seed_41/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_random_seed_41-Proto-2026_08_07-15_37_36",
+            'random_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_random_seed_40/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_random_seed_40-Proto-2026_08_07-15_37_33",
+            'always_on_path': "./logs/personalization_feature_replay_proto_ppg_drift_aware_always_on/personalization_feature_replay_proto_ppg_drift_aware_always_on-Proto-2026_08_06-10_10_45",
+            'always_on_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_41/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_41-Proto-2026_08_06-10_14_49",
+            'always_on_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_40/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_40-Proto-2026_08_06-10_14_26",
+            # Experiments over buffer sizes and model embedding sizes
+            # embed dim 128 and buffer size 64 correspond to baseline MMD compared with Al;ways on, Random and LSDD 
+            'embed_dim_128_buffer_size_64_path': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd/personalization_feature_replay_proto_ppg_drift_aware_mmd-Proto-2026_08_06-10_15_20",
+            'embed_dim_128_buffer_size_64_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41-Proto-2026_08_06-10_16_01",
+            'embed_dim_128_buffer_size_64_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40-Proto-2026_08_06-10_15_44",
+            'embed_dim_128_buffer_size_32_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_drift_aware_mmd-Proto-2026_08_08-18_32_06",
+            'embed_dim_128_buffer_size_32_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_drift_aware_mmd_seed_41-Proto-2026_08_08-12_28_00",
+            'embed_dim_128_buffer_size_32_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_drift_aware_mmd_seed_40-Proto-2026_08_08-12_28_46",
+            'embed_dim_128_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_drift_aware_mmd-Proto-2026_08_08-18_32_27",
+            'embed_dim_128_buffer_size_16_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_drift_aware_mmd_seed_41-Proto-2026_08_08-12_28_11",
+            'embed_dim_128_buffer_size_16_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_drift_aware_mmd_seed_40-Proto-2026_08_08-12_28_57",
+            'embed_dim_32_buffer_size_64_path': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_drift_aware_mmd-Proto-2026_08_07-23_11_14",
+            'embed_dim_32_buffer_size_64_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_drift_aware_mmd_seed_41-Proto-2026_08_07-23_15_14",
+            'embed_dim_32_buffer_size_64_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_drift_aware_mmd_seed_40-Proto-2026_08_07-23_14_43",
+            'embed_dim_32_buffer_size_32_path': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_drift_aware_mmd-Proto-2026_08_08-02_45_33",
+            'embed_dim_32_buffer_size_32_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_drift_aware_mmd_seed_41-Proto-2026_08_08-03_12_29",
+            'embed_dim_32_buffer_size_32_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_drift_aware_mmd_seed_40-Proto-2026_08_08-03_09_43",
+            'embed_dim_32_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_drift_aware_mmd-Proto-2026_08_08-06_31_52",            
+            'embed_dim_32_buffer_size_16_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_drift_aware_mmd_seed_41-Proto-2026_08_08-06_56_55",
+            'embed_dim_32_buffer_size_16_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_drift_aware_mmd_seed_40-Proto-2026_08_08-06_54_33",
+            'embed_dim_16_buffer_size_64_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_drift_aware_mmd-Proto-2026_08_07-23_15_36",
+            'embed_dim_16_buffer_size_64_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_drift_aware_mmd_seed_41-Proto-2026_08_07-23_16_09",
+            'embed_dim_16_buffer_size_64_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_drift_aware_mmd_seed_40-Proto-2026_08_07-23_16_00",
+            'embed_dim_16_buffer_size_32_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_drift_aware_mmd-Proto-2026_08_08-03_00_45",
+            'embed_dim_16_buffer_size_32_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_drift_aware_mmd_seed_41-Proto-2026_08_08-03_05_26",
+            'embed_dim_16_buffer_size_32_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_drift_aware_mmd_seed_40-Proto-2026_08_08-03_03_39",
+            'embed_dim_16_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_drift_aware_mmd-Proto-2026_08_08-06_38_43",            
+            'embed_dim_16_buffer_size_16_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_drift_aware_mmd_seed_41-Proto-2026_08_08-06_40_30",
+            'embed_dim_16_buffer_size_16_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_drift_aware_mmd_seed_40-Proto-2026_08_08-06_36_55",
+            # Experiments over different devices for deployment
+            'pi_always_on_path' : "./logs/pi_deployment_feature_replay_always_on/pi_deployment_feature_replay_always_on-Proto-2026_08_08-13_06_53",
+            'pi_always_on_path_seed_41' : "./logs/pi_deployment_feature_replay_always_on_seed_41/pi_deployment_feature_replay_always_on_seed_41-Proto-2026_08_08-16_08_04",
+            'pi_always_on_path_seed_40' : "./logs/pi_deployment_feature_replay_always_on_seed_40/pi_deployment_feature_replay_always_on_seed_40-Proto-2026_08_08-15_00_41",
+            'pi_drift_aware_mmd_path' : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_08_08-13_59_17",
+            'pi_drift_aware_mmd_path_seed_41' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_08_08-16_31_20",
+            'pi_drift_aware_mmd_path_seed_40' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_40/pi_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_08_08-15_25_03",
+            'pixel_always_on_path' : "./logs/pixel_deployment_feature_replay_always_on/pixel_deployment_feature_replay_always_on-Proto-2026_08_08-13_56_11",
+            'pixel_always_on_path_seed_41' : "./logs/pixel_deployment_feature_replay_always_on_seed_41/pixel_deployment_feature_replay_always_on_seed_41-Proto-2026_08_08-21_31_32",
+            'pixel_always_on_path_seed_40' : "./logs/pixel_deployment_feature_replay_always_on_seed_40/pixel_deployment_feature_replay_always_on_seed_40-Proto-2026_08_08-18_27_07",
+            'pixel_drift_aware_mmd_path' : "./logs/pixel_deployment_feature_replay_drift_aware_mmd/pixel_deployment_feature_replay_drift_aware_mmd-Proto-2026_08_08-17_35_24",
+            'pixel_drift_aware_mmd_path_seed_41' : "./logs/pixel_deployment_feature_replay_drift_aware_mmd_seed_41/pixel_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_08_08-20_39_05",
+            'pixel_drift_aware_mmd_path_seed_40' : "./logs/pixel_deployment_feature_replay_drift_aware_mmd_seed_40/pixel_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_08_08-19_13_20",
         }, 
         'lwf': {
             'gradual_shifts_path': "./logs/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts/personalization_lwf_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-21_34_18",
@@ -1536,56 +2826,116 @@ def analyze_logs_and_plot():
         },
     }
     
+    baselines_ppg_ecg = {
+        # Experiments with ECG (seed 42)
+        'running_mean': {
+            'abrupt_shifts_path': "./logs/personalization_running_mean_proto_ppg_ecg_calibration_size_1_abrupt_shifts/personalization_running_mean_proto_ppg_ecg_calibration_size_1_abrupt_shifts-Proto-2026_08_10-13_19_45",
+            'gradual_shifts_path': "./logs/personalization_running_mean_proto_ppg_ecg_calibration_size_1_gradual_shifts/personalization_running_mean_proto_ppg_ecg_calibration_size_1_gradual_shifts-Proto-2026_08_10-13_49_56",
+            'mixed_shifts_path': "./logs/personalization_running_mean_proto_ppg_ecg_calibration_size_1_mixed_shifts/personalization_running_mean_proto_ppg_ecg_calibration_size_1_mixed_shifts-Proto-2026_08_10-14_14_22",
+        },
+        'feature_replay_ppg': {
+            'gradual_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_gradual_shifts-Proto-2026_05_17-20_41_18",
+            'mixed_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_mixed_shifts-Proto-2026_05_17-23_19_51",
+            'abrupt_shifts_path': "./logs/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts/personalization_feature_replay_proto_ppg_calibration_size_1_abrupt_shifts-Proto-2026_05_17-21_27_56", 
+        },
+        'feature_replay_ppg_ecg': {
+            'abrupt_shifts_path' : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_abrupt_shifts/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_abrupt_shifts-Proto-2026_08_10-13_28_16",
+            'gradual_shifts_path' : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_gradual_shifts-Proto-2026_08_10-13_28_31",
+            'mixed_shifts_path' : "./logs/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_mixed_shifts/personalization_feature_replay_proto_ppg_ecg_calibration_size_1_mixed_shifts-Proto-2026_08_10-13_28_46",
+            # Experiments over different embedding and buffer sizes
+            'embed_dim_128_buffer_size_64_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-13_43_33",
+            'embed_dim_128_buffer_size_32_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_128_buffer_size_32_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-18_10_52",
+            'embed_dim_128_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_128_buffer_size_16_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-19_57_09",
+            'embed_dim_32_buffer_size_64_path': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_32_buffer_size_64_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-13_45_39",
+            'embed_dim_32_buffer_size_32_path': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_32_buffer_size_32_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-18_07_21",
+            'embed_dim_32_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_32_buffer_size_16_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-19_48_24",
+            'embed_dim_16_buffer_size_64_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_64_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-13_45_47",
+            'embed_dim_16_buffer_size_32_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_32_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-17_52_08",
+            'embed_dim_16_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-19_20_11",
+            # Experiments over different devices for deployment
+            'pi_always_on_path' : "./logs/pi_deployment_ppg_ecg_feature_replay_always_on/pi_deployment_ppg_ecg_feature_replay_always_on-Proto-2026_08_11-11_48_05",
+            'pi_drift_aware_mmd_path' : "./logs/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd-Proto-2026_08_11-12_16_26",
+            'pixel_always_on_path' : "./logs/pixel_deployment_ppg_ecg_feature_replay_always_on/pixel_deployment_ppg_ecg_feature_replay_always_on-Proto-2026_08_11-11_49_52",
+            'pixel_drift_aware_mmd_path' : "./logs/pixel_deployment_ppg_ecg_feature_replay_drift_aware_mmd/pixel_deployment_ppg_ecg_feature_replay_drift_aware_mmd-Proto-2026_08_11-13_48_32",            
+        }
+    }
+    
     # -------------------------------------------------
     # Performance Assessment with Clinical & CL Metrics
     # -> all the baselines
     # -------------------------------------------------
-    analyze_gradual_vs_mixed_vs_abrupt(baselines)
-    
+    if not args.ecg:
+        analyze_gradual_vs_mixed_vs_abrupt(baselines_ppg)
+    else:
+        analyze_gradual_vs_mixed_vs_abrupt_ppg_ecg(baselines_ppg_ecg)
+        
     # ---------------------------------------------------------
     # Performance Assessment with Clinical & CL Metrics
     # -> only for feature replay with MMD vs LSDD
     # ---------------------------------------------------------
-    analyze_mmd_vs_lsdd(baselines)
+    if not args.ecg:
+        analyze_drift_detection_methods(baselines_ppg)
     
     # ---------------------------------------------------------
     # Performance Assessment with Clinical & CL Metrics
-    # -> only for feature replay with PPG vs PPG + ECG
+    # -> only for feature replay with MMD but varying model embeddings and buffer sizes
     # ---------------------------------------------------------
-    analyze_ppg_vs_ppg_ecg(baselines)
+    if not args.ecg:
+        analyze_mmd_embeddings_and_buffer_sizes(baselines_ppg)
+    else:
+        analyze_mmd_embeddings_and_buffer_sizes_ppg_ecg(baselines_ppg_ecg)
+    
+    # -----------------------------
+    # Resource Profiling Estimation
+    # -----------------------------
+    # NOTE: change when backbone is decided
+    if not args.ecg:
+        config_file_path_ppg = './checkpoints/proto_ppg_percentile_embed_dim_16_group_layer_norm_kq_4/proto_ppg_percentile_embed_dim_16_group_layer_norm_kq_4-Proto-2026_08_07-20_12_07/proto_ppg_percentile_embed_dim_16_group_layer_norm_kq_4/ckpt/config.yaml'
+        resource_usage_profile_estimation(config_file_path_ppg)
+    else:
+        config_file_path_ppg_ecg = './checkpoints/proto_ppg_ecg_percentile_embed_dim_32_group_layer_norm_kq_4/proto_ppg_ecg_percentile_embed_dim_32_group_layer_norm_kq_4-Proto-2026_08_10-09_46_20/proto_ppg_ecg_percentile_embed_dim_32_group_layer_norm_kq_4/ckpt/config.yaml'
+        resource_usage_profile_estimation(config_file_path_ppg_ecg)
     
     # --------------------------
     # Resource Profiling
     # -> only for feature replay
     # --------------------------
-    
     baseline = 'feature_replay'
     
-    # Laptop Profiling
-    #print("[Log Analysis] Laptop Resource Profiling")
-    #resource_profiling(
-    #    baseline=baseline, 
-    #    baselines=baselines, 
-    #    deployment_device='laptop'
-    #)
-    
     # Pi Profiling
-    print("[Log Analysis] Raspberry Pi Resource Profiling")
-    pi_profile = resource_profiling(
-        baseline=baseline, 
-        baselines=baselines,
-        deployment_device='pi'
-    )
+    print("[Log Analysis] Raspberry Pi Model 5 ~ Resource Profiling")
+    if not args.ecg:
+        pi_profile = resource_profiling(
+            baseline=baseline, 
+            baselines=baselines_ppg,
+            deployment_device='pi'
+        )
+    else:
+        pi_profile_ppg_ecg = resource_profiling_ppg_ecg(
+            baseline=baseline, 
+            baselines=baselines_ppg_ecg,
+            deployment_device='pi'
+        )
     
     # Pixel Profiling
-    print("[Log Analysis] Google Pixel Resource Profiling")
-    pixel_profile = resource_profiling(
-        baseline=baseline, 
-        baselines=baselines,
-        deployment_device='pixel'
-    )
+    print("[Log Analysis] Google Pixel 10a ~ Resource Profiling")
+    if not args.ecg:
+        pixel_profile = resource_profiling(
+            baseline=baseline, 
+            baselines=baselines_ppg,
+            deployment_device='pixel'
+        )
+    else:
+        pixel_profile_ppg_ecg = resource_profiling_ppg_ecg(
+            baseline=baseline, 
+            baselines=baselines_ppg_ecg,
+            deployment_device='pixel'
+        )
     
-    generate_resource_profile_table(pi_profile, pixel_profile)
+    if not args.ecg:
+        generate_resource_profile_table(pi_profile, pixel_profile, config_file_path_ppg)
+    else:
+        generate_resource_profile_table(pi_profile_ppg_ecg, pixel_profile_ppg_ecg, config_file_path_ppg_ecg)
         
     print("[Log Analysis] Results Analysis Completed ✓")
     
@@ -1598,7 +2948,8 @@ def parseargs():
     parser.add_argument('--fig_root', default='', type=str, help='path to figure folder where to store the result analysis outputs')
     parser.add_argument('--exp_fig_root', default='', type=str, help='path to figure folder of each subject analyzed in an experiment (subfolder inside fig_root)')
     parser.add_argument('--exp_pi_deployment_drift_aware_fig_root', default='', type=str, help='deployment on Pi drift-aware experiment folder')
-
+    parser.add_argument('--ecg', action=argparse.BooleanOptionalAction, default=False, help='whether to load only ecg or not')
+        
     return parser.parse_args()
 
 
@@ -1606,7 +2957,7 @@ if __name__ == "__main__":
     args = parseargs()
     
     # Collect metrics from the log file folder
-    analyze_logs_and_plot()
+    analyze_logs_and_plot(args)
     
     
         

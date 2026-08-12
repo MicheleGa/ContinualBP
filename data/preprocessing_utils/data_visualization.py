@@ -1985,12 +1985,19 @@ def plot_drift_calibration_summary(
  
     # Title with metrics
     fmt = lambda v: f"{v:.2f}" if v is not None and not np.isnan(v) else "N/A"
-    ax.set_title(
-        f"ERT={ert}  |  W={window_size}  ||  "
-        f"AE  SBP={fmt(sbp_ae)} mmHg  DBP={fmt(dbp_ae)} mmHg  ||  "
-        f"BWT  SBP={fmt(sbp_bwt)} mmHg  DBP={fmt(dbp_bwt)} mmHg  ",
-        fontsize=10, pad=7,
-    )
+    if ert is not None and window_size is not None:
+        ax.set_title(
+            f"ERT={ert}  |  W={window_size}  ||  "
+            f"AE  SBP={fmt(sbp_ae)} mmHg  DBP={fmt(dbp_ae)} mmHg  ||  "
+            f"BWT  SBP={fmt(sbp_bwt)} mmHg  DBP={fmt(dbp_bwt)} mmHg  ",
+            fontsize=10, pad=7,
+        )
+    else:
+        ax.set_title(
+                    f"AE  SBP={fmt(sbp_ae)} mmHg  DBP={fmt(dbp_ae)} mmHg  ||  "
+                    f"BWT  SBP={fmt(sbp_bwt)} mmHg  DBP={fmt(dbp_bwt)} mmHg  ",
+                    fontsize=10, pad=7,
+                )
  
     ax.grid(True, alpha=0.25, linewidth=0.5)
     plt.tight_layout()

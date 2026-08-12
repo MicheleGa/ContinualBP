@@ -97,10 +97,32 @@ class BPRegressor(nn.Module):
         super().__init__()
         self.regressor = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, input_dim // 2),
             nn.ReLU(),
             nn.Dropout(p=0.25),
-            nn.Linear(64, output_dim),
+            nn.Linear(input_dim // 2, output_dim),
+        )
+    
+    def forward(self, x):
+        if x.dim() != 2:
+            raise ValueError(f"BPRegressor expected input dims 2 [btach dimension, feature dimension], got {list(x.shape)}")
+        return self.regressor(x)
+    
+class DeeperBPRegressor(nn.Module):
+    r"""
+    Source: https://github.com/easyfan327/FewShotBP/blob/main/models/PPGECGNet_V0e2x1b.py
+    """
+    def __init__(self, input_dim, output_dim=3):
+        super().__init__()
+        self.regressor = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(p=0.25),
+            nn.Linear(input_dim // 2, input_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(p=0.25),
+            nn.Linear(input_dim // 4, output_dim),
         )
     
     def forward(self, x):

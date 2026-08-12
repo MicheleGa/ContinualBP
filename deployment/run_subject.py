@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from deployment_maml import MAML
-from deployment_component_factory import BPRegressor, ReservoirReplayBuffer, Model
+from deployment_component_factory import BPRegressor, DeeperBPRegressor, ReservoirReplayBuffer, Model
 from Proto import Proto
 from DriftDetectors import MMDDriftOnline, LSDDDriftOnline
 
@@ -228,6 +228,9 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
             'tm_detector_reinit_kb':        [],
         },
 
+        # Total run time (filled at end of run_subject)
+        'cumulative_latency_s': 0.0,
+
         # Aggregate memory (filled at end of run_subject)
 
         # RSS delta from before model construction to after load_state_dict.
@@ -273,7 +276,7 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
         input_seq_len_s=config['input_seq_len_s'],
         embed_dim=config['embed_dim']
     )
-    prediction_head_pre = BPRegressor(input_dim=2 * config['embed_dim'] if config['ecg'] else config['embed_dim'], output_dim=config['output_dim'])
+    prediction_head_pre = BPRegressor(input_dim=config['embed_dim'], output_dim=config['output_dim']) if not config['ecg'] else DeeperBPRegressor(input_dim=2 * config['embed_dim'], output_dim=config['output_dim'])
     pretrained_learner = Model(encoder_pre, prediction_head_pre)
 
     # N.B. MAML checkpoint saved with learn2learn wrapper (in maml.py script)
@@ -313,7 +316,8 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
     # Important for logging
     step_idx = 0
     
-    # Snapshot RSS immediately before TTA loop 
+    # Snapshot cumulative latency/RSS immediately before TTA loop 
+    t_cumulative_start = time.perf_counter()
     rss_before_tta_mb = _current_rss_mb()
     prof['rss_before_tta_mb'] = rss_before_tta_mb
     peak_tta_rss_mb = rss_before_tta_mb   # updated every step
@@ -550,6 +554,7 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
         step_idx += 1
     
     # Aggregate memory results
+    prof['cumulative_latency_s'] = time.perf_counter() - t_cumulative_start
     prof['peak_tta_rss_mb'] = peak_tta_rss_mb
     prof['peak_incremental_tta_mb'] = peak_tta_rss_mb - rss_before_tta_mb
     prof['peak_process_rss_mb'] = _peak_memory_mb()

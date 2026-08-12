@@ -566,7 +566,7 @@ if __name__ == "__main__":
         num_batches=args.num_batches,
         num_blocks=args.num_blocks
     )
-  
+    
     # Notice that at this point subjects with insufficient runs have been removed
     subject_id = online_physio_dataset.subjects_for_personalization[1] # random.choice(list(online_physio_dataset.index_by_subject_id))
     print(f"Subject selected {subject_id}")

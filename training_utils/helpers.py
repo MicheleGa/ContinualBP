@@ -12,7 +12,7 @@ import random
 import torch
 import torch.nn.functional as F
 from models import BIOT, TCN, Proto, ResGruNet
-from models.component_factory import BPRegressor
+from models.component_factory import BPRegressor, DeeperBPRegressor
 
 
 def parseargs():
@@ -99,7 +99,7 @@ def parseargs():
     parser.add_argument('--eval_steps', default=8, type=int, help='inner steps for meta-learning evaluation')
    
     # Personalization Setup
-    parser.add_argument('--baselines', default=['no_adapt', 'first_batch_finetune', 'online', 'online_from_scratch', 'feature_replay', 'lwf', 'ewc', 'agem'], type=str, nargs='+', help='Baselines to employ for personalization')
+    parser.add_argument('--baselines', default=['no_adapt', 'first_batch_finetune', 'online', 'online_from_scratch', 'feature_replay', 'lwf', 'ewc', 'agem', 'running_mean'], type=str, nargs='+', help='Baselines to employ for personalization')
     parser.add_argument('--pretrained_model_ckpt_path', default=None, type=str, help='checkpoint path to the pretrained model')
     parser.add_argument('--pretraining_feats_stats', default=None, type=str, help='path to the features statistics during pretraining')
     parser.add_argument('--detector_calibration_csv_path', default=None, type=str, help='path to the folder where the calibration results CSV file should be saved')
@@ -111,9 +111,11 @@ def parseargs():
     parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size for personalization')
     parser.add_argument('--num_batches', default=2, type=int, help='required number of batches with timestamp-contiguous windows')
     parser.add_argument('--num_blocks', default=2, type=int, help='required number of blocks with timestamp-contiguous windows per subject')
-    parser.add_argument('--setup_type', default='fixed', type=str, choices=['drift', 'fixed'], help='whether to trigger adaptation after the distribution shift detector or not')
+    parser.add_argument('--setup_type', default='fixed', type=str, choices=['drift', 'fixed', 'random'], help='whether to trigger adaptation after the distribution shift detector or not')
     parser.add_argument('--drift_detector_type', default='mmd', type=str, choices=['mmd', 'lsdd'], help='type of drift detector to use for the drift-aware setup')
     parser.add_argument('--drift_threshold', default=20, type=int, choices=[20, 50, 70, 90, 95], help='Threshold percentile for drift detector (allowed: 20, 50, 80)')
+    parser.add_argument('--mmd_reference_log', default=None, type=str, help='path to the MMD experiment log for the random baseline')
+    parser.add_argument('--random_update_prob', default=0.735, type=float, help='probability of performing a random update')
     parser.add_argument('--replay_buffer_size', default=64, type=int, help='maximum size of the feature replay buffer')
     parser.add_argument('--replay_batch_size', default=16, type=int, help='batch size for feature replay')
     parser.add_argument('--lwf_lambda', default=0.01, type=float, help='lambda for LwF distillation loss')
@@ -379,9 +381,10 @@ def get_prediction_head_architecture(config):
         model (torch.nn.Module): 
             The model prediction head architecture initialized with the given configuration.   
     """
-    
-    return BPRegressor(input_dim=2 * config['embed_dim'] if config['ecg'] else config['embed_dim'], output_dim=config['output_dim'])
-
+    if not config['ecg']:
+        return BPRegressor(input_dim=config['embed_dim'], output_dim=config['output_dim'])
+    else:
+        return DeeperBPRegressor(input_dim=2 * config['embed_dim'], output_dim=config['output_dim'])
     
 def get_meta_lr(epoch, config):
     r"""

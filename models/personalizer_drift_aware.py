@@ -1,0 +1,820 @@
+import os
+import sys
+folders_to_add = ['data', 'models', 'training_utils']
+for folder in folders_to_add:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), folder)))
+import copy
+import json
+import time
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+from models.maml import MAML
+from models.DriftDetectors import MMDDriftOnline, LSDDDriftOnline
+from component_factory import ReservoirReplayBuffer, Model
+from training_utils.helpers import get_encoder_architecture, get_prediction_head_architecture, build_inner_optimizer
+from training_utils.metrics import call_metric, compute_transfer_metrics_from_matrix
+from data.online_dataset import OnlineSubjectDataset
+from data.online_dataset_aurora import AuroraOnlineSubjectDataset
+from data.preprocessing_utils.data_visualization import (
+    plot_blockwise_mae, plot_subject_annotation_blocks, plot_aurora_subject_annotation_blocks, 
+    plot_update_summary_table, plot_param_updates, plot_drift_calibration_summary
+)
+
+def eval_model_on_sample_set(encoder, prediction_head, dataset, sample_list, device, config):
+    r"""
+    Evaluates the model on a specific set of subject run samples, calculating Mean Absolute 
+    Error (MAE) and standard deviation for SBP and DBP.
+    
+    Parameters
+    ------------
+    encoder (torch.nn.Module): 
+        The feature extraction network.
+        
+    prediction_head (torch.nn.Module): 
+        The regression head that maps features to blood pressure values.
+        
+    dataset (PhysioDataset): 
+        The dataset instance used to retrieve signals and targets via indices.
+        
+    sample_list (list): 
+        A list of sample indices (IDs) representing the specific set of samples to evaluate.
+        
+    device (torch.device): 
+        The computational device (CPU or CUDA) for tensor operations.
+        
+    config (dict): 
+        Configuration dictionary containing batch size and block split settings.
+        
+    Returns
+    ------------
+    output param 1:
+        SBP Mean Absolute Error (float).
+        
+    output param 2:
+        SBP Error Standard Deviation (float).
+        
+    output param 3:
+        DBP Mean Absolute Error (float).
+        
+    output param 4:
+        DBP Error Standard Deviation (float).
+        
+    output param 5:
+        Predicted SBP and DBP values as a numpy array of shape (N, 2).
+        
+    output param 6:
+        Ground truth SBP and DBP values as a numpy array of shape (N, 2).   
+    """
+
+    SBP_IDX = 0
+    DBP_IDX = 1
+    B = config['personalization_batch_size']
+    all_outputs = []
+    all_targets = []
+
+    encoder.eval()
+    prediction_head.eval()
+    with torch.no_grad():
+        for eval_idx in range(0, len(sample_list), B):
+            batch_ids = sample_list[eval_idx:eval_idx + B]
+            batch = [dataset.__getitem__(sid) for sid in batch_ids]
+
+            signals = torch.stack([s for s, _, _ in batch]).to(device)
+            targets = torch.stack([t for _, t, _ in batch]).to(device)
+
+            outputs = prediction_head(encoder(signals))
+
+            all_outputs.append(outputs.detach().cpu())
+            all_targets.append(targets.detach().cpu())
+
+    if len(all_outputs) == 0:
+        return None, None, None, None, None, None
+
+    all_outputs = torch.cat(all_outputs, dim=0).numpy()
+    all_targets = torch.cat(all_targets, dim=0).numpy()
+
+    # Select SBP & DBP only
+    outputs_sbp_dbp = all_outputs[:, [SBP_IDX, DBP_IDX]]
+    targets_sbp_dbp = all_targets[:, [SBP_IDX, DBP_IDX]]
+
+    # Absolute errors
+    abs_err = np.abs(outputs_sbp_dbp - targets_sbp_dbp)
+
+    sbp_err = abs_err[:, SBP_IDX]
+    dbp_err = abs_err[:, DBP_IDX]
+
+    sbp_mae = float(np.mean(sbp_err))
+    sbp_std = float(np.std(sbp_err))
+
+    dbp_mae = float(np.mean(dbp_err))
+    dbp_std = float(np.std(dbp_err))
+
+    return (
+        sbp_mae, sbp_std,
+        dbp_mae, dbp_std,
+        outputs_sbp_dbp,
+        targets_sbp_dbp
+    )
+    
+        
+def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, device, config):
+    r"""
+    Executes the 'Feature Replay' personalization CL algorithm that mitigates catastrophic 
+    forgetting by storing previously seen latent features in a reservoir buffer and 
+    interleaving them with current data during adaptation.
+    
+    Parameters
+    ------------
+    baseline (str): 
+        Identifier string for the specific baseline experiment (e.g., 'feature_replay').
+        
+    dataset (PhysioDataset): 
+        The dataset instance providing subject-specific physiology signals and blood pressure labels.
+        
+    subject_id (int/str): 
+        The unique identifier for the subject being personalized.
+        
+    figs_subj_dir (str): 
+        The root directory for saving subject-specific visualization plots.
+    
+    logs_subj_dir (str:)
+        The root directory for saving subject-specific logs and CSVs.
+        
+    device (torch.device): 
+        The computational device (CPU/CUDA) used for model training and inference.
+        
+    config (dict): 
+        Configuration dictionary containing hyperparameters such as 'replay_buffer_size' and learning rates.
+        
+    Returns
+    ------------
+    output param 1:
+        A dictionary containing lists of SBP/DBP MAE and standard deviations calculated per block.
+        
+    output param 2:
+        A tuple of concatenated (predictions, targets) as numpy arrays for the entire run.
+        
+    output param 3:
+        A dictionary of SBP Continual Learning metrics (Average Accuracy, Backward Transfer).
+        
+    output param 4:
+        A dictionary of DBP Continual Learning metrics (Average Accuracy, Backward Transfer).   
+    """
+    # ---- INITIALIZATION ----
+    figs_baseline_path = os.path.join(figs_subj_dir, baseline)
+    os.makedirs(figs_baseline_path, exist_ok=True)
+    
+    logs_baseline_path = os.path.join(logs_subj_dir, baseline)
+    os.makedirs(logs_baseline_path, exist_ok=True)
+    
+    # Set stream kwargs based on the dataset and optionally
+    # plot subject blocks and SBP/DBP/MAP drifts
+    stream_kwargs = dict(
+        subject_id=subject_id,
+        batch_size=config['personalization_batch_size'],
+        num_batches=config['num_batches'],
+        num_blocks=config['num_blocks']
+    )
+    
+    if config['plot_personalization']:    
+        blocks = dataset.get_subject_blocks(**stream_kwargs)
+        if 'aurora' in config['dataset_name'].lower():
+            plot_aurora_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        
+        elif 'vital_db' in config['dataset_name'].lower():
+            plot_subject_annotation_blocks(dataset, subject_id, blocks, savepath=os.path.join(figs_baseline_path, f"subject_{subject_id}_annotation_blocks.png"), show_bp_plot=True)
+        else:
+            raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
+        
+    # Initialize pretrained learner (will be loaded from ckpt)
+    encoder_pre = get_encoder_architecture(config)
+    prediction_head_pre = get_prediction_head_architecture(config)
+    pretrained_learner = Model(encoder_pre, prediction_head_pre)
+
+    # N.B. MAML checkpoint saved with learn2learn wrapper (in maml.py script)
+    # thereby MAML init must match that of the pretrainer.py script
+    pretrained_learner = MAML(
+        pretrained_learner,
+        lr=config['inner_lr'],
+        first_order=True,
+        anil=(config['inner_adapt'] == 'head')
+    )
+
+    ckpt = torch.load(config['pretrained_model_ckpt_path'], weights_only=False)
+    pretrained_learner.load_state_dict(ckpt['learner_state_dict'])
+    pretrained_learner = pretrained_learner.to(device)
+    pretrained_learner.eval()
+    print(f"[Personalization] MAML Learner pre-trained ckpt loaded ✓")
+
+    # To device
+    enc, ph = pretrained_learner.encoder.to(device), pretrained_learner.prediction_head.to(device)
+
+    # Feature replay buffer
+    replay_buffer = ReservoirReplayBuffer(seed=config['seed'], max_size=config['replay_buffer_size'])
+    
+    # Prepare data structures for evaluation  w/ online TTA
+    
+    # Track past batches for AE/BWT metrics
+    # -> only during Online TTA
+    past_batches = []
+    
+    # AE/BWT data structures
+    T = config['num_batches'] * config['num_blocks'] 
+    sbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
+    dbp_errors_matrix = np.full((T, T), np.nan, dtype=float)
+    baseline_block_sbp_mae = []
+    baseline_block_sbp_std = []
+    baseline_block_dbp_mae = []
+    baseline_block_dbp_std = []
+    baseline_outputs = []
+    baseline_targets = []
+
+    # Track updates per baseline
+    param_update_log = []
+    total_params = sum(p.numel() for p in Model(enc, ph).parameters())
+    
+    # Track targets per baseline, to do drfit analysis after perosnalization
+    targets_log = []
+    predictions_log = []
+    
+    # Drift detector placeholders
+    drift_detector = None
+    detector_initialized = False
+    detection_timesteps = []
+    
+    # Random baseline data structures
+    
+    # NOTE: random baseline requires MMD to run first to get the number of udpates per subject
+    if config['setup_type'] == 'random':
+        subject_reference_log = os.path.join(
+            config["mmd_reference_log"],
+            f"subject_{subject_id}",
+            baseline,
+            "param_update_log.csv",
+        )
+        df = pd.read_csv(subject_reference_log)
+
+        mmd_update_steps = df.loc[
+            df["n_updated_params"] > 0,
+            "step_idx"
+        ].to_numpy()
+        K = len(mmd_update_steps)
+        
+        rng = np.random.default_rng(config["seed"] + int(subject_id[1:]))
+        random_update_steps = set(
+            rng.choice(T, size=K, replace=False)
+        )
+        
+    # Important for logging
+    step_idx = 0
+    feature_replay_start_time = time.perf_counter()
+    
+    # ---- PERSONALIZATION ----
+    for batch_info in dataset.get_subject_blocks(**stream_kwargs):
+        
+        # ONLINE TEST-TIME ADAPTATION EVALUATION 
+        
+        # ---------- Evaluate before adaptation ----------
+        # -> ensure the system always produce an output given the stream of data
+        # -> follow test-time-adaptation evaluation
+        sample_ids = batch_info["sample_ids"]
+
+        # Evaluate on CURRENT batch (before adaptation)
+        sbp_mae_before, sbp_std_before, dbp_mae_before, dbp_std_before, outs_before, tgts_before = eval_model_on_sample_set(
+                enc, ph, dataset,
+                sample_ids,   
+                device,
+                config
+            )
+
+        baseline_block_sbp_mae.append(sbp_mae_before)
+        baseline_block_sbp_std.append(sbp_std_before)
+        baseline_block_dbp_mae.append(dbp_mae_before)
+        baseline_block_dbp_std.append(dbp_std_before)
+
+        # Log targets/predictions for AE/BWT
+        baseline_outputs.append(outs_before)
+        baseline_targets.append(tgts_before)
+        
+        # Log targets/predictions for drift analysis
+        targets_log.append({
+            "step_idx": step_idx,
+            "sbp_values": tgts_before[:, 0].tolist(),
+            "dbp_values": tgts_before[:, 1].tolist(),
+        })
+        predictions_log.append({
+            "step_idx": step_idx,
+            "sbp_values": outs_before[:, 0].tolist(),
+            "dbp_values": outs_before[:, 1].tolist(),
+        })
+            
+        # ----- Feature drift tracking -----
+        sample_batch = [dataset.__getitem__(sid) for sid in sample_ids]
+
+        signals = torch.stack([x for x, _, _ in sample_batch]).to(device)
+        targets = torch.stack([y for _, y, _ in sample_batch]).to(device)
+        
+        # Extract features with the frozen encoder
+        with torch.no_grad():
+            features = enc(signals) 
+        
+        # ---------- Decide adaptation ----------
+        do_adapt = False
+
+        if config['setup_type'] == 'fixed':
+            do_adapt = True
+
+        elif config['setup_type'] == 'drift':
+            # NOTE: Before the detector is initialized, always adapt.
+            if not detector_initialized:
+                do_adapt = True
+            else:
+                # Use drift detector to decide
+                for i in range(features.shape[0]):
+                    detection_report = drift_detector.predict(features[i].cpu().numpy())
+                    drift_flag = detection_report["data"]["is_drift"]
+                    
+                    if drift_detector.t >= config['detector_window_size']:
+                        if drift_flag == 1:
+                            global_window_idx = step_idx * config['personalization_batch_size'] + i
+                            detection_timesteps.append(global_window_idx)
+                            do_adapt = True
+        
+        elif config['setup_type'] == 'random':
+            do_adapt = step_idx in random_update_steps
+            if do_adapt:
+                global_window_idx = (step_idx * config["personalization_batch_size"])
+                detection_timesteps.append(global_window_idx)
+                
+        else:
+            raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
+
+        if do_adapt:
+            # ---------- Adaptation (head only) ----------
+            
+            # Use features and targets for adaptation
+            train_features = features
+            train_targets = targets
+            
+            # Optimizer
+            opt = build_inner_optimizer(
+                adapted_encoder=enc, 
+                adapted_head=ph, 
+                base_lr=config['personalization_lr'], 
+                mode='head', # only head is updated during online TTA
+                opt_type=config['inner_opt'].lower(), 
+                config=config
+            )
+            
+            # Encoder params for logging
+            n_updated = sum(p.numel() for group in opt.param_groups for p in group['params'])
+            total_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in ph.parameters())
+                
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head',
+                "n_updated_params": n_updated,
+                "total_params": total_params,
+                "fraction_updated": n_updated / total_params
+            })
+
+            # Loss Function
+            criterion = (
+                F.smooth_l1_loss
+                if config["criterion"] == "SmoothL1Loss"
+                else F.mse_loss
+            )
+            
+            # Training data/labels are already prepared for the current batch
+            for step in range(config["personalization_steps"]):
+                
+                # Train prediction head
+                ph.train()
+                
+                # Reservoir sampling for feature replay, same size as train features
+                replay_feats, replay_tgts = replay_buffer.sample(train_features.shape[0])
+                    
+                # Replayed feats can be none on the first update as there are no previous features to replay
+                if replay_feats is not None:
+                    replay_feats = replay_feats.to(device).detach()
+                    replay_tgts = replay_tgts.to(device)
+                    feats = torch.cat([train_features, replay_feats], dim=0)
+                    tgts = torch.cat([train_targets, replay_tgts], dim=0)
+                else:
+                    feats, tgts = train_features, train_targets
+                
+                out = ph(feats)
+                loss = criterion(out, tgts)
+                
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                train_loss = loss.item()
+                
+            # Set to eval mode after adaptation
+            ph.eval()
+        
+        else:
+            # No adaptation this step
+            param_update_log.append({
+                "step_idx": step_idx,
+                "update_mode": 'head',
+                "n_updated_params": 0,
+                "total_params": total_params,
+                "fraction_updated": 0.0
+            })
+        
+        # Always update the replay buffer to maintain a diverse feature set
+        # -> otherwise the buffer will be filled up without features before the drift 
+        with torch.no_grad():
+            replay_buffer.add(features.detach().cpu(), targets.detach().cpu())
+            
+        # Detector init/re-init when buffer has enough samples for the reference set
+        if config['setup_type'] == 'drift':
+            if len(replay_buffer) >= config['calibration_phase_size'] and (not detector_initialized or do_adapt):
+                reference_data = torch.stack(replay_buffer.features).numpy().copy()
+
+                if config['drift_detector_type'] == 'mmd':
+                    drift_detector = MMDDriftOnline(
+                        x_ref=reference_data,
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                elif config['drift_detector_type'] == 'lsdd':
+                    drift_detector = LSDDDriftOnline(
+                        x_ref=reference_data,
+                        ert=config['detector_ert'],
+                        window_size=config['detector_window_size'],
+                        n_bootstraps=config['detector_n_bootstraps'],
+                        backend='pytorch',
+                        verbose=False
+                    )
+                else:
+                    raise ValueError('Inexistent drift detector type, allowed is mmd or lsdd!')
+
+                if not detector_initialized:
+                    detector_initialized = True
+                    print(f"[Personalization] Detector initialized with {reference_data.shape[0]} samples ✓")
+                else:
+                    print(f"[Personalization] Detector re-initialized with {reference_data.shape[0]} samples ✓")  
+        
+        # Add sample ids for AE/BWT
+        past_batches.append(sample_ids)
+        
+        # ---------- Evaluate on ALL PREVIOUS batches (for BWT/AE) ----------
+        for idx, past_ids in enumerate(past_batches):
+
+            sbp_mae_i, sbp_std_i, dbp_mae_i, dbp_std_i, outs_i, tgts_i = eval_model_on_sample_set(
+                    enc, ph, dataset,
+                    past_ids,  
+                    device,
+                    config
+                )
+
+            sbp_errors_matrix[step_idx, idx] = sbp_mae_i
+            dbp_errors_matrix[step_idx, idx] = dbp_mae_i
+        
+        # Increment step idx for the next block
+        step_idx += 1
+        
+    # Record run time end
+    total_subject_run_time = time.perf_counter() - feature_replay_start_time
+                    
+    # ---- AGGREGATED METRICS & LOGGING ----
+    # Compute CL metrics (AE, BWT)
+    sbp_baseline_metrics = compute_transfer_metrics_from_matrix(sbp_errors_matrix)
+    dbp_baseline_metrics = compute_transfer_metrics_from_matrix(dbp_errors_matrix)
+    
+    # Save error matrices as CSV
+    sbp_df_err = pd.DataFrame(sbp_errors_matrix)
+    sbp_df_err.to_csv(os.path.join(logs_baseline_path, "sbp_error_matrix.csv"), index=False)
+    dbp_df_err = pd.DataFrame(dbp_errors_matrix)
+    dbp_df_err.to_csv(os.path.join(logs_baseline_path, "dbp_error_matrix.csv"), index=False)
+        
+    print(f"[Personalization] Saved error matrices for subject {subject_id}, baseline {baseline} ✓")
+
+    # Prepare per-block stats
+    per_block_stats = {
+        'sbp_mae': baseline_block_sbp_mae, 'sbp_std': baseline_block_sbp_std,
+        'dbp_mae': baseline_block_dbp_mae, 'dbp_std': baseline_block_dbp_std,
+    }
+
+    # Prepare concatenated outputs/targets
+    outs_and_tgts = {}
+    if len(baseline_outputs) > 0:
+        outs_and_tgts = (
+            np.concatenate([o for o in baseline_outputs if o is not None], axis=0),
+            np.concatenate([t for t in baseline_targets if t is not None], axis=0)
+        )
+    else:
+        outs_and_tgts = (np.empty((0,)), np.empty((0,)))
+                
+    # Save update logs per baseline
+    df_updates = pd.DataFrame(param_update_log)
+    
+    log_csv_path = os.path.join(logs_baseline_path, "param_update_log.csv")
+    df_updates.to_csv(log_csv_path, index=False)
+    
+    plot_path = os.path.join(figs_baseline_path, "param_updates.png")
+    plot_param_updates(df_updates, subject_id, plot_path)
+    
+    # Save targets/predictions log per baseline
+    log_json_path = os.path.join(logs_baseline_path, "targets_log.json")
+    with open(log_json_path, "w") as f:
+        json.dump(targets_log, f)
+    
+    log_json_path = os.path.join(logs_baseline_path, "predictions_log.json")
+    with open(log_json_path, "w") as f:
+        json.dump(predictions_log, f)
+
+    if config['setup_type'] == 'drift' or config['setup_type'] == 'random':    
+        
+        if config['setup_type'] == 'drift':
+            print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {step_idx * config['personalization_batch_size']} steps with drift detection after calibration ✓")
+        else:
+            print(f"[Personalization] Total detections with random updates: {len(detection_timesteps)} out of {step_idx * config['personalization_batch_size']} steps with random detection after calibration ✓")
+
+        # Calibration summary plot
+        sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
+        dbp_ae, dbp_bwt = dbp_baseline_metrics['AE'], dbp_baseline_metrics['BWT']
+        
+        if config['setup_type'] == 'drift':
+            plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
+        else:
+            plot_fname = f"random{config['random_update_prob']}_detector_summary.png"
+        plot_path  = os.path.join(figs_baseline_path, plot_fname)
+    
+        plot_drift_calibration_summary(
+            targets_log=targets_log,
+            predictions_log=predictions_log,
+            detection_timesteps=detection_timesteps,
+            calibration_phase_size=config['calibration_phase_size'],
+            batch_size=config['personalization_batch_size'],
+            ert=config['detector_ert'] if config['setup_type'] == 'drift' else None,
+            window_size=config['detector_window_size'] if config['setup_type'] == 'drift' else None,
+            sbp_ae=sbp_ae,
+            dbp_ae=dbp_ae,
+            sbp_bwt=sbp_bwt,
+            dbp_bwt=dbp_bwt,
+            save_path=plot_path,
+        )
+            
+    return per_block_stats, outs_and_tgts, sbp_baseline_metrics, dbp_baseline_metrics, total_subject_run_time
+
+
+def personalization_drift_aware(config, device):
+    r"""
+    Orchestrates the personalization and continual learning evaluation of blood pressure 
+    estimation models. This function initializes datasets, loads a meta-pretrained model 
+    (MAML), and evaluates multiple adaptation baselines across a stream of subject data.
+
+    The function handles the full lifecycle of personalization:
+    1.  **Initialization**: Sets up fresh and meta-trained learners.
+    2.  **Drift Analysis**: Establishes thresholds for relative Blood Pressure drift.
+    3.  **Cross-Subject Iteration**: For each subject, it runs several baselines (No Adapt, 
+        Online, EWC, LwF, AGEM, etc.).
+    4.  **Logging & Visualization**: Generates block-wise MAE plots, update summaries, 
+        and Bland-Altman/AAMI performance metrics.
+    5.  **Aggregation**: Computes Average Accuracy (AA) and Backward Transfer (BWT) across 
+        the entire subject cohort.
+
+    Parameters
+    ------------
+    tensorboard_path (str): 
+        Path to save TensorBoard log files for monitoring training and validation loss.
+        
+    config (dict): 
+        Global configuration containing hyperparameters, paths, and model specifications.
+        Required keys include 'inner_adapt', 'pretrained_model_ckpt_path', and 'baselines'.
+        
+    device (torch.device): 
+        Hardware accelerator (CPU/CUDA) to be used for model adaptation and inference.
+
+    Returns
+    ------------
+    This function does not return values but writes CSV logs, metrics, and visualization 
+    plots to the directory specified in `config['figure_path']`.
+    """
+    ## --- Personalization ---
+
+    # Initialize dataset
+    if 'aurora' in config['dataset_name'].lower():
+        online_physio_dataset = AuroraOnlineSubjectDataset(
+            seed=config['seed'],
+            lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            ecg=config['ecg'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        )
+    elif 'vital_db' in config['dataset_name'].lower():
+        online_physio_dataset = OnlineSubjectDataset(
+            seed=config['seed'],
+            lmdb_folder=os.path.join(config['dataset_folder'], config['dataset_name']),
+            fs=config['fs'],
+            input_seq_len_s=config['input_seq_len_s'],
+            ecg=config['ecg'],
+            batch_size=config['personalization_batch_size'],
+            num_batches=config['num_batches'],
+            num_blocks=config['num_blocks']
+        )
+    else:
+        raise ValueError(f"Dataset {config['dataset_name']} not recognized for personalization!")
+    
+    # Get test subjects
+    personalization_subjects = online_physio_dataset.subjects_for_personalization
+
+    # Baseline code source: https://github.com/GMvandeVen/continual-learning
+    # -> if config['model_name'] == 'BIOT' or config['model_name'] == 'ResGruNet' or config['model_name'] == 'TCN':
+    # USe a reduced set of baselines to avoid long runtimes (set this from argparse)
+    baselines = config['baselines']
+    
+    if 'feature_replay' not in baselines:
+        raise ValueError("The 'feature_replay' baseline must be included in the baselines list for personalization.")
+    if len(baselines) > 1:
+        raise ValueError("Currently, only the 'feature_replay' baseline is supported for personalization. Please set baselines=['feature_replay'] in the configuration.")
+    
+    # Include the new baseline key here as well so aggregation handles it
+    global_outs_and_tgts = {
+        b: [] for b in baselines 
+    }
+    
+    # Create aggregate directory
+    figs_agg_dir = os.path.join(config['figure_path'], 'aggregate_metrics')
+    if not os.path.exists(figs_agg_dir):
+        os.makedirs(figs_agg_dir)
+    
+    logs_agg_dir = os.path.join(config['logs_path'], 'aggregate_metrics')
+    if not os.path.exists(logs_agg_dir):
+        os.makedirs(logs_agg_dir)
+    
+    if config['setup_type'] == 'drift':
+        print(f"[Personalization] Personalization performed with feature-based drift detection")
+    
+    if config['setup_type'] == 'random':
+        print(f"[Personalization] Personalization performed with randomly-scheduled updates (with probability {config['random_update_prob']})")
+    
+    # Record cumulative run time for all subjects
+    # note that this scripts may be run in parallel with other tasks (in the laptop) and may not reflect the actual latency of the personalization
+    t_cumulative = {}
+    
+    for subject_counter, subject_id in enumerate(personalization_subjects):
+        print(f"[Personalization] {subject_counter + 1}/{len(personalization_subjects)} personalizing model on subject {subject_id}")
+        
+        figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}")
+        os.makedirs(figs_subj_dir, exist_ok=True)
+        
+        logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}")
+        os.makedirs(logs_subj_dir, exist_ok=True)
+        
+        sbp_baseline_metrics = {}
+        dbp_baseline_metrics = {}
+        per_block_stats = {}
+        outs_and_tgts = {}
+        
+        # Personalize each different baseline
+        for b in baselines:
+            print(f"[Personalization] Personalizing baseline {b} on subject {subject_id}")
+
+            baseline_per_block_stats, baseline_outs_and_tgts, baseline_sbp_baseline_metrics, baseline_dbp_baseline_metrics, total_subject_run_time = personalize_feature_replay(
+                baseline=b, 
+                dataset=online_physio_dataset, 
+                subject_id=subject_id, 
+                figs_subj_dir=figs_subj_dir,
+                logs_subj_dir=logs_subj_dir,
+                device=device, 
+                config=config
+            )
+            t_cumulative[subject_id] = total_subject_run_time
+            
+            # Collect results
+            sbp_baseline_metrics[b] = baseline_sbp_baseline_metrics
+            dbp_baseline_metrics[b] = baseline_dbp_baseline_metrics
+            per_block_stats[b] = baseline_per_block_stats
+            outs_and_tgts[b] = baseline_outs_and_tgts
+        
+        if outs_and_tgts is None:
+            raise ValueError("Outputs and targets for a subject cannot be None ...")
+
+        # --- Save baseline_metrics as CSV (AE and BWT per baseline) ---
+        sbp_df_metrics = pd.DataFrame.from_dict(sbp_baseline_metrics, orient='index')
+        sbp_csv_path = os.path.join(logs_subj_dir, f'subject_{subject_id}_sbp_baseline_metrics.csv')
+        sbp_df_metrics.to_csv(sbp_csv_path, index=True)
+        dbp_df_metrics = pd.DataFrame.from_dict(dbp_baseline_metrics, orient='index')
+        dbp_csv_path = os.path.join(logs_subj_dir, f'subject_{subject_id}_dbp_baseline_metrics.csv')
+        dbp_df_metrics.to_csv(dbp_csv_path, index=True)
+        print(f"[Personalization] Saved SBP/DBP baseline metrics CSV to {sbp_csv_path} ✓")
+
+        # Plot and save MAE per block using the standalone function
+        plot_blockwise_mae(per_block_stats=per_block_stats, subject_id=subject_id, index_to_plot='sbp', savepath=os.path.join(figs_subj_dir, f'subject_{subject_id}_sbp_blockwise_mae.png'))
+        plot_blockwise_mae(per_block_stats=per_block_stats, subject_id=subject_id, index_to_plot='dbp', savepath=os.path.join(figs_subj_dir, f'subject_{subject_id}_dbp_blockwise_mae.png'))
+
+        # ---- Call metric plots for each baseline ----
+        for b, (outs, tgts) in outs_and_tgts.items():
+            if outs.shape[0] > 0:
+                print(f"[Personalization] {subject_counter + 1}/{len(personalization_subjects)} Results for {subject_id} with baseline {b}")
+                call_metric(tgts, outs, config, figure_savepath=os.path.join(figs_subj_dir, b), log_savepath=os.path.join(logs_subj_dir, b), plot=True)
+                # append to global for aggregated metrics later
+                if b in global_outs_and_tgts:
+                    global_outs_and_tgts[b].append((outs, tgts))
+
+        # --- Extract and plot number of updates per baseline ---
+        # Using only SBP as DBP is the same
+        updates_per_baseline = {}
+        for b in baselines:
+            updates_log = pd.read_csv(os.path.join(logs_subj_dir, b, 'param_update_log.csv'))
+            updates_per_baseline[b] = (updates_log['n_updated_params'] > 0).sum()
+        update_fig_path = os.path.join(figs_subj_dir, f"subject_{subject_id}_update_summary.png")
+        plot_update_summary_table(updates_per_baseline, update_fig_path)
+        print(f"[Personalization] Saved update summary figure for subject {subject_id} ✓")
+
+        print(f"[Personalization] Personalization on {subject_counter + 1}/{len(personalization_subjects)} subject completed ✓")
+
+        if config['num_personalization_subjects'] > 0 and subject_counter > config['num_personalization_subjects']:
+            break
+    
+    # ---- Save cumulative run time for all subjects ---
+    run_time_csv_path = os.path.join(logs_agg_dir, 'personalization_cumulative_run_time.csv')
+    df_run_time = pd.DataFrame.from_dict(t_cumulative, orient='index', columns=['run_time_seconds'])
+    df_run_time.to_csv(run_time_csv_path, index=True)
+    print(f"[Personalization] Saved cumulative run time for all subjects to {run_time_csv_path} ✓")
+    
+    # ---- Aggregate AE and BWT across subjects ----
+    all_metrics_sbp = {b: {"AE": [], "BWT": []} for b in global_outs_and_tgts.keys()}
+    for subject_id in personalization_subjects:
+        subj_csv = os.path.join(config['logs_path'], f"subject_{subject_id}", f"subject_{subject_id}_sbp_baseline_metrics.csv")
+        if os.path.exists(subj_csv):
+            df = pd.read_csv(subj_csv, index_col=0)
+            for b in df.index:
+                if "AE" in df.columns and not pd.isna(df.loc[b, "AE"]):
+                    all_metrics_sbp[b]["AE"].append(df.loc[b, "AE"])
+                if "BWT" in df.columns and not pd.isna(df.loc[b, "BWT"]):
+                    all_metrics_sbp[b]["BWT"].append(df.loc[b, "BWT"])
+                    
+    all_metrics_dbp = {b: {"AE": [], "BWT": []} for b in global_outs_and_tgts.keys()}
+    for subject_id in personalization_subjects:
+        subj_csv = os.path.join(config['logs_path'], f"subject_{subject_id}", f"subject_{subject_id}_dbp_baseline_metrics.csv")
+        if os.path.exists(subj_csv):
+            df = pd.read_csv(subj_csv, index_col=0)
+            for b in df.index:
+                if "AE" in df.columns and not pd.isna(df.loc[b, "AE"]):
+                    all_metrics_dbp[b]["AE"].append(df.loc[b, "AE"])
+                if "BWT" in df.columns and not pd.isna(df.loc[b, "BWT"]):
+                    all_metrics_dbp[b]["BWT"].append(df.loc[b, "BWT"])
+                    
+    # Compute mean/std across subjects for each baseline
+    sbp_agg_rows = []
+    for b, vals in all_metrics_sbp.items():
+        if len(vals["AE"]) > 0:
+            ae_mean, ae_std = np.mean(vals["AE"]), np.std(vals["AE"])
+            bwt_mean, bwt_std = np.mean(vals["BWT"]), np.std(vals["BWT"])
+            sbp_agg_rows.append({"Baseline": b, "AE_mean": ae_mean, "AE_std": ae_std,
+                             "BWT_mean": bwt_mean, "BWT_std": bwt_std})
+            print(f'[Personalization] Aggregated personalization results (AE/BWT) for SBP with baseline {b}')
+            print(f'\t- AE: {ae_mean:.4f} ± {ae_std:.4f}')
+            print(f'\t- BWT: {bwt_mean:.4f} ± {bwt_std:.4f}')
+
+    sbp_df_agg = pd.DataFrame(sbp_agg_rows)
+    sbp_agg_csv_path = os.path.join(logs_agg_dir, 'sbp_aggregate_baseline_metrics.csv')
+    sbp_df_agg.to_csv(sbp_agg_csv_path, index=False)
+    
+    dbp_agg_rows = []
+    for b, vals in all_metrics_dbp.items():
+        if len(vals["AE"]) > 0:
+            ae_mean, ae_std = np.mean(vals["AE"]), np.std(vals["AE"])
+            bwt_mean, bwt_std = np.mean(vals["BWT"]), np.std(vals["BWT"])
+            dbp_agg_rows.append({"Baseline": b, "AE_mean": ae_mean, "AE_std": ae_std,
+                             "BWT_mean": bwt_mean, "BWT_std": bwt_std})
+            print(f'[Personalization] Aggregated personalization results (AE/BWT) for DBP with baseline {b}')
+            print(f'\t- AE: {ae_mean:.4f} ± {ae_std:.4f}')
+            print(f'\t- BWT: {bwt_mean:.4f} ± {bwt_std:.4f}')
+
+    dbp_df_agg = pd.DataFrame(dbp_agg_rows)
+    dbp_agg_csv_path = os.path.join(logs_agg_dir, 'dbp_aggregate_baseline_metrics.csv')
+    dbp_df_agg.to_csv(dbp_agg_csv_path, index=False)
+
+    # ---- Aggregate call_metric across subjects ----
+    for b, data_list in global_outs_and_tgts.items():
+        if len(data_list) > 0:
+            print(f'[Personalization] Aggregated personalization results (BHS/AAMI/Bland-Altman/R²) for the baseline {b}')
+            all_outs = np.concatenate([o for o, _ in data_list], axis=0)
+            all_tgts = np.concatenate([t for _, t in data_list], axis=0)
+            
+            aggregated_metric_fig_path = os.path.join(figs_agg_dir, f"aggregate_{b}_metrics")
+            os.makedirs(aggregated_metric_fig_path, exist_ok=True)
+            aggregated_metric_log_path = os.path.join(logs_agg_dir, f"aggregate_{b}_metrics")
+            os.makedirs(aggregated_metric_log_path, exist_ok=True)
+            
+            call_metric(all_tgts, all_outs, config, figure_savepath=aggregated_metric_fig_path, log_savepath=aggregated_metric_log_path, plot=True)
+
+    print(f"[Personalization] Saved aggregated metrics to {figs_agg_dir} and {logs_agg_dir} ✓")
+
+    print(f"[Personalization] Personalization completed ✓")

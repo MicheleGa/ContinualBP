@@ -508,43 +508,71 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
 
 def flatten_profiling_report(report):
     r"""
-    Flattens the profiling report into a CSV-friendly dictionary.
-    Per-step arrays are summarized using averages.
+    Flatten a profiling report into a CSV-friendly dictionary.
+
+    Per-step quantities are summarized into:
+        - mean
+        - total (sum)
+        - count
+
+    Boolean quantities are summarized as:
+        - adaptation_rate (= mean of booleans)
+        - n_true
+        - count
+
+    End-of-personalization quantities are copied unchanged.
     """
 
     flat = {}
 
-    # calibration
-    flat['calibration_time_s'] = report.get('calibration_time_s', 0.0)
+    per_step = report.get("per_step", {})
 
-    # per-step summaries
-    per_step = report.get('per_step', {})
+    for key, values in per_step.items():
 
-    for key, value in per_step.items():
-        if isinstance(value, list):
-            if len(value) == 0:
-                flat[f'{key}_mean'] = 0.0
-            elif isinstance(value[0], bool):
-                flat[f'{key}_mean'] = float(np.mean(value))
+        if not isinstance(values, list):
+            continue
+
+        n = len(values)
+
+        if n == 0:
+            flat[f"{key}_mean"] = 0.0
+            flat[f"{key}_sum"] = 0.0
+            flat[f"{key}_count"] = 0
+            continue
+
+        # Boolean metrics (currently only did_adapt)
+        if isinstance(values[0], bool):
+
+            rate = float(np.mean(values))
+            n_true = int(np.sum(values))
+
+            if key == "did_adapt":
+                flat["adaptation_rate"] = rate
+                flat["n_adaptations"] = n_true
+                flat["n_steps"] = n
             else:
-                flat[f'{key}_mean'] = float(np.mean(value))
+                flat[f"{key}_mean"] = rate
+                flat[f"{key}_sum"] = n_true
+                flat[f"{key}_count"] = n
 
-            flat[f'{key}_sum'] = float(np.sum(value)) if len(value) > 0 else 0.0
-            flat[f'{key}_count'] = len(value)
+        else:
 
-    # final metrics
+            flat[f"{key}_mean"] = float(np.mean(values))
+            flat[f"{key}_sum"] = float(np.sum(values))
+            flat[f"{key}_count"] = n
+
+    #
+    # Aggregate metrics produced at the end of run_subject()
+    #
+
     final_keys = [
-        'peak_memory_mb',
-        'n_steps',
-        'n_adaptations',
-        'adaptation_rate',
-        'total_tta_time_s',
-        'total_prediction_time_s',
-        'total_feature_extraction_time_s',
-        'total_drift_detection_time_s',
-        'total_adaptation_time_s',
-        'estimated_time_if_always_adapted_s',
-        'time_saved_by_drift_detection_s'
+        "cumulative_latency_s",
+        "model_memory_mb",
+        "rss_before_tta_mb",
+        "peak_tta_rss_mb",
+        "peak_incremental_tta_mb",
+        "peak_process_rss_mb",
+        "tm_peak_run_kb",
     ]
 
     for key in final_keys:
@@ -553,10 +581,16 @@ def flatten_profiling_report(report):
     return flat
 
 
-
 def aggregate_profiling_reports(reports):
     r"""
-    Aggregates multiple profiling reports across subjects.
+    Aggregate profiling reports across subjects.
+
+    For every flattened metric compute:
+
+        mean
+        std
+        min
+        max
     """
 
     if len(reports) == 0:
@@ -565,6 +599,7 @@ def aggregate_profiling_reports(reports):
     aggregate = defaultdict(list)
 
     for report in reports:
+
         flat = flatten_profiling_report(report)
 
         for key, value in flat.items():
@@ -573,7 +608,13 @@ def aggregate_profiling_reports(reports):
     summary = {}
 
     for key, values in aggregate.items():
-        summary[key] = float(mean(values))
+
+        values = np.asarray(values, dtype=float)
+
+        summary[f"{key}_mean"] = float(np.mean(values))
+        summary[f"{key}_std"] = float(np.std(values))
+        summary[f"{key}_min"] = float(np.min(values))
+        summary[f"{key}_max"] = float(np.max(values))
 
     return summary
 

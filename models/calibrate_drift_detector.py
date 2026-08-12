@@ -21,7 +21,7 @@ from data.online_dataset import OnlineSubjectDataset
 from data.preprocessing_utils.data_visualization import plot_subject_annotation_blocks, plot_drift_calibration_summary, plot_param_updates
     
 
-def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, calibration_phase_size, ert, window_size, n_bootstraps, device, config):
+def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_subj_dir, logs_subj_dir, calibration_phase_size, ert, window_size, n_bootstraps, buffer_size, embed_dim, device, config):
     # ---- INITIALIZATION ----
     figs_baseline_path = os.path.join(figs_subj_dir, baseline)
     os.makedirs(figs_baseline_path, exist_ok=True)
@@ -45,6 +45,18 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
         else:
             raise ValueError("Dataset not recognized for plotting annotation blocks. Supported: 'aurora', 'vital_db'.")
     
+    # Config emebddding dim to instantiate the model architecture correctly
+    config['embed_dim'] = embed_dim
+        
+    pretrained_model_ckpt_path = None
+    
+    if embed_dim  == 32:
+        pretrained_model_ckpt_path = "./checkpoints/proto_ppg_percentile_embed_dim_32_group_layer_norm_kq_4/proto_ppg_percentile_embed_dim_32_group_layer_norm_kq_4-Proto-2026_08_04-09_42_26/proto_ppg_percentile_embed_dim_32_group_layer_norm_kq_4_best_maml"
+    elif embed_dim == 64:
+        pretrained_model_ckpt_path = "./checkpoints/proto_ppg_percentile_embed_dim_64_group_layer_norm_kq_4/proto_ppg_percentile_embed_dim_64_group_layer_norm_kq_4-Proto-2026_08_04-09_37_27/proto_ppg_percentile_embed_dim_64_group_layer_norm_kq_4_best_maml"
+    elif embed_dim == 128:
+        pretrained_model_ckpt_path = "./checkpoints/proto_ppg_percentile_group_layer_norm_kq_4/proto_ppg_percentile_group_layer_norm_kq_4-Proto-2026_05_14-21_57_34/proto_ppg_percentile_group_layer_norm_kq_4_best_maml"
+    
     # Initialize pretrained learner (will be loaded from ckpt)
     encoder_pre = get_encoder_architecture(config)
     prediction_head_pre = get_prediction_head_architecture(config)
@@ -58,8 +70,8 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
         first_order=True,
         anil=(config['inner_adapt'] == 'head')
     )
-
-    ckpt = torch.load(config['pretrained_model_ckpt_path'], weights_only=False)
+    
+    ckpt = torch.load(pretrained_model_ckpt_path, weights_only=False)
     pretrained_learner.load_state_dict(ckpt['learner_state_dict'])
     pretrained_learner = pretrained_learner.to(device)
     pretrained_learner.eval()
@@ -69,7 +81,7 @@ def subject_calibration_with_feature_replay(baseline, dataset, subject_id, figs_
     enc, ph = pretrained_learner.encoder.to(device), pretrained_learner.prediction_head.to(device)
 
     # Feature replay buffer
-    replay_buffer = ReservoirReplayBuffer(seed=config['seed'], max_size=config['replay_buffer_size'])
+    replay_buffer = ReservoirReplayBuffer(seed=config['seed'], max_size=buffer_size)
     
     # Prepare data structures for evaluation  w/ online TTA
     
@@ -462,95 +474,113 @@ def calibrate_drift_detector(config, device):
     param_grid = {
         "window_size": [2, 4, 8],
         "ert": [16, 32, 64],
-        "n_bootstraps": [500, 1000],
-        "calibration_phase_size": [config['replay_buffer_size'], config['replay_buffer_size'] // 2, config['replay_buffer_size'] // 4],
+        "n_bootstraps": [500],
+        "buffer_size": [16, 32, 64],
+        "calibration_phase_size": [16],
+        "embed_dim": [32, 64, 128],
     }
     
     # Logging
     results = []
     
-    for calibration_phase_size in param_grid["calibration_phase_size"]:
-        for window_size in param_grid["window_size"]:
-            for ert in param_grid["ert"]:
-                if window_size * 4 > ert:
-                    print(f"Skipping config with W={window_size} and ERT={ert} since ERT should be > 4*W to allow for at least 4 windows between false alarms")
-                    continue 
-                for n_bootstraps in param_grid["n_bootstraps"]:
+    for embed_dim in param_grid["embed_dim"]:
+        for calibration_phase_size in param_grid["calibration_phase_size"]:
+            for buffer_size in param_grid["buffer_size"]:
 
-                    print(f"\n[Calibration] Testing config: W={window_size}, ERT={ert}, N_bootstraps={n_bootstraps}, Calibration Phase Size={calibration_phase_size}")
+                # The detector only (re-)initializes once the reservoir buffer holds
+                # >= calibration_phase_size samples (see detector init check further
+                # down the pipeline). If the buffer's max capacity is smaller than
+                # calibration_phase_size, that condition can never be satisfied and
+                # the detector would never initialize, so skip these invalid combos.
+                if buffer_size < calibration_phase_size:
+                    print(f"Skipping config with buffer_size={buffer_size} < calibration_phase_size={calibration_phase_size}: the reservoir buffer would never accumulate enough samples to initialize the detector")
+                    continue
 
-                    # Create a config-specific string for the path
-                    config_str = f"calib_{calibration_phase_size}_W_{window_size}_ert_{ert}_boot_{n_bootstraps}"
-                    
-                    total_detections = 0
-                    total_steps = 0
-                    first_detection_steps = []
-                    sbp_ae_list  = []
-                    dbp_ae_list  = []
-                    sbp_bwt_list = []
-                    dbp_bwt_list = []
+                for window_size in param_grid["window_size"]:
+                    for ert in param_grid["ert"]:
+                        if window_size * 4 > ert:
+                            print(f"Skipping config with W={window_size} and ERT={ert} since ERT should be > 4*W to allow for at least 4 windows between false alarms")
+                            continue 
+                        for n_bootstraps in param_grid["n_bootstraps"]:
 
-                    for subject_counter, subject_id in enumerate(test_subjects):
-                        
-                        try:
-                            figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}", config_str)
-                            os.makedirs(figs_subj_dir, exist_ok=True)
-                            
-                            logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}", config_str)
-                            os.makedirs(logs_subj_dir, exist_ok=True)
-                            
-                            stats = subject_calibration_with_feature_replay(
-                                baseline='feature_replay',
-                                dataset=online_physio_dataset,
-                                subject_id=subject_id,
-                                figs_subj_dir=figs_subj_dir,
-                                logs_subj_dir=logs_subj_dir, 
-                                calibration_phase_size=calibration_phase_size,
-                                ert=ert,
-                                window_size=window_size,
-                                n_bootstraps=n_bootstraps,
-                                device=device,
-                                config=config
-                            )
-                            print(stats, flush=True)
- 
-                            # Detector stats
-                            total_detections += stats["n_detections"]
-                            total_steps += stats["n_steps"]
-                            if stats["first_detection"] is not None:
-                                first_detection_steps.append(stats["first_detection"])
- 
-                            # Model-performance stats (guard against None)
-                            if stats["sbp_ae"]  is not None: sbp_ae_list.append(stats["sbp_ae"])
-                            if stats["dbp_ae"]  is not None: dbp_ae_list.append(stats["dbp_ae"])
-                            if stats["sbp_bwt"] is not None: sbp_bwt_list.append(stats["sbp_bwt"])
-                            if stats["dbp_bwt"] is not None: dbp_bwt_list.append(stats["dbp_bwt"])
-                                
-                        except Exception as e:
-                            print(f"Error during calibration of subject {subject_id}: {e}")
-                            continue
-                        
-                    false_alarm_rate = total_detections / max(total_steps, 1)
-                    empirical_ert    = 1.0 / max(false_alarm_rate, 1e-8)
- 
-                    results.append({
-                        # Grid parameters
-                        "n_bootstraps":          n_bootstraps,
-                        "calibration_phase_size":calibration_phase_size,
-                        "window_size":           window_size,
-                        "ert_target":            ert,
-                        # Detector behaviour
-                        "empirical_ert":         empirical_ert,
-                        "false_alarm_rate":      false_alarm_rate,
-                        "avg_first_detection":   np.mean(first_detection_steps) if first_detection_steps else None,
-                        "pct_subjects_detected": 100.0 * len(first_detection_steps) / max(len(test_subjects), 1),
-                        # Model performance (AE = average per-step MAE on current batch)
-                        "avg_sbp_ae":  np.mean(sbp_ae_list)  if sbp_ae_list  else None,
-                        "avg_dbp_ae":  np.mean(dbp_ae_list)  if dbp_ae_list  else None,
-                        # Continual-learning stability (positive BWT = forgetting)
-                        "avg_sbp_bwt": np.mean(sbp_bwt_list) if sbp_bwt_list else None,
-                        "avg_dbp_bwt": np.mean(dbp_bwt_list) if dbp_bwt_list else None,
-                    })
+                            print(f"\n[Calibration] Testing config: Embed Dim={embed_dim}, W={window_size}, ERT={ert}, N_bootstraps={n_bootstraps}, Calibration Phase Size={calibration_phase_size}, Buffer Size={buffer_size}")
+
+                            # Create a config-specific string for the path
+                            config_str = f"embed_{embed_dim}_calib_{calibration_phase_size}_buf_{buffer_size}_W_{window_size}_ert_{ert}_boot_{n_bootstraps}"
+
+                            total_detections = 0
+                            total_steps = 0
+                            first_detection_steps = []
+                            sbp_ae_list  = []
+                            dbp_ae_list  = []
+                            sbp_bwt_list = []
+                            dbp_bwt_list = []
+
+                            for subject_counter, subject_id in enumerate(test_subjects):
+
+                                try:
+                                    figs_subj_dir = os.path.join(config['figure_path'], f"subject_{subject_id}", config_str)
+                                    os.makedirs(figs_subj_dir, exist_ok=True)
+
+                                    logs_subj_dir = os.path.join(config['logs_path'], f"subject_{subject_id}", config_str)
+                                    os.makedirs(logs_subj_dir, exist_ok=True)
+
+                                    stats = subject_calibration_with_feature_replay(
+                                        baseline='feature_replay',
+                                        dataset=online_physio_dataset,
+                                        subject_id=subject_id,
+                                        figs_subj_dir=figs_subj_dir,
+                                        logs_subj_dir=logs_subj_dir, 
+                                        calibration_phase_size=calibration_phase_size,
+                                        ert=ert,
+                                        window_size=window_size,
+                                        n_bootstraps=n_bootstraps,
+                                        buffer_size=buffer_size,
+                                        embed_dim=embed_dim,
+                                        device=device,
+                                        config=config
+                                    )
+                                    print(stats, flush=True)
+
+                                    # Detector stats
+                                    total_detections += stats["n_detections"]
+                                    total_steps += stats["n_steps"]
+                                    if stats["first_detection"] is not None:
+                                        first_detection_steps.append(stats["first_detection"])
+
+                                    # Model-performance stats (guard against None)
+                                    if stats["sbp_ae"]  is not None: sbp_ae_list.append(stats["sbp_ae"])
+                                    if stats["dbp_ae"]  is not None: dbp_ae_list.append(stats["dbp_ae"])
+                                    if stats["sbp_bwt"] is not None: sbp_bwt_list.append(stats["sbp_bwt"])
+                                    if stats["dbp_bwt"] is not None: dbp_bwt_list.append(stats["dbp_bwt"])
+
+                                except Exception as e:
+                                    print(f"Error during calibration of subject {subject_id}: {e}")
+                                    continue
+
+                            false_alarm_rate = total_detections / max(total_steps, 1)
+                            empirical_ert    = 1.0 / max(false_alarm_rate, 1e-8)
+
+                            results.append({
+                                # Grid parameters
+                                "embed_dim":             embed_dim,
+                                "n_bootstraps":          n_bootstraps,
+                                "calibration_phase_size":calibration_phase_size,
+                                "buffer_size":           buffer_size,
+                                "window_size":           window_size,
+                                "ert_target":            ert,
+                                # Detector behaviour
+                                "empirical_ert":         empirical_ert,
+                                "false_alarm_rate":      false_alarm_rate,
+                                "avg_first_detection":   np.mean(first_detection_steps) if first_detection_steps else None,
+                                "pct_subjects_detected": 100.0 * len(first_detection_steps) / max(len(test_subjects), 1),
+                                # Model performance (AE = average per-step MAE on current batch)
+                                "avg_sbp_ae":  np.mean(sbp_ae_list)  if sbp_ae_list  else None,
+                                "avg_dbp_ae":  np.mean(dbp_ae_list)  if dbp_ae_list  else None,
+                                # Continual-learning stability (positive BWT = forgetting)
+                                "avg_sbp_bwt": np.mean(sbp_bwt_list) if sbp_bwt_list else None,
+                                "avg_dbp_bwt": np.mean(dbp_bwt_list) if dbp_bwt_list else None,
+                            })
     
     # Save results as CSV
     df = pd.DataFrame(results)
@@ -603,7 +633,7 @@ def calibrate_drift_detector(config, device):
     df.dropna(inplace=True)
     
     # 2. Define the sorting hierarchy (all ascending by default)
-    sort_columns = ["calibration_phase_size", "n_bootstraps", "ert_target", "window_size", "avg_sbp_ae"]
+    sort_columns = ["embed_dim", "buffer_size", "calibration_phase_size", "n_bootstraps", "ert_target", "window_size", "avg_sbp_ae"]
 
     # 3. Sort the DataFrame
     sorted_df = df.sort_values(by=sort_columns, ascending=True).reset_index(

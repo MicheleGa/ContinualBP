@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torchinfo import summary
 from thop import profile, clever_format
-from deployment_component_factory import BPRegressor
+from deployment_component_factory import BPRegressor, DeeperBPRegressor
 
 
 class TemporalResBlock(nn.Module):
@@ -46,15 +46,14 @@ class TemporalResBlock(nn.Module):
 
         return out
 
-
 class TemporalBlock(nn.Module):
-    def __init__(self):
+    def __init__(self, embed_dim=128):
         super(TemporalBlock, self).__init__()
 
-        self.tresblock0 = TemporalResBlock(1, 32)
-        self.tresblock1 = TemporalResBlock(32, 64)
-        self.tresblock2 = TemporalResBlock(64, 128)
-        self.tresblock3 = TemporalResBlock(128, 128)
+        self.tresblock0 = TemporalResBlock(1, embed_dim // 4)
+        self.tresblock1 = TemporalResBlock(embed_dim // 4, embed_dim // 2)
+        self.tresblock2 = TemporalResBlock(embed_dim // 2, embed_dim)
+        self.tresblock3 = TemporalResBlock(embed_dim, embed_dim)
 
     def forward(self, x):
         x = torch.unsqueeze(x, dim=-1).permute(0, 2, 1)
@@ -69,7 +68,7 @@ class GenSignalFeatures(nn.Module):
     def __init__(self, embed_dim=128):
         super().__init__()
 
-        self.temporalblock = TemporalBlock()
+        self.temporalblock = TemporalBlock(embed_dim=embed_dim)
 
         self.t_gru = nn.GRU(input_size=embed_dim, hidden_size=embed_dim, batch_first=True)
         self.t_ln = nn.LayerNorm(embed_dim)
@@ -153,8 +152,8 @@ if __name__ == "__main__":
     print(f'Proto Encoder has {params} params and {macs} MACs.')
     
     # Instantiate prediction head and profile its MACs/bytes on a dummy input
-    head = BPRegressor(encoder.embed_dim, 3)
-    y = torch.rand((args.batch_size, encoder.embed_dim))
+    head = BPRegressor(args.embed_dim, 3) if not args.ecg else DeeperBPRegressor(2 * args.embed_dim, 3)
+    y = torch.rand((args.batch_size, args.embed_dim if not args.ecg else 2 * args.embed_dim))
     print("\n--- Head Summary ---")
     summary(head, input_data=[y], col_names=("input_size","output_size","num_params","mult_adds"))
     macs, params = profile(head, inputs=(y,))
