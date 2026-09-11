@@ -1,6 +1,6 @@
 # Resource-Efficient Continual Learning for Continuous Blood Pressure Estimation on Edge Devices
 
-This is a PyTorch implementation of the Continual Learning (CL) experiments with deep neural networks (DNNs) for continuous Blood Pressure (BP) under resource constraints typical of edge devices. 
+Code repository of the paper **Resource-Efficient Continual Learning for Continuous Blood Pressure Estimation on Edge Devices**, accepted at the *The International Symposium on Edge intelligence, Trustworthy and Decentralized Artificial Intelligence (iEDGE 2026)*. 
 
 Readme Overview:
 
