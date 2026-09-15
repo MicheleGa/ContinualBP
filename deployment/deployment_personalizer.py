@@ -122,8 +122,10 @@ def run_subject_on_pi(
     weights_remote = f"{pi_remote_dir}/{os.path.basename(model_weights_path)}"
     config_remote = f"{pi_remote_dir}/{os.path.basename(config_path)}"
     results_remote = f"{pi_remote_dir}/results_{subject_id}.pkl"
+    energy_results_remote = f"{pi_remote_dir}/energy_results_{subject_id}.csv"
     results_local = os.path.join(local_baseline_path, f"results_from_pi_{subject_id}.pkl")
- 
+    energy_results_local = os.path.join(local_baseline_path, f"energy_results_from_pi_{subject_id}.csv")
+    
     try:
         # ----------------------------------------------
         # 2. Transfer data, weights and config to the Pi
@@ -138,10 +140,33 @@ def run_subject_on_pi(
         # 3. Execute run_subject on the Pi
         # --------------------------------
         remote_cmd = (
-            f"cd {pi_remote_dir} && "
-            f"source ./venv/bin/activate && "
+            f"cd {pi_remote_dir} ; "
+
+            # Compile
+            f"gcc -D_GNU_SOURCE -o power_monitor power_monitor.c ; "
+            
+            # Set CPU governor
+            f"sudo cpufreq-set -g performance ; "
+
+            # Start monitor on CPU 3, completely detached
+            f"taskset -c 3 ./power_monitor {energy_results_remote} "
+            f"> monitor.log 2>&1 & "
+            f"monitor_pid=$! ; "
+
+            # Give monitor time to initialize
+            f"sleep 3; "
+
+            # Run subject on CPUs 0-2
+            f"cd {pi_remote_dir} ; source ./venv/bin/activate ; "
+            f"taskset -c 0-2 env OMP_NUM_THREADS=3 "
             f"python run_subject_cli.py "
-            f"{data_remote} {weights_remote} {config_remote} {results_remote}"
+            f"{data_remote} {weights_remote} {config_remote} {results_remote}; "
+
+            # Allow monitor to flush/finalize
+            f"sleep 3; "
+
+            # Stop exactly the monitor we started
+            f"kill -TERM $monitor_pid"
         )
         print(f"[Pi] Running inference on {pi_host} ...")
         stdout = _ssh_pi(pi_user, pi_host, remote_cmd)
@@ -154,6 +179,7 @@ def run_subject_on_pi(
         ## --------------------------
         print(f"[Pi] Fetching results from {pi_host} ...")
         _scp_pi(f"{target}:{results_remote}", results_local)
+        _scp_pi(f"{target}:{energy_results_remote}", energy_results_local)
  
         with open(results_local, "rb") as f:
             baseline_outputs, baseline_targets, profiling_report = pickle.load(f)
@@ -164,7 +190,7 @@ def run_subject_on_pi(
         # 5. Clean up remote files (best-effort – never crash the caller)
         # ---------------------------------------------------------------
         remote_files = " ".join([
-            data_remote, weights_remote, config_remote, results_remote
+            data_remote, weights_remote, config_remote, results_remote, energy_results_remote
         ])
         try:
             _ssh_pi(

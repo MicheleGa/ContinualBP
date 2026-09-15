@@ -247,7 +247,7 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     # Random baseline data structures
     
     # NOTE: random baseline requires MMD to run first to get the number of udpates per subject
-    if config['setup_type'] == 'random':
+    if config['setup_type'] == 'random' or config['setup_type'] == 'steps':
         subject_reference_log = os.path.join(
             config["mmd_reference_log"],
             f"subject_{subject_id}",
@@ -266,6 +266,16 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
         random_update_steps = set(
             rng.choice(T, size=K, replace=False)
         )
+        
+        if config['setup_type'] == 'steps':
+            if K > 0:
+                interval = T / K  # average #steps between consecutive updates (float, for logging)
+                fixed_update_steps = set(
+                    np.linspace(0, T, num=K, endpoint=False, dtype=int)
+                )
+            else:
+                interval = None
+                fixed_update_steps = set()
         
     # Important for logging
     step_idx = 0
@@ -347,7 +357,12 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
             if do_adapt:
                 global_window_idx = (step_idx * config["personalization_batch_size"])
                 detection_timesteps.append(global_window_idx)
-                
+             
+        elif config['setup_type'] == 'steps':
+            do_adapt = step_idx in fixed_update_steps
+            if do_adapt:
+                global_window_idx = (step_idx * config["personalization_batch_size"])
+                detection_timesteps.append(global_window_idx)
         else:
             raise ValueError('Inexistent adaptation type, allowed is fixed or drift!')
 
@@ -533,12 +548,14 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
     with open(log_json_path, "w") as f:
         json.dump(predictions_log, f)
 
-    if config['setup_type'] == 'drift' or config['setup_type'] == 'random':    
+    if config['setup_type'] in ('drift', 'random', 'steps'):    
         
         if config['setup_type'] == 'drift':
-            print(f"[Personalization] Total detections with drift-aware updates: {len(detection_timesteps)} out of {step_idx * config['personalization_batch_size']} steps with drift detection after calibration ✓")
+            print(f"[Personalization] Total detections with drift-aware updates ✓")
+        elif config['setup_type'] == 'random':
+            print(f"[Personalization] Total detections with random updates ✓")
         else:
-            print(f"[Personalization] Total detections with random updates: {len(detection_timesteps)} out of {step_idx * config['personalization_batch_size']} steps with random detection after calibration ✓")
+            print(f"[Personalization] Total detections with fixed-interval updates ✓")
 
         # Calibration summary plot
         sbp_ae, sbp_bwt = sbp_baseline_metrics['AE'], sbp_baseline_metrics['BWT']
@@ -546,8 +563,10 @@ def personalize_feature_replay(baseline, dataset, subject_id, figs_subj_dir, log
         
         if config['setup_type'] == 'drift':
             plot_fname = f"ert{config['detector_ert']}_w{config['detector_window_size']}_detector_summary.png"
-        else:
+        elif config['setup_type'] == 'random':
             plot_fname = f"random{config['random_update_prob']}_detector_summary.png"
+        else:
+            plot_fname = f"steps_K{K}_detector_summary.png"
         plot_path  = os.path.join(figs_baseline_path, plot_fname)
     
         plot_drift_calibration_summary(
@@ -662,6 +681,9 @@ def personalization_drift_aware(config, device):
     if config['setup_type'] == 'random':
         print(f"[Personalization] Personalization performed with randomly-scheduled updates (with probability {config['random_update_prob']})")
     
+    if config['setup_type'] == 'steps':
+        print(f"[Personalization] Personalization performed with step-based updates")
+        
     # Record cumulative run time for all subjects
     # note that this scripts may be run in parallel with other tasks (in the laptop) and may not reflect the actual latency of the personalization
     t_cumulative = {}

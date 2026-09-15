@@ -6,8 +6,11 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
  
 from run_subject import run_subject   # already present on the Pi
- 
- 
+ # Ensure Torch uses only three threads: cpu from 0-2 cores
+import torch
+torch.set_num_threads(3)
+
+
 def main():
     if len(sys.argv) != 5:
         print(
@@ -18,7 +21,6 @@ def main():
         sys.exit(1)
  
     data_path, weights_path, config_path, results_path = sys.argv[1:5]
- 
     print(f"[Deployment On-Device] data    : {data_path}")
     print(f"[Deployment On-Device] weights : {weights_path}")
     print(f"[Deployment On-Device] config  : {config_path}")

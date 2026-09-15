@@ -111,7 +111,7 @@ def parseargs():
     parser.add_argument('--personalization_batch_size', default=16, type=int, help='batch size for personalization')
     parser.add_argument('--num_batches', default=2, type=int, help='required number of batches with timestamp-contiguous windows')
     parser.add_argument('--num_blocks', default=2, type=int, help='required number of blocks with timestamp-contiguous windows per subject')
-    parser.add_argument('--setup_type', default='fixed', type=str, choices=['drift', 'fixed', 'random'], help='whether to trigger adaptation after the distribution shift detector or not')
+    parser.add_argument('--setup_type', default='fixed', type=str, choices=['drift', 'fixed', 'random', 'steps'], help='which drift detection regime to follow to trigger adaptation')
     parser.add_argument('--drift_detector_type', default='mmd', type=str, choices=['mmd', 'lsdd'], help='type of drift detector to use for the drift-aware setup')
     parser.add_argument('--drift_threshold', default=20, type=int, choices=[20, 50, 70, 90, 95], help='Threshold percentile for drift detector (allowed: 20, 50, 80)')
     parser.add_argument('--mmd_reference_log', default=None, type=str, help='path to the MMD experiment log for the random baseline')

@@ -188,7 +188,11 @@ def _tm_peak_kb() -> float:
     """
     _, peak = tracemalloc.get_traced_memory()
     return peak / 1024.0
-    
+
+
+def _mono():
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
 
 def run_subject(data_path, model_path, config_path, device=None, verbose=False):
     
@@ -226,10 +230,18 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
             'tm_current_kb':                [],
             'tm_head_adapt_kb':             [],
             'tm_detector_reinit_kb':        [],
+            
+            # Energy (J)
+            't_step_start_mono':             [],  # monotonic wall time at the start of each step
+            't_step_end_mono':               [],  # monotonic wall time at the end of each step
         },
 
         # Total run time (filled at end of run_subject)
         'cumulative_latency_s': 0.0,
+        
+        # Cumulative monotonic wall time at the start/end of the TTA loop
+        't_run_start_mono': 0.0,
+        't_run_end_mono': 0.0,
 
         # Aggregate memory (filled at end of run_subject)
 
@@ -322,6 +334,9 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
     prof['rss_before_tta_mb'] = rss_before_tta_mb
     peak_tta_rss_mb = rss_before_tta_mb   # updated every step
     
+    # Record monotonic wall time at the start of the TTA loop
+    prof['t_run_start_mono'] = _mono()
+    
     # ---- PERSONALIZATION ----
     for block_idx in range(len(blocks_list)):
         
@@ -333,6 +348,9 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
         
         # TTA start
         t_step_start = time.perf_counter()
+        
+        # Record monotonic wall time at the start of the TTA step
+        prof['per_step']['t_step_start_mono'].append(_mono())
         
         # ---------- Evaluate before adaptation ----------
         # -> ensure the system always produce an output given the stream of data
@@ -528,12 +546,14 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
                 t_adapt_end = time.perf_counter()
                 adapt_latency = t_adapt_end - t_adapt_start
                 
-        # Step end: timing and memory                   
+        # Step end: timing, memory, and record monotonic wall time                   
         t_step_end = time.perf_counter()
         rss_step_end_mb = _current_rss_mb()
         
         step_latency = t_step_end - t_step_start
         peak_tta_rss_mb = max(peak_tta_rss_mb, rss_step_end_mb)
+        
+        prof['per_step']['t_step_end_mono'].append(_mono())
         
         # Record per-step profiling 
         prof['per_step']['prediction_s'].append(pred_latency)
@@ -562,6 +582,9 @@ def run_subject(data_path, model_path, config_path, device=None, verbose=False):
  
     # Always stop tracemalloc — started unconditionally at the top
     tracemalloc.stop()
+    
+    # Record monotonic wall time at the end of the TTA loop
+    prof['t_run_end_mono'] = _mono()
         
     return (
         baseline_outputs,

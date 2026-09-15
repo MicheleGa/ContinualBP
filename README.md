@@ -420,25 +420,55 @@ After pretraining, the personalization stage can be executed to reproduce the re
 **Notes:** Ablation study on MMD, over smaller embedding (128/32/16) and buffer (64/32/16) sizes. For conciseness, we report the SBP results averaged over three seeds but w/o variance. For embedding size 8, MMD was numerically unstable.
 
 | Metric | Raspberry Pi 5 | Google Pixel 10a |
-|---|---:|---:|
-| *Estimated Communication Requirements* | | |
-| &nbsp;&nbsp;Setting A | 14.2 kB | 14.2 kB |
-| &nbsp;&nbsp;Setting B | 1.4 MB | 1.4 MB |
-| *Profiled Comput. Requirements ~ Update Latency Breakdown (ms)* | | |
-| &nbsp;&nbsp;feat. extraction | 21.3 ± 0.4 | 65.0 ± 14.8 |
-| &nbsp;&nbsp;BP prediction | 0.5 ± 0.0 | 1.0 ± 0.2 |
-| &nbsp;&nbsp;drift detection | 3.9 ± 0.1 | 15.0 ± 3.0 |
-| &nbsp;&nbsp;head adapt. | 13.6 ± 3.7 | 14.8 ± 4.8 |
-| &nbsp;&nbsp;detector reinit. | 203.3 ± 59.6 | 82.4 ± 34.3 |
-| *Cumulative Latency for 88 subj. (min)* | | |
-| &nbsp;&nbsp;MMD | 33.1 ± 1.0 | 29.7 ± 2.3 |
-| &nbsp;&nbsp;Always-on | 12.7 ± 0.0 | 21.8 ± 1.4 |
-| *Profiled Memory Requirements ~ Avg. Memory (MB)* | | |
-| &nbsp;&nbsp; | 371.9 ± 0.1 | 355.9 ± 0.2 |
-| *Profiled Avg. Update Frequency Reduction (%)* | | |
-| &nbsp;&nbsp; | 50.4 ± 13.2 | 50.2 ± 13.0 |
-| *Profiled Avg. Annotations required for one subj. (# samples)* | | |
-| &nbsp;&nbsp;MMD | 142.8 ± 31.5 | 143.3 ± 32.9 |
-| &nbsp;&nbsp;Always-on | 288.0 ± 0.0 | 288.0 ± 0.0 |
+| :--- | :---: | :---: |
+| **_Estimated Communication Requirements_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;Setting A | 14.2 kB | 14.2 kB |
+| &nbsp;&nbsp;&nbsp;&nbsp;Setting B | 1.4 MB | 1.4 MB |
+| **_Profiled Comput. Requirements $\sim$ Update Latency Breakdown (ms)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;feat. extraction | 21.8 ± 0.6 | 65.0 ± 14.8 |
+| &nbsp;&nbsp;&nbsp;&nbsp;BP prediction | 0.6 ± 0.0 | 1.0 ± 0.2 |
+| &nbsp;&nbsp;&nbsp;&nbsp;drift detection | 4.4 ± 0.1 | 15.0 ± 3.0 |
+| &nbsp;&nbsp;&nbsp;&nbsp;head adapt. | 13.8 ± 3.5 | 14.8 ± 4.8 |
+| &nbsp;&nbsp;&nbsp;&nbsp;detector reinit. | 204.1 ± 56.1 | 82.4 ± 34.3 |
+| **_Cumulative Latency for 88 subj. (min)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;MMD | 33.3 ± 0.9 | 29.7 ± 2.3 |
+| &nbsp;&nbsp;&nbsp;&nbsp;Always-on | 12.7 ± 0.0 | 21.8 ± 1.4 |
+| **_Profiled Memory Requirements $\sim$ Avg. Memory (MB)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp; | 371.9 ± 0.1 | 355.9 ± 0.2 |
+| **_Profiled Energy Requirements $\sim$ Avg. Energy (J)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;Update | 0.1 ± 0.0 | - |
+| &nbsp;&nbsp;&nbsp;&nbsp;Subject | 8.5 ± 1.2 | - |
+| **_Profiled Avg. Update Frequency Reduction (%)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp; | 50.3 ± 12.5 | 50.2 ± 13.0 |
+| **_Profiled Avg. Annotations required for one subj. (# samples)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;MMD | 143.0 ± 31.9 | 143.3 ± 32.9 |
+| &nbsp;&nbsp;&nbsp;&nbsp;Always-on | 288.0 ± 0.0 | 288.0 ± 0.0 |
 
 **Notes:** Resource profiling (over three seeds) of feature replay with MMD, embedding size 16 and buffer size 16.
+
+| Metric | Raspberry Pi 5 | Google Pixel 10a |
+| :--- | :---: | :---: |
+| **_Estimated Communication Requirements_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;Setting A | 110.6 kB | 110.6 kB |
+| &nbsp;&nbsp;&nbsp;&nbsp;Setting B | 2.9 MB | 2.9 MB |
+| **_Profiled Comput. Requirements ~ Update Latency Breakdown (ms)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;feat. extraction | 59.5 ± 0.7 | 696.8 ± 17.1 |
+| &nbsp;&nbsp;&nbsp;&nbsp;BP prediction | 0.9 ± 0.0 | 3.8 ± 0.1 |
+| &nbsp;&nbsp;&nbsp;&nbsp;drift detection | 4.5 ± 0.1 | 22.4 ± 0.5 |
+| &nbsp;&nbsp;&nbsp;&nbsp;head adapt. | 22.8 ± 5.8 | 60.1 ± 15.9 |
+| &nbsp;&nbsp;&nbsp;&nbsp;detector reinit. | 248.6 ± 66.0 | 93.8 ± 26.1 |
+| **_Cumulative Latency for 88 subj. (min)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;MMD | 43.0 ± 0.0 | 102.7 ± 0.0 |
+| &nbsp;&nbsp;&nbsp;&nbsp;Always-on | 18.8 ± 0.0 | 96.8 ± 0.0 |
+| **_Profiled Memory Requirements ~ Avg. Memory (MB)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp; | 375.7 ± 0.2 | 360.5 ± 0.2 |
+| **_Profiled Energy Requirements ~ Avg. Energy (J)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;Update | 0.2 ± 0.0 | - |
+| &nbsp;&nbsp;&nbsp;&nbsp;Subject | 13.0 ± 1.6 | - |
+| **_Profiled Avg. Update Frequency Reduction (%)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp; | 41.1 ± 14.8 | 42.6 ± 14.8 |
+| **_Profiled Avg. Annotations required for one subj. (# samples)_** | | |
+| &nbsp;&nbsp;&nbsp;&nbsp;MMD | 169.5 ± 42.5 | 165.2 ± 42.6 |
+| &nbsp;&nbsp;&nbsp;&nbsp;Always-on | 288.0 ± 0.0 | 288.0 ± 0.0 |
+
+**Notes:** Resource profiling (over three seeds) of feature replay with MMD, embedding size 32 and buffer size 16.

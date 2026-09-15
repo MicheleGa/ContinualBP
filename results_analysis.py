@@ -65,7 +65,102 @@ _PER_STEP_MEMORY_LABELS = {
     'tm_detector_reinit_kb':    'Delta during detector reinit',
 }
 
+_PER_STEP_ENERGY_KEYS = [
+    't_step_start_mono',         # Monotonic wall time at the start of each step
+    't_step_end_mono'            # Monotonic wall time at the end of each step
+]
+
+_AGGREGATE_ENERGY_KEYS = [
+    't_run_start_mono',          # Cumulative monotonic wall time at the start of the TTA loop
+    't_run_end_mono',            # Cumulative monotonic wall time at the end of the TTA loop
+]
+
+_RAIL_CURRENT_VOLTAGE_PAIRS = {
+    "3V7_WL_SW": (0, 8),
+    "3V3_SYS":   (1, 9),
+    "1V8_SYS":   (2, 10),
+    "DDR_VDD2":  (3, 11),
+    "DDR_VDDQ":  (4, 12),
+    "1V1_SYS":   (5, 13),
+    "0V8_SW":    (6, 14),
+    "VDD_CORE":  (7, 15),
+    "0V8_AON":   (16, 19),
+    "3V3_DAC":   (17, 20),
+    "3V3_ADC":   (18, 21),
+    "HDMI":      (22, 23),
+    # EXT5V_V (24) and BATT_V (25) have no paired current channel in
+    # `vcgencmd pmic_read_adc` output and are excluded from the total.
+}
+
 _PER_STEP_ANNOTATED_SAMPLES_NUMBER = 4
+
+# -----------------------------------
+# Energy Costs Profiling
+# -----------------------------------
+
+def _pivot_board_power(energy_df):
+    """
+    energy_df: long-format rows (t_mono_s, rail_idx, current_A, voltage_V),
+    unfiltered -- pass every rail_idx the C monitor logged, not just
+    VDD_CORE, so the full board total can be summed.
+    Sums V*I across every rail with a matched current/voltage pair.
+    """
+    wide = energy_df.pivot_table(index="t_mono_s", columns="rail_idx",
+                                  values=["current_A", "voltage_V"])
+
+    power_w = None
+    for rail_name, (cur_idx, volt_idx) in _RAIL_CURRENT_VOLTAGE_PAIRS.items():
+        if cur_idx not in wide["current_A"].columns or volt_idx not in wide["voltage_V"].columns:
+            continue  # rail absent from this particular log; skip rather than fail
+        rail_power_w = wide["current_A"][cur_idx] * wide["voltage_V"][volt_idx]
+        power_w = rail_power_w if power_w is None else power_w.add(rail_power_w, fill_value=0.0)
+
+    return power_w.sort_index()
+
+
+def _energy_in_window(power_series, t0, t1):
+    """
+    Trapezoidal energy (J) of power_series over [t0, t1]. Falls back to
+    holding the nearest sample's power constant across the window when
+    fewer than 2 samples fall inside it
+    """
+    t = power_series.index.to_numpy()
+    p = power_series.to_numpy()
+    mask = (t >= t0) & (t <= t1)
+    if mask.sum() >= 2:
+        return float(np.trapz(p[mask], t[mask]))
+    idx = np.clip(np.searchsorted(t, (t0 + t1) / 2.0), 0, len(p) - 1)
+    return float(p[idx] * (t1 - t0))
+
+
+def _estimate_idle_power(power_series, t_run_start, t_run_end):
+    """
+    Idle power (W) from the pre-run and post-run monitor windows
+    (samples strictly outside [t_run_start, t_run_end]).
+
+    Integrates each idle window with the trapezoidal rule to get an
+    idle *energy* over that window, then divides by the window's own
+    duration to get an average idle *power* -- the form needed to
+    subtract a baseline from windows of arbitrary length later.
+    Returns the pre/post windows separately too, so you can sanity-check
+    how much they drift from each other.
+    """
+    t = power_series.index.to_numpy()
+    p = power_series.to_numpy()
+
+    def _window_avg_power(mask):
+        t_w, p_w = t[mask], p[mask]
+        if len(t_w) < 2:
+            return np.nan
+        duration_s = t_w[-1] - t_w[0]
+        return float(np.trapz(p_w, t_w) / duration_s) if duration_s > 0 else np.nan
+
+    idle_pre_w = _window_avg_power(t < t_run_start)
+    idle_post_w = _window_avg_power(t > t_run_end)
+    candidates = [v for v in (idle_pre_w, idle_post_w) if not np.isnan(v)]
+    idle_avg_w = float(np.mean(candidates)) if candidates else np.nan
+
+    return idle_avg_w, idle_pre_w, idle_post_w
 
 # -----------------------------------
 # MACs/Communication Costs Estimation
@@ -442,7 +537,7 @@ def resource_profiling_ppg_ecg(baseline, baselines, deployment_device):
     return results
 
 
-def _collect_seed_data(baseline, profiling_path, detector_name):
+def _collect_seed_data(baseline, profiling_path, detector_name, deployment_device):
     """
     Collect profiling data for a *single* seed path.
 
@@ -465,10 +560,16 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
     if not profiling_path.exists():
         raise ValueError(f"[{detector_name}] Error: path {profiling_path} does not exist — skipping.")
 
-    per_step_per_subject_means = {k: [] for k in _PER_STEP_LATENCY_KEYS}
+    per_step_per_subject_latency_means = {k: [] for k in _PER_STEP_LATENCY_KEYS}
     aggregate_latency_per_subject = {k: [] for k in _AGGREGATE_LATENCY_KEYS}
     aggregate_memory_per_subject = {k: [] for k in _AGGREGATE_MEMORY_KEYS}
     per_step_memory_peak_per_subject = {k: [] for k in _PER_STEP_MEMORY_KEYS}
+    subject_idle_power_w = []
+    subject_idle_power_pre_post_w = {}         
+    per_step_energy_per_subject = {}           
+    subject_mean_step_energy_j = []
+    subject_cumulative_energy_j = []
+    subject_cumulative_energy_whole_window_j = []
     subject_frequency_savings = []
     subject_annotation_savings = []
     subject_updates_drift = {}
@@ -482,6 +583,8 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
 
         subject_id = subject_dir.name.split('_')[-1]
 
+        ## Update frequency reduction, latency, and storage (both Pi and Pixel)
+        
         profiling_json_path = subject_dir / "profiling" / f"{baseline}_profiling_report.json"
         with open(profiling_json_path, "r", encoding="utf-8") as f:
             prof = json.load(f)
@@ -511,7 +614,7 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
         for key in _PER_STEP_LATENCY_KEYS:
             values = prof['per_step'][key]
             if values:
-                per_step_per_subject_means[key].append(np.mean(values))
+                per_step_per_subject_latency_means[key].append(np.mean(values))
         
         # ── Latency (total per subject) ────────────────────────────
         for key in _AGGREGATE_LATENCY_KEYS:
@@ -529,6 +632,56 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
             if values:
                 per_step_memory_peak_per_subject[key].append(max(values))
 
+        ## Energy measurements (only for Pi w/ MMD)
+        if deployment_device == "pi":
+            if 'drift_aware_mmd' in str(subject_dir).split('/')[1]:
+                energy_csv_path = subject_dir / "feature_replay" / f"energy_results_from_pi_{subject_id}.csv"
+                energy_df = pd.read_csv(energy_csv_path)
+
+                # No rail_idx filter here anymore -- keep every channel the
+                # monitor logged so the board total can sum across all of them.
+
+                # 1) Pair every rail's current+voltage samples into one board
+                #    power series, keyed on the shared CLOCK_MONOTONIC timestamp.
+                power_series = _pivot_board_power(energy_df)
+            
+                t_run_start = prof['t_run_start_mono']
+                t_run_end = prof['t_run_end_mono']
+
+                # 2) Idle power from samples outside the run window.
+                idle_avg_w, idle_pre_w, idle_post_w = _estimate_idle_power(
+                    power_series, t_run_start, t_run_end
+                )
+                
+                subject_idle_power_w.append(idle_avg_w)
+                subject_idle_power_pre_post_w[subject_id] = (idle_pre_w, idle_post_w)
+
+                # 3) + 4) Raw and idle-corrected ("net") energy per TTA step.
+                step_starts = prof['per_step']['t_step_start_mono']
+                step_ends = prof['per_step']['t_step_end_mono']
+
+                raw_step_energy_j = []
+                net_step_energy_j = []
+                for t0, t1 in zip(step_starts, step_ends):
+                    raw_j = _energy_in_window(power_series, t0, t1)
+                    net_j = raw_j - idle_avg_w * (t1 - t0)
+                    raw_step_energy_j.append(raw_j)
+                    net_step_energy_j.append(net_j)
+                    
+                per_step_energy_per_subject[subject_id] = {
+                    "raw_energy_j": raw_step_energy_j,
+                    "net_energy_j": net_step_energy_j,
+                }
+
+                # 5) Per-subject mean net energy per step, and cumulative net energy.
+                subject_mean_step_energy_j.append(float(np.mean(net_step_energy_j)))
+                subject_cumulative_energy_j.append(float(np.sum(net_step_energy_j)))
+
+                # Cross-check against integrating net power over the whole run window directly.
+                raw_total_j = _energy_in_window(power_series, t_run_start, t_run_end)
+                net_total_j = raw_total_j - idle_avg_w * (t_run_end - t_run_start)
+                subject_cumulative_energy_whole_window_j.append(net_total_j)
+                
     # ── Aggregate clinical metrics CSV (one per path) ─────────────
     clinical_metrics_csv = pd.read_csv(
         os.path.join(
@@ -540,10 +693,16 @@ def _collect_seed_data(baseline, profiling_path, detector_name):
     )
 
     return {
-        "per_step_latency":    per_step_per_subject_means,
+        "per_step_latency":    per_step_per_subject_latency_means,
         "aggregate_latency":   aggregate_latency_per_subject,
         "aggregate_memory":    aggregate_memory_per_subject,
         "per_step_memory":     per_step_memory_peak_per_subject,
+        "energy_idle_power_w":              subject_idle_power_w,
+        "energy_idle_power_pre_post_w":     subject_idle_power_pre_post_w,
+        "energy_per_step":                  per_step_energy_per_subject,
+        "energy_mean_per_step_j":           subject_mean_step_energy_j,
+        "energy_cumulative_j":              subject_cumulative_energy_j,
+        "energy_cumulative_whole_window_j": subject_cumulative_energy_whole_window_j,
         "frequency_savings":   subject_frequency_savings,
         "annotation_savings":  subject_annotation_savings,
         "updates_drift":       subject_updates_drift,
@@ -616,7 +775,7 @@ def _average_seed_results(seed_data_list):
         set().union(*[d["updates_drift"].keys() for d in seed_data_list])
     )
     avg_updates_drift = {
-        sid: float(np.mean([d["updates_drift"].get(sid, np.nan) for d in seed_data_list]))
+        sid: float(np.mean([d["updates_drift"].get(sid) for d in seed_data_list]))
         for sid in all_subject_ids
     }
     
@@ -625,7 +784,7 @@ def _average_seed_results(seed_data_list):
             set().union(*[d["annotations_drift"].keys() for d in seed_data_list])
     )
     avg_annotations_drift = {
-        sid: float(np.mean([d["annotations_drift"].get(sid, np.nan) for d in seed_data_list]))
+        sid: float(np.mean([d["annotations_drift"].get(sid) for d in seed_data_list]))
         for sid in all_subject_ids
     }
        
@@ -635,6 +794,48 @@ def _average_seed_results(seed_data_list):
     # total_annotations is determined by the data stream, not the seed
     avg_total_annotations = seed_data_list[0]["total_annnotations"]
 
+    # ── Energy: subject-level scalars, pooled across seeds and per-step, subject-keyed: concatenated (not averaged)  ────────────
+    energy_mean_step_pooled = np.array([
+        v for d in seed_data_list for v in d.get("energy_mean_per_step_j")
+    ])
+    energy_cumulative_pooled = np.array([
+        v for d in seed_data_list for v in d.get("energy_cumulative_j")
+    ])
+    energy_cumulative_whole_window_pooled = np.array([
+        v for d in seed_data_list for v in d.get("energy_cumulative_whole_window_j")
+    ])
+    energy_idle_power_pooled = np.array([
+        v for d in seed_data_list for v in d.get("energy_idle_power_w")
+    ])
+    
+    pooled_energy_per_step_by_subject = {
+        sid: {
+            "raw_energy_j": [
+                v for d in seed_data_list
+                for v in d.get("energy_per_step", {}).get(sid, {}).get("raw_energy_j", [])
+            ],
+            "net_energy_j": [
+                v for d in seed_data_list
+                for v in d.get("energy_per_step", {}).get(sid, {}).get("net_energy_j", [])
+            ],
+        }
+        for sid in all_subject_ids
+    }
+    
+    avg_idle_power_pre_post = {
+        sid: (
+            float(np.mean([
+                d["energy_idle_power_pre_post_w"].get(sid, (np.nan, np.nan))[0]
+                for d in seed_data_list
+            ])),
+            float(np.mean([
+                d["energy_idle_power_pre_post_w"].get(sid, (np.nan, np.nan))[1]
+                for d in seed_data_list
+            ])),
+        )
+        for sid in all_subject_ids
+    }
+    
     # ── Clinical metrics: concatenate all subjects across seeds ──────────────
     pooled_clinical = pd.concat(
         [d["clinical_metrics"] for d in seed_data_list],
@@ -653,7 +854,102 @@ def _average_seed_results(seed_data_list):
         "avg_total_opportunities": avg_total_opportunities,
         "avg_total_annotations":   avg_total_annotations,
         "pooled_clinical_metrics": pooled_clinical,
+        "energy_mean_step_pooled":               energy_mean_step_pooled,
+        "energy_cumulative_pooled":               energy_cumulative_pooled,
+        "energy_cumulative_whole_window_pooled":  energy_cumulative_whole_window_pooled,
+        "energy_idle_power_pooled":               energy_idle_power_pooled,
+        "energy_per_step_by_subject":              pooled_energy_per_step_by_subject,
+        "avg_idle_power_pre_post":                 avg_idle_power_pre_post,
         "n_seeds":                 len(seed_data_list),
+    }
+    
+
+def _compute_breakeven_frequency(avg, deployment_device, detector_name):
+    """
+    Compute the amortized per-step overhead and the break-even update
+    frequency at which feature replay with MMD becomes cheaper than an
+    Always-on baseline that updates psi at every step.
+
+    Parameters
+    ----------
+    avg : dict
+        Output of _average_seed_results()
+    deployment_device : str
+    detector_name : str
+
+    Returns
+    -------
+    dict
+        per_subject : {subject_id: {...}}
+        p_star      : float   (break-even update frequency, 0-1)
+        p_mean      : float   (mean actual update frequency across subjects)
+        p_std       : float
+        worthwhile_fraction : float  (fraction of subjects below p_star)
+    """
+    # Adjust these keys to match however latency_ms is actually named
+
+    t_det  = 0.0
+    t_head_update = 0.0
+    t_det_reinit = 0.0
+    
+    for key in _PER_STEP_LATENCY_KEYS:
+        arr = avg["latency_pooled"][key]          # pooled over all subjects
+        m, s = float(arr.mean()) * 1e3, float(arr.std()) * 1e3
+        
+        if key == 'drift_detection_s':
+            t_det = m
+        elif key == 'head_adapt_s':
+            t_head_update = m
+        elif key == 'drift_detector_reinit_s':
+            t_det_reinit = m
+        
+    p_star = (t_head_update - t_det) / (t_head_update + t_det_reinit)
+
+    per_subject = {}
+    p_values = []
+    for subject_id, n in avg["avg_updates_drift"].items():
+        N = avg["avg_total_opportunities"].get(subject_id)
+        p = n / N                                    # actual update frequency
+        L = N / n if n > 0 else float("inf")          # steps between updates
+        tau_L = t_det + (t_head_update + t_det_reinit) / L if n > 0 else t_det
+
+        per_subject[subject_id] = {
+            "n_updates": n,
+            "n_opportunities": N,
+            "L_steps_between_updates": L,
+            "update_frequency_p": p,
+            "amortized_overhead_ms": tau_L,
+            "worthwhile_vs_always_on": p < p_star,
+        }
+        p_values.append(p)
+
+    p_arr = np.asarray(p_values)
+    p_mean, p_std = float(p_arr.mean()), float(p_arr.std())
+    worthwhile_fraction = float((p_arr < p_star).mean())
+
+    print(
+        f"\n[{detector_name}] Deployment ~ Break-even update frequency "
+        f"({deployment_device}): p* = {p_star*100:.2f}%"
+    )
+    if p_star <= 0:
+        print(
+            f"[{detector_name}] p* <= 0 on {deployment_device}: "
+            f"t_det ({t_det:.1f} ms) >= t_head ({t_head_update:.1f} ms), "
+            f"so MMD-triggered adaptation is never cheaper than Always-on here."
+        )
+    else:
+        print(
+            f"[{detector_name}] Actual update frequency: {p_mean*100:.2f}% "
+            f"± {p_std*100:.2f}% — worthwhile for "
+            f"{worthwhile_fraction*100:.1f}% of subjects."
+        )
+    
+    return {
+        "per_subject": per_subject,
+        "p_star": p_star,
+        "p_mean": p_mean,
+        "p_std": p_std,
+        "worthwhile_fraction": worthwhile_fraction,
     }
 
 
@@ -693,7 +989,7 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
     # ── Collect data per seed ─────────────────────────────────────
     seed_data_list = []
     for seed_label, path in seed_paths.items():
-        data = _collect_seed_data(baseline, path, detector_name)
+        data = _collect_seed_data(baseline, path, detector_name, deployment_device)
         if data is not None:
             seed_data_list.append(data)
 
@@ -729,6 +1025,10 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
         f"\n[{detector_name}] Deployment ~ Update Frequency Reduction {suffix}:"
         f" {mean_freq:.1f}% ± {std_freq:.1f}%"
     )
+    
+    # ── Break-even update frequency (worthwhileness vs Always-on) ─
+    breakeven = _compute_breakeven_frequency(avg, deployment_device, detector_name)
+    print(f"\n[{detector_name}] Deployment ~ Break-even Update Frequency {breakeven['p_star']*100:.2f}:")
     
     # ── Annotation requirement reduction ────────────────────────────────
     ann_arr = avg["ann_pooled"] * 100
@@ -819,6 +1119,43 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
             step_mem_stats[key] = (m, s)
             print(f"  {_PER_STEP_MEMORY_LABELS[key]:45s}  {m:7.2f} ± {s:5.2f} kB")
 
+    # ── Energy (present only for Pi + MMD runs — see _collect_seed_data) ──
+    energy_summary = {}
+    if avg["energy_cumulative_pooled"].size > 0:
+        print(f"\n[{detector_name}] Deployment ~ Energy Summary {suffix}:")
+
+        idle_arr = avg["energy_idle_power_pooled"]
+        mean_idle_w, std_idle_w = float(idle_arr.mean()), float(idle_arr.std())
+        print(f"  {'idle board power (baseline)':45s}  {mean_idle_w:7.3f} ± {std_idle_w:6.3f} W")
+
+        step_arr = avg["energy_mean_step_pooled"]
+        mean_step_j, std_step_j = float(step_arr.mean()), float(step_arr.std())
+        print(f"  {'net energy per update':45s}  {mean_step_j:7.4f} ± {std_step_j:6.4f} J")
+
+        cum_arr = avg["energy_cumulative_pooled"]
+        mean_cum_j, std_cum_j = float(cum_arr.mean()), float(cum_arr.std())
+        print(f"  {'cumulative net energy per subject':45s}  {mean_cum_j:7.2f} ± {std_cum_j:6.2f} J")
+
+        # Cross-check: sum of per-step energies vs. integrating net power
+        # directly over the whole run window. Large divergence flags a
+        # subject/seed worth inspecting (e.g. a gap between steps that
+        # neither integration path accounted for the same way).
+        cum_whole_arr = avg["energy_cumulative_whole_window_pooled"]
+        mean_cum_whole_j, std_cum_whole_j = float(cum_whole_arr.mean()), float(cum_whole_arr.std())
+        discrepancy_pct = (
+            100.0 * abs(mean_cum_j - mean_cum_whole_j) / mean_cum_whole_j
+            if mean_cum_whole_j != 0 else float("nan")
+        )
+        print(f"  {'cumulative net energy (whole-window x-check)':45s}  {mean_cum_whole_j:7.2f} ± {std_cum_whole_j:6.2f} J")
+        print(f"      (sum-of-steps vs. whole-window discrepancy: {discrepancy_pct:.1f}%)")
+
+        energy_summary = {
+            "idle_power_w":                    (mean_idle_w, std_idle_w),
+            "energy_per_update_j":              (mean_step_j, std_step_j),
+            "cumulative_energy_j":              (mean_cum_j, std_cum_j),
+            "cumulative_energy_whole_window_j": (mean_cum_whole_j, std_cum_whole_j),
+        }
+        
     # ── Plots ─────────────────────────────────────────────────────
     #plot_drift_aware_updates_per_subject(
     #    subject_updates_drift=avg["avg_updates_drift"],
@@ -840,7 +1177,8 @@ def _run_profiling_report(baseline, seed_paths, detector_name, deployment_device
         "aggregate_memory_mb":          agg_mem_stats,
         "update_freq_reduction":        (mean_freq, std_freq),
         "annotation_samples_reduction": (mean_annotations, std_annotations),
-        "n_seeds":                 n_seeds,
+        "n_seeds":                      n_seeds,
+        "energy_summary":               energy_summary,
     }
     
     
@@ -1187,6 +1525,7 @@ def analyze_drift_detection_methods(baselines):
         "always_on_path", 
         "drift_aware_mmd_path",
         "random_path",
+        "steps_path",
         "drift_aware_lsdd_path", 
     ]
     
@@ -1397,6 +1736,7 @@ def analyze_drift_detection_methods(baselines):
         "Always": "always_on_path",
         "MMD": "drift_aware_mmd_path",
         "Random": "random_path",
+        "Steps": "steps_path",
         "LSDD": "drift_aware_lsdd_path",
     }
     
@@ -1859,6 +2199,12 @@ def generate_resource_profile_table(pi_profile, pixel_profile, config_file_path)
     aggregate_memory_labels = {
         "peak process memory": "peak_process_rss_mb",
     }
+    
+    # ── Energy labels & keys ───────────────────────────────────────────────
+    mmd_aggregate_energy_labels = {
+        "Update": "energy_per_update_j",
+        "Subject": "cumulative_energy_j",
+    }
 
     INDENT = {1: r'\quad', 2: r'\qquad'}
 
@@ -1924,6 +2270,16 @@ def generate_resource_profile_table(pi_profile, pixel_profile, config_file_path)
         px_m, px_s = px['aggregate_memory_mb'][key]
         rows.append(
             rf"        \quad & {fmt(pi_m, pi_s)} & {fmt(px_m, px_s)} \\"
+        )
+    rows.append(r"        \hline")
+    
+    # ── Energy block ───────────────────────────────────────────────────────
+    rows.append(r"        \multicolumn{3}{l}{\textit{Profiled Energy Requirements $\sim$ Avg. Energy (J)}} \\")
+    rows.append(r"        \hline")
+    for label, key in mmd_aggregate_energy_labels.items():
+        pi_m, pi_s = pi['energy_summary'][key]
+        rows.append(
+            rf"        \quad {label} & {fmt(pi_m, pi_s)} & - \\"
         )
     rows.append(r"        \hline")
 
@@ -2224,9 +2580,9 @@ def generate_drift_detection_methods_overleaf_table(
     latex.append(r"\begin{table}")
     latex.append(r"    \centering")
     latex.append(r"    \caption{Drift-aware personalization results (over three seeds) for continuous SBP estimation from PPG (DBP omitted for conciseness). We report the fraction of skipped updates relatively to the always-on baseline.}")
-    latex.append(r"    \begin{tabular}{p{1cm}|c|c|c|c}")
+    latex.append(r"    \begin{tabular}{p{1cm}|c|c|c|c|c}")
     latex.append(r"        \hline")
-    latex.append(r"        \textbf{Metric} & \textbf{Always} & \textbf{MMD} & \textbf{Random} & \textbf{LSDD} \\")
+    latex.append(r"        \textbf{Metric} & \textbf{Always} & \textbf{MMD} & \textbf{Random} & \textbf{Steps} & \textbf{LSDD} \\")
     latex.append(r"        \hline")
     
     for metric in ["AE", "BWT", "ME", "STD", "BHS", r"Skip\%"]:
@@ -2748,6 +3104,9 @@ def analyze_logs_and_plot(args):
             'always_on_path': "./logs/personalization_feature_replay_proto_ppg_drift_aware_always_on/personalization_feature_replay_proto_ppg_drift_aware_always_on-Proto-2026_08_06-10_10_45",
             'always_on_path_seed_41': "./logs/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_41/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_41-Proto-2026_08_06-10_14_49",
             'always_on_path_seed_40': "./logs/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_40/personalization_feature_replay_proto_ppg_drift_aware_always_on_seed_40-Proto-2026_08_06-10_14_26",
+            'steps_path': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_steps/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_steps-Proto-2026_09_11-17_02_22",
+            'steps_path_seed_41': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_steps_seed_41/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_steps_seed_41-Proto-2026_09_11-17_21_04",
+            'steps_path_seed_40': "./logs/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_steps_seed_40/personalization_feature_replay_proto_embed_dim_128_buffer_size_64_ppg_drift_aware_steps_seed_40-Proto-2026_09_11-17_20_49",
             # Experiments over buffer sizes and model embedding sizes
             # embed dim 128 and buffer size 64 correspond to baseline MMD compared with Al;ways on, Random and LSDD 
             'embed_dim_128_buffer_size_64_path': "./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd/personalization_feature_replay_proto_ppg_drift_aware_mmd-Proto-2026_08_06-10_15_20",
@@ -2781,9 +3140,14 @@ def analyze_logs_and_plot(args):
             'pi_always_on_path' : "./logs/pi_deployment_feature_replay_always_on/pi_deployment_feature_replay_always_on-Proto-2026_08_08-13_06_53",
             'pi_always_on_path_seed_41' : "./logs/pi_deployment_feature_replay_always_on_seed_41/pi_deployment_feature_replay_always_on_seed_41-Proto-2026_08_08-16_08_04",
             'pi_always_on_path_seed_40' : "./logs/pi_deployment_feature_replay_always_on_seed_40/pi_deployment_feature_replay_always_on_seed_40-Proto-2026_08_08-15_00_41",
-            'pi_drift_aware_mmd_path' : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_08_08-13_59_17",
-            'pi_drift_aware_mmd_path_seed_41' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_08_08-16_31_20",
-            'pi_drift_aware_mmd_path_seed_40' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_40/pi_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_08_08-15_25_03",
+            # Old profiling without energy measurements
+            #'pi_drift_aware_mmd_path' : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_08_08-13_59_17",
+            #'pi_drift_aware_mmd_path_seed_41' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_08_08-16_31_20",
+            #'pi_drift_aware_mmd_path_seed_40' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_40/pi_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_08_08-15_25_03",
+            # New profiling with energy measurements
+            'pi_drift_aware_mmd_path' : "./logs/pi_deployment_feature_replay_drift_aware_mmd/pi_deployment_feature_replay_drift_aware_mmd-Proto-2026_09_14-20_12_27",
+            'pi_drift_aware_mmd_path_seed_41' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_41/pi_deployment_feature_replay_drift_aware_mmd_seed_41-Proto-2026_09_14-21_55_19",
+            'pi_drift_aware_mmd_path_seed_40' : "./logs/pi_deployment_feature_replay_drift_aware_mmd_seed_40/pi_deployment_feature_replay_drift_aware_mmd_seed_40-Proto-2026_09_14-21_04_41",
             'pixel_always_on_path' : "./logs/pixel_deployment_feature_replay_always_on/pixel_deployment_feature_replay_always_on-Proto-2026_08_08-13_56_11",
             'pixel_always_on_path_seed_41' : "./logs/pixel_deployment_feature_replay_always_on_seed_41/pixel_deployment_feature_replay_always_on_seed_41-Proto-2026_08_08-21_31_32",
             'pixel_always_on_path_seed_40' : "./logs/pixel_deployment_feature_replay_always_on_seed_40/pixel_deployment_feature_replay_always_on_seed_40-Proto-2026_08_08-18_27_07",
@@ -2854,7 +3218,10 @@ def analyze_logs_and_plot(args):
             'embed_dim_16_buffer_size_16_path': "./logs/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_ecg_drift_aware_mmd/personalization_feature_replay_proto_embed_dim_16_buffer_size_16_ppg_ecg_drift_aware_mmd-Proto-2026_08_10-19_20_11",
             # Experiments over different devices for deployment
             'pi_always_on_path' : "./logs/pi_deployment_ppg_ecg_feature_replay_always_on/pi_deployment_ppg_ecg_feature_replay_always_on-Proto-2026_08_11-11_48_05",
-            'pi_drift_aware_mmd_path' : "./logs/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd-Proto-2026_08_11-12_16_26",
+            # Old profiling without energy measurements
+            #'pi_drift_aware_mmd_path' : "./logs/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd-Proto-2026_08_11-12_16_26",
+            # New profiling with energy measurements
+            'pi_drift_aware_mmd_path': "./logs/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd/pi_deployment_ppg_ecg_feature_replay_drift_aware_mmd-Proto-2026_09_14-22_48_01",
             'pixel_always_on_path' : "./logs/pixel_deployment_ppg_ecg_feature_replay_always_on/pixel_deployment_ppg_ecg_feature_replay_always_on-Proto-2026_08_11-11_49_52",
             'pixel_drift_aware_mmd_path' : "./logs/pixel_deployment_ppg_ecg_feature_replay_drift_aware_mmd/pixel_deployment_ppg_ecg_feature_replay_drift_aware_mmd-Proto-2026_08_11-13_48_32",            
         }
@@ -2871,7 +3238,7 @@ def analyze_logs_and_plot(args):
         
     # ---------------------------------------------------------
     # Performance Assessment with Clinical & CL Metrics
-    # -> only for feature replay with MMD vs LSDD
+    # -> only for feature replay with MMD vs LSDD vs Random vs Steps
     # ---------------------------------------------------------
     if not args.ecg:
         analyze_drift_detection_methods(baselines_ppg)
