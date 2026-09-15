@@ -471,4 +471,4 @@ After pretraining, the personalization stage can be executed to reproduce the re
 | &nbsp;&nbsp;&nbsp;&nbsp;MMD | 169.5 ± 42.5 | 165.2 ± 42.6 |
 | &nbsp;&nbsp;&nbsp;&nbsp;Always-on | 288.0 ± 0.0 | 288.0 ± 0.0 |
 
-**Notes:** Resource profiling (over three seeds) of feature replay with MMD, embedding size 32 and buffer size 16.
+**Notes:** Resource profiling of feature replay with MMD, embedding size 32 and buffer size 16.
