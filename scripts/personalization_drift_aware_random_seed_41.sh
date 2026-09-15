@@ -33,7 +33,7 @@ cd ..
 #    --inner_adapt 'head' \
 #    --plot_personalization \
 #    --setup_type 'random' \
-#    --mmd_reference_log ./logs/personalization_feature_replay_proto_ppg_embed_dim_128_buffer_size_64_drift_aware_mmd/personalization_feature_replay_proto_ppg_embed_dim_128_buffer_size_64_drift_aware_mmd-Proto-2026_08_05-16_17_27 \
+#    --mmd_reference_log ./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd/personalization_feature_replay_proto_ppg_drift_aware_mmd-Proto-2026_08_06-10_15_20 \
 #    --baselines "feature_replay" \
 #    > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 #
@@ -53,7 +53,7 @@ cd ..
 #    --dataset_name pulse_db_vital_db_percentile \
 #    --expname "$experiment_name" \
 #    --loader_worker 4 \
-#    -seed 40 \
+#    --seed 40 \
 #    --gpu 0 \
 #    --fs 125 \
 #    --input_seq_len_s 10 \
@@ -69,7 +69,7 @@ cd ..
 #    --inner_adapt 'head' \
 #    --plot_personalization \
 #    --setup_type 'random' \
-#    --mmd_reference_log ./logs/personalization_feature_replay_proto_ppg_embed_dim_128_buffer_size_64_drift_aware_mmd_seed_40/personalization_feature_replay_proto_ppg_embed_dim_128_buffer_size_64_drift_aware_mmd_seed_40-Proto-2026_08_06-12_12_44 \
+#    --mmd_reference_log ./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_40-Proto-2026_08_06-10_15_44 \
 #    --baselines "feature_replay" \
 #    > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
 
@@ -105,6 +105,6 @@ python personalization_drift_aware.py \
     --inner_adapt 'head' \
     --plot_personalization \
     --setup_type 'random' \
-    --mmd_reference_log ./logs/personalization_feature_replay_proto_ppg_embed_dim_128_buffer_size_64_drift_aware_mmd_seed_41/personalization_feature_replay_proto_ppg_embed_dim_128_buffer_size_64_drift_aware_mmd_seed_41-Proto-2026_08_06-12_12_51 \
+    --mmd_reference_log ./logs/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41/personalization_feature_replay_proto_ppg_drift_aware_mmd_seed_41-Proto-2026_08_06-10_16_01 \
     --baselines "feature_replay" \
     > "./logs/$experiment_name/${experiment_name}_personalization_training.log"
